@@ -1,0 +1,27 @@
+[package]
+name = "typeassist-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TypeAssist Tauri shell (Layer 5). Hosts the webview and orchestrates the Swift sidecar."
+
+[lib]
+name = "typeassist_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+behavioural-model = { path = "../../../crates/behavioural-model" }
+volatility-map = { path = "../../../crates/volatility-map" }
+correction-engine = { path = "../../../crates/correction-engine" }
+storage = { path = "../../../crates/storage" }

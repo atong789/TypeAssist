@@ -1,0 +1,11 @@
+[package]
+name = "correction-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Layer 4 — lexicon-aware spatial correction. Three tiers, three space-error types, four outcome states."
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+volatility-map = { path = "../volatility-map" }

@@ -1,0 +1,20 @@
+target/
+**/*.rs.bk
+
+# Tauri / Node
+apps/tauri/node_modules/
+apps/tauri/dist/
+apps/tauri/src-tauri/target/
+apps/tauri/src-tauri/gen/
+apps/tauri/src-tauri/sidecars/
+
+# Swift
+adapters/macos/.build/
+adapters/macos/Package.resolved
+*.xcodeproj/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp

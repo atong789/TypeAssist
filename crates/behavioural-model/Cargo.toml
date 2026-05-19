@@ -1,0 +1,12 @@
+[package]
+name = "behavioural-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Layer 2 — aggregates raw input events into per-key timing, error patterns, hand asymmetry, fatigue, ghost-key pairs."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+volatility-map = { path = "../volatility-map" }

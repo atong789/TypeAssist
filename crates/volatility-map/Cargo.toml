@@ -1,0 +1,17 @@
+[package]
+name = "volatility-map"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Layer 3 — spatial volatility map contract. Versioned serde + JSON Schema artifact."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+[[bin]]
+name = "emit_schema"
+path = "src/bin/emit_schema.rs"
