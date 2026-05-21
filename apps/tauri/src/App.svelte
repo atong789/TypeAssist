@@ -7,6 +7,12 @@
 
   type Route = "home" | "today" | "warmup" | "practice" | "settings";
   let route: Route = "home";
+
+  // Route changes requested by a child view (e.g. Home's "Start" → Warm-up).
+  // The cast lives here in the script block — TS isn't valid in markup expressions.
+  function handleNavigate(event: CustomEvent<string>) {
+    route = event.detail as Route;
+  }
 </script>
 
 <main>
@@ -19,7 +25,7 @@
   </nav>
 
   <section>
-    {#if route === "home"}<Home />
+    {#if route === "home"}<Home on:navigate={handleNavigate} />
     {:else if route === "today"}<Today />
     {:else if route === "warmup"}<WarmUp />
     {:else if route === "practice"}<Practice />
