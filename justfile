@@ -28,6 +28,12 @@ sign-dev:
 dev: build-sidecar
     cd apps/tauri && npm run tauri dev
 
+# Walking skeleton: build+sign the sidecar, then run the Rust daemon against it.
+# Proves the Swift↔Rust bridge + injection: type "tge " anywhere -> "the ".
+skeleton: build-sidecar
+    cargo build -p correction-engine --bin skeleton
+    ./target/debug/skeleton {{sidecar_dest}}
+
 # Regenerate the L3 JSON Schema artifact from serde types
 schema:
     cargo run -p volatility-map --bin emit_schema

@@ -24,7 +24,7 @@ enum InputEvent {
 }
 
 enum OutboundCommand {
-    case injectCorrection(String)
+    case injectCorrection(deleteCount: Int, replacement: String)
     case shutdown
 }
 
@@ -102,8 +102,9 @@ final class Bridge {
               let type = obj["type"] as? String else { return nil }
         switch type {
         case "inject_correction":
-            guard let word = obj["word"] as? String else { return nil }
-            return .injectCorrection(word)
+            guard let deleteCount = obj["delete_count"] as? Int,
+                  let replacement = obj["replacement"] as? String else { return nil }
+            return .injectCorrection(deleteCount: deleteCount, replacement: replacement)
         case "shutdown":
             return .shutdown
         default:
