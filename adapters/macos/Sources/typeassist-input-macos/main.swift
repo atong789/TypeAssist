@@ -2,7 +2,12 @@ import Foundation
 
 let bridge = Bridge()
 
-guard Accessibility.isTrusted() else {
+// Skeleton-only: the daemon sets TYPEASSIST_AX_PROMPT=1 so macOS pops the
+// Accessibility dialog when the permission is missing. Production keeps the
+// prompt suppressed — L5 owns that conversation (see Accessibility.swift).
+let promptForAccessibility = ProcessInfo.processInfo.environment["TYPEASSIST_AX_PROMPT"] == "1"
+
+guard Accessibility.isTrusted(prompt: promptForAccessibility) else {
     bridge.emit(.permissionRequired)
     // Stay alive briefly so the parent process can read the event,
     // then exit non-zero so the parent can decide to relaunch after the user grants.

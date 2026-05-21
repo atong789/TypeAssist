@@ -37,8 +37,8 @@ final class EventTap {
 
     func handleCommand(_ command: OutboundCommand) {
         switch command {
-        case .injectCorrection(let word):
-            Accessibility.injectCorrection(word)
+        case .injectCorrection(let deleteCount, let replacement):
+            Accessibility.injectCorrection(deleteCount: deleteCount, replacement: replacement)
         case .shutdown:
             stop()
             exit(0)

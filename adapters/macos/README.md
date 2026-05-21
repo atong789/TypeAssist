@@ -59,7 +59,7 @@ on stdout. To test correction injection, paste an `inject_correction` command
 on stdin:
 
 ```json
-{"type":"inject_correction","word":"hello"}
+{"type":"inject_correction","delete_count":4,"replacement":"the "}
 ```
 
 ## Future adapters

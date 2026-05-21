@@ -63,3 +63,15 @@ impl CorrectionEngine {
         todo!("L4 stub — outcome recording not implemented yet")
     }
 }
+
+/// Walking-skeleton lookup: one hardcoded correction, no real map.
+///
+/// This is intentionally NOT the L3 volatility map and NOT the lexicon — it
+/// exists only to prove the Swift↔Rust thread end to end. See CLAUDE.md
+/// "walking skeleton". Replace with `CorrectionEngine::propose` once L2/L3 land.
+pub fn skeleton_lookup(word: &str) -> Option<&'static str> {
+    match word {
+        "tge" => Some("the"),
+        _ => None,
+    }
+}

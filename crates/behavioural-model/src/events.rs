@@ -40,8 +40,11 @@ pub struct Modifiers {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutboundCommand {
-    /// Replace the currently-being-typed word with `word`.
-    InjectCorrection { word: String },
+    /// Replace the just-typed word: delete `delete_count` characters from the
+    /// focused field, then type `replacement`. `replacement` includes the
+    /// trailing word-boundary character (e.g. the space) so the adapter stays
+    /// dumb — it does no word logic of its own.
+    InjectCorrection { delete_count: u32, replacement: String },
     /// Shut down the adapter.
     Shutdown,
 }

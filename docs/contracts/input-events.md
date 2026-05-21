@@ -65,10 +65,10 @@ Emitted just before the sidecar exits cleanly.
 
 ### `inject_correction`
 
-Replace the currently-being-typed word with `word`. Implementation is sidecar-specific (on macOS: backspaces + keystroke synthesis against the focused field via AX).
+Replace the just-typed word: delete `delete_count` characters from the focused field, then type `replacement`. `replacement` includes the trailing word-boundary character (e.g. the space), so the adapter does no word logic of its own — the core decides exactly what to remove and what to type. Implementation is sidecar-specific (on macOS: synthesized backspaces + layout-independent Unicode keystrokes).
 
 ```json
-{ "type": "inject_correction", "word": "hello" }
+{ "type": "inject_correction", "delete_count": 4, "replacement": "the " }
 ```
 
 ### `shutdown`
