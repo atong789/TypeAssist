@@ -48,7 +48,7 @@ TypeAssist's users have motor difficulties (stroke survivors, arthritis). Large,
 - **Semantic elements.** Use real `<button>`/`<a>` with appropriate ARIA (e.g. `aria-current="page"` on the active nav item), never click-handler `<div>`s, so screen readers announce roles correctly.
 - **No sliders, anywhere.** Discrete card selectors only (see Product principles). Enforced by CSS in `apps/tauri/src/app.css`.
 
-Shared accessible tokens live in `apps/tauri/src/app.css` (`--text-secondary`, `--hairline`, `--focus-ring`) plus a global `:focus-visible` ring. Reuse them on every new screen so these rules hold automatically.
+Shared accessible tokens live in `apps/tauri/src/app.css` (`--text-secondary`, `--hairline`, `--focus-ring`) plus a global `:focus` ring. Reuse them on every new screen so these rules hold automatically.
 
 ## Correction-engine state model
 
