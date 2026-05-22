@@ -50,6 +50,45 @@ TypeAssist's users have motor difficulties (stroke survivors, arthritis). Large,
 
 Shared accessible tokens live in `apps/tauri/src/app.css` (`--text-secondary`, `--hairline`, `--focus-ring`) plus a global `:focus` ring. Reuse them on every new screen so these rules hold automatically.
 
+## Insight system
+
+TypeAssist surfaces insight across three surfaces — **Today**, **Progress**, **Practice** — each with a distinct job and voice. Never blur them.
+
+**Two kinds of typing data:**
+- **Ambient** — normal all-day typing everywhere on the Mac, captured passively. The core product.
+- **Deliberate practice** — opt-in structured sessions (Practice mode, Warm-up).
+
+**Content-blind, always.** The app never sees *what* was typed — only motor/timing shape (key, dwell, drift, episode rhythm). Insight speaks to **episode shape and patterns, never content**. Do **not** track which app was focused (surveillance feel).
+
+### Today — the daily mirror (observational, read-only)
+
+- A short, gentle **narrative readback** of the day. A friend giving a readback, never a clinician.
+- **"What I noticed"**: a few specific, recognizable patterns (e.g. "right thumb on the spacebar"). **Descriptive, never prescriptive** — never "you should practice."
+- **No clock-time / time-of-day timeline.** (Retired: time-of-day bands are context-free — a user can't connect "hesitant at 2pm" to anything. The meaningful variable is the **typing episode/effort** — cold starts, sustained-effort fatigue, recovery — not the clock.)
+- **Read-only.** The only interactive element is a quiet link into Progress. Today is a sidebar destination, so **no back-arrow**.
+- **Honest empty states**: a morning with no data says "the day's just beginning" — never predictions or yesterday's baggage.
+- **Today observes; Home invites.** Any call to action (e.g. a warm-up suggestion on a stiff cold-start morning) lives on **Home's warm-up card**, never on Today.
+
+### Progress — where the meaning lives (reached from Today; feeds the therapist export)
+
+- **Clean rate, not error count**: "landed clean 88% this week, up from 82% last month." Always a **rate** (per 100 words), never a raw count — a heavy day inflates raw counts and misleads. Capability framing ("clean"), never deficit ("errors").
+- **Steadiness trend across weeks** — meaningful because it spans weeks, not one day. The trend line **must show honest variation** (good and bad weeks both belong); never a fake monotonic rise.
+- **Volume as practice**: "~14,000 words this week, all of it practice." Reflective and gentle — **never a goal/target/streak**. A quiet day must never read as failure.
+- **Slips smoothed for you**: the count of silent corrections, framed as **help given** ("smoothed for you"), never errors made. This makes invisible progress visible — the whole point, since silent help means the user can't otherwise feel the improvement.
+- **"Where your hands are gaining ground"**: per-finger/per-key patterns + commonalities (recurring swap-pairs from the volatility map), framed as capability ("steadier," "gaining ground"). Show **only fingers with something to say** (gains, plus the occasional "still finding it"), capped ~3–4 by default, with a quiet **"see all"** for the full hand. Calm by default, complete on demand.
+- **No progress without meaningful samples**: a finger needs enough real data before it earns a trend; below that show "still getting to know this one," never a number invented from a few keystrokes. (Exact threshold is a build-time tuning detail.)
+- **Range selector**: Week / Month / All time. Retain longitudinal data locally (cheap, private; also powers the therapist export).
+- **Footer**: restate the on-device privacy promise; opt-in therapist-share, never pushed.
+- **Never on this surface**: WPM, streaks, daily scores, comparison to other users, goals/targets, prescriptions.
+
+### Practice — opt-in targeted training (future surface)
+
+- Where structured measurement legitimately belongs (the user opted into an exercise). Typing-Club style: accuracy and improvement on focused letter-combinations, in TypeAssist's voice. Levels: **Gentle / Steady / Spirited**.
+
+### Cross-cutting — progress is offered, never imposed
+
+The same number that motivates on a good day can sting on a bad one. Progress is rich and available in the views the user **goes to** (Progress, Practice), framed as capability growing — never a daily verdict, notification, or streak that greets them. **The good day and the bad day both belong.**
+
 ## Correction-engine state model
 
 - **Confidence tiers**: `Gentle`, `Balanced`, `Bold`.
