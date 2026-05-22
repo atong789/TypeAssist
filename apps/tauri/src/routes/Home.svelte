@@ -31,13 +31,18 @@
     <span class="today-note">{todayNote}</span>
   </div>
 
-  <section class="warmup" aria-label="Optional warm-up">
-    <div class="warmup-copy">
-      <h2>A quick warm-up?</h2>
-      <p>30 seconds to help me tune to your hands today. Entirely optional.</p>
-    </div>
-    <button class="start" on:click={() => dispatch("navigate", "warmup")}>Start</button>
-  </section>
+  <!-- The whole card is one large, mouse-forgiving button: click anywhere to
+       start. The "Start" pill is a visible affordance only — the card itself
+       is the control, so there is a single tab stop, activatable with
+       Enter and Space. Keeping it a <button> (with phrasing-content spans, no
+       nested button or heading) keeps the markup valid and accessible. -->
+  <button class="warmup" on:click={() => dispatch("navigate", "warmup")}>
+    <span class="warmup-copy">
+      <span class="warmup-title">A quick warm-up?</span>
+      <span class="warmup-desc">30 seconds to help me tune to your hands today. Entirely optional.</span>
+    </span>
+    <span class="start" aria-hidden="true">Start</span>
+  </button>
 
   <p class="status">
     <span class="dot" aria-hidden="true"></span>
@@ -63,7 +68,7 @@
   .subline {
     margin: 0;
     font-size: 1.25rem;
-    color: color-mix(in srgb, canvastext 55%, transparent);
+    color: var(--text-secondary);
   }
 
   .today {
@@ -71,8 +76,8 @@
     align-items: baseline;
     gap: 1rem;
     padding: 1.1rem 0;
-    border-top: 1px solid color-mix(in srgb, canvastext 12%, transparent);
-    border-bottom: 1px solid color-mix(in srgb, canvastext 12%, transparent);
+    border-top: 1px solid var(--hairline);
+    border-bottom: 1px solid var(--hairline);
   }
 
   .today-label {
@@ -80,50 +85,67 @@
   }
 
   .today-note {
-    color: color-mix(in srgb, canvastext 55%, transparent);
+    color: var(--text-secondary);
   }
 
+  /* The entire card is the button. Reset native button styling and lay it out
+     like a card; large target spanning the content width. */
   .warmup {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 1.5rem;
+    width: 100%;
     padding: 1.5rem 1.75rem;
-    border: 1px solid color-mix(in srgb, canvastext 14%, transparent);
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    background: transparent;
+    border: 1px solid var(--hairline);
     border-radius: 14px;
+    cursor: pointer;
   }
 
-  .warmup-copy h2 {
-    margin: 0 0 0.4rem;
+  .warmup:hover {
+    background: color-mix(in srgb, canvastext 6%, canvas);
+  }
+
+  .warmup:focus {
+    outline: 3px solid var(--focus-ring);
+    outline-offset: 3px;
+  }
+
+  .warmup-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+
+  .warmup-title {
     font-size: 1.2rem;
     font-weight: 600;
   }
 
-  .warmup-copy p {
-    margin: 0;
+  .warmup-desc {
     line-height: 1.5;
-    color: color-mix(in srgb, canvastext 55%, transparent);
+    color: var(--text-secondary);
   }
 
+  /* Visible affordance only (aria-hidden); the card around it is the control. */
   .start {
     flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 44px;
     padding: 0.6rem 1.5rem;
-    font: inherit;
     font-weight: 600;
-    color: inherit;
-    background: transparent;
-    border: 1px solid color-mix(in srgb, canvastext 22%, transparent);
+    border: 1px solid color-mix(in srgb, canvastext 28%, canvas);
     border-radius: 10px;
-    cursor: pointer;
   }
 
-  .start:hover {
-    background: color-mix(in srgb, canvastext 8%, transparent);
-  }
-
-  .start:focus-visible {
-    outline: 2px solid Highlight;
-    outline-offset: 2px;
+  .warmup:hover .start {
+    background: color-mix(in srgb, canvastext 10%, canvas);
   }
 
   .status {
@@ -132,7 +154,7 @@
     gap: 0.55rem;
     margin: 0;
     font-size: 0.95rem;
-    color: color-mix(in srgb, canvastext 50%, transparent);
+    color: var(--text-secondary);
   }
 
   .dot {

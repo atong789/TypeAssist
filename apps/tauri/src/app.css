@@ -3,10 +3,41 @@
   color-scheme: light dark;
   font-size: 16px;
   line-height: 1.5;
+
+  /* Accessible palette — see CLAUDE.md "Accessibility standards".
+     Reuse these tokens on every screen so contrast and focus stay consistent. */
+
+  /* Secondary ("quiet") text. Mixes toward the background but stays OPAQUE so
+     contrast is predictable; tuned to clear WCAG AA (>=4.5:1) in light + dark. */
+  --text-secondary: color-mix(in srgb, canvastext 62%, canvas);
+
+  /* Hairline separators and card borders. */
+  --hairline: color-mix(in srgb, canvastext 16%, canvas);
+
+  /* Keyboard focus ring — high contrast in both light and dark mode. */
+  --focus-ring: #0a84ff;
+}
+
+/* Keyboard focus is load-bearing for users navigating without a mouse:
+   always show a clear ring. Ring on :focus (not just :focus-visible) as
+   defense-in-depth — focus must never be invisible. Components may override
+   offset/radius. */
+:focus {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+html,
+body {
+  height: 100%;
 }
 
 body {
   margin: 0;
+  /* The document itself must never scroll — a scrollable document becomes a
+     keyboard focus stop in WebKit with no :focus-visible ring (an invisible
+     tab stop). Scrolling lives inside the content region instead. */
+  overflow: hidden;
   background: canvas;
   color: canvastext;
 }
