@@ -35,6 +35,21 @@ Persistence: `crates/storage/` (SQLite via sqlx).
 
 These override implementation convenience. If a feature seems to want a slider, find another shape.
 
+## Accessibility standards — non-negotiable
+
+TypeAssist's users have motor difficulties (stroke survivors, arthritis). Large, mouse-forgiving targets and full keyboard operability are the *core of the product*, not enhancements. Every screen must meet all of these:
+
+- **Target size.** Interactive controls are at least **36px tall** (aim for 44px) with comfortable padding. Prefer large hit areas — e.g. make a whole card clickable, with an inner control as the visible affordance.
+- **Full keyboard navigation.** Every interactive element is reachable with **Tab** and activatable with **Enter and Space**. Use a logical DOM/tab order (primary navigation, then main content); never use positive `tabindex` — the visual order is the tab order.
+- **Primary navigation = a single tab stop.** The sidebar is a **WAI-ARIA vertical tablist with roving tabindex** (matches native macOS sidebars): one Tab stop lands on the *selected* item, **Up/Down** (wrapping) + **Home/End** move focus between items, and Tab/Shift+Tab move out of/into the content. Use **manual activation** — arrows move focus only; **Enter/Space (or click) commits** the screen change — so a stray arrow never navigates (fewer accidental navigations for motor-impaired users). Mark items `role="tab"` with `aria-selected`, and the content region `role="tabpanel"` + `aria-labelledby` the active tab. Don't make the panel wrapper itself a tab stop; Tab should land on the content's first *interactive* element.
+- **Visible focus rings — always.** Every focusable control shows a clear, high-contrast ring (the `--focus-ring` token) whenever focused. Style **`:focus`** (not only `:focus-visible`): a keyboard-first app must never hide focus, and `:focus-visible` silently drops when focus is moved *programmatically* (e.g. by the focus trap or roving-tabindex arrows) — which produced a real "vanishing ring" bug. There is also a global `:focus` ring in `app.css` as a backstop.
+- **Focus must never escape the app (focus trap).** In a WebView, Tab past the last control hands focus to the host window — a ringless, non-DOM location — before wrapping. A root-level `keydown` handler wraps focus: Tab on the last tabbable → first, Shift+Tab on the first → last (computing tabbables live, respecting roving `tabindex="-1"`). This keeps the ring continuous on every screen, including ones with no content yet. Lives in `apps/tauri/src/App.svelte`.
+- **WCAG AA contrast.** Body and secondary ("quiet") text must clear **4.5:1** against the background in *both* light and dark mode (3:1 for large text and non-text UI). Use the `--text-secondary` token, not translucent gray — gray mixed with `transparent` fails contrast unpredictably over varied backgrounds.
+- **Semantic elements.** Use real `<button>`/`<a>` with appropriate ARIA (e.g. `aria-current="page"` on the active nav item), never click-handler `<div>`s, so screen readers announce roles correctly.
+- **No sliders, anywhere.** Discrete card selectors only (see Product principles). Enforced by CSS in `apps/tauri/src/app.css`.
+
+Shared accessible tokens live in `apps/tauri/src/app.css` (`--text-secondary`, `--hairline`, `--focus-ring`) plus a global `:focus-visible` ring. Reuse them on every new screen so these rules hold automatically.
+
 ## Correction-engine state model
 
 - **Confidence tiers**: `Gentle`, `Balanced`, `Bold`.
