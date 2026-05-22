@@ -4,8 +4,9 @@
   import Practice from "./routes/Practice.svelte";
   import WarmUp from "./routes/WarmUp.svelte";
   import Today from "./routes/Today.svelte";
+  import Progress from "./routes/Progress.svelte";
 
-  type Route = "home" | "today" | "warmup" | "practice" | "settings";
+  type Route = "home" | "today" | "warmup" | "practice" | "settings" | "progress";
 
   const items: { route: Route; label: string }[] = [
     { route: "home", label: "Home" },
@@ -17,6 +18,10 @@
 
   let route: Route = "home";
   let tabEls: HTMLButtonElement[] = [];
+
+  // "progress" is a sub-view reached from Today, not a sidebar tab. While it's
+  // open, keep Today lit and tabbable so the sidebar stays keyboard-reachable.
+  $: activeTab = route === "progress" ? "today" : route;
 
   // Sidebar is a WAI-ARIA vertical tablist with roving tabindex:
   //  - one tab stop (the selected tab); Tab enters here, Tab again exits to the
@@ -118,9 +123,9 @@
           role="tab"
           id={`tab-${item.route}`}
           aria-controls="screen-panel"
-          aria-selected={route === item.route}
-          tabindex={route === item.route ? 0 : -1}
-          class:active={route === item.route}
+          aria-selected={activeTab === item.route}
+          tabindex={activeTab === item.route ? 0 : -1}
+          class:active={activeTab === item.route}
           bind:this={tabEls[i]}
           on:click={() => selectIndex(i)}
           on:keydown={(e) => onTabKeydown(e, i)}
@@ -129,12 +134,13 @@
     </div>
   </nav>
 
-  <div class="panel" id="screen-panel" role="tabpanel" aria-labelledby={`tab-${route}`}>
+  <div class="panel" id="screen-panel" role="tabpanel" aria-labelledby={`tab-${activeTab}`}>
     {#if route === "home"}<Home on:navigate={handleNavigate} />
-    {:else if route === "today"}<Today />
+    {:else if route === "today"}<Today on:navigate={handleNavigate} />
     {:else if route === "warmup"}<WarmUp />
     {:else if route === "practice"}<Practice />
     {:else if route === "settings"}<Settings />
+    {:else if route === "progress"}<Progress />
     {/if}
   </div>
 </main>
