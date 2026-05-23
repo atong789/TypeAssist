@@ -77,12 +77,7 @@
     max-width: 820px;
   }
 
-  .eyebrow {
-    margin: 0;
-    font-size: 0.95rem;
-    font-weight: 600;
-    color: var(--text-secondary);
-  }
+  /* .eyebrow style lives in app.css (Pattern B header). */
 
   .narrative {
     margin: 0;
