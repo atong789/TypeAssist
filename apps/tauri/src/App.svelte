@@ -152,7 +152,7 @@
   <div class="panel" id="screen-panel" role="tabpanel" aria-labelledby={`tab-${activeTab}`}>
     {#if route === "home"}<Home on:navigate={handleNavigate} />
     {:else if route === "today"}<Today on:navigate={handleNavigate} focusTarget={focusOnArrival} />
-    {:else if route === "warmup"}<WarmUp />
+    {:else if route === "warmup"}<WarmUp on:navigate={handleNavigate} />
     {:else if route === "practice"}<Practice />
     {:else if route === "settings"}<Settings />
     {:else if route === "progress"}<Progress on:navigate-back={handleNavigateBack} />
