@@ -107,6 +107,9 @@
 
 {#if state === "in-progress"}
   <div class="warmup">
+    <header class="screen-header">
+      <h1>Warm-up</h1>
+    </header>
     <p class="instruction">Type the words below to loosen up — no score, no rush.</p>
 
     <div class="passage" tabindex="0" role="textbox" aria-label="Warm-up passage. Type the words shown." aria-multiline="false" bind:this={passageEl} on:keydown={onKeydown}>{#each segments as seg}{#if seg.type === "word"}<span class="word">{#each seg.chars as c}{#if c.idx === caretPos}<span class="caret" aria-hidden="true"></span>{/if}<span class={c.idx < caretPos ? "typed" : "untyped"}>{c.ch}</span>{/each}</span>{:else}{#if seg.idx === caretPos}<span class="caret" aria-hidden="true"></span>{/if}{' '}{/if}{/each}</div>

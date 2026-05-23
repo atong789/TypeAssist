@@ -141,10 +141,10 @@
 
 {#if state === "level-select"}
   <div class="practice level-select">
-    <header>
+    <header class="screen-header">
       <h1>Practice</h1>
-      <p class="instruction">Pick the kind of round that fits today.</p>
     </header>
+    <p class="instruction">Pick the kind of round that fits today.</p>
     <div class="levels">
       <button class="level-card" bind:this={gentleEl} on:click={() => startRound("gentle")}>
         <span class="level-icon" aria-hidden="true">
@@ -190,13 +190,13 @@
     <!-- Passage is first in DOM so Tab from it lands on the chevron button
          next; the header is visually placed at the top via flex `order: -1`. -->
     <div class="passage" tabindex="0" role="textbox" aria-multiline="false" aria-label={`Practice passage, ${levelLabel(level)} level. Type the words shown.`} bind:this={passageEl} on:keydown={onKeydown}>{#each segments as seg}{#if seg.type === "word"}<span class="word">{#each seg.chars as cInfo}{#each slipsAt[cInfo.idx] as slipCh}<span class="slip">{slipCh}</span>{/each}{#if cInfo.idx === nextTargetIdx}<span class="caret" aria-hidden="true"></span>{/if}<span class={cInfo.idx < nextTargetIdx ? "typed" : "untyped"}>{cInfo.ch}</span>{/each}</span>{:else}{#each slipsAt[seg.idx] as slipCh}<span class="slip">{slipCh}</span>{/each}{#if seg.idx === nextTargetIdx}<span class="caret" aria-hidden="true"></span>{/if}{' '}{/if}{/each}</div>
-    <header class="subview-header round-header">
-      <button class="subview-back" aria-label="Back to level select" on:click={changeLevel}>
+    <header class="screen-header round-header">
+      <button class="screen-back" aria-label="Back to level select" on:click={changeLevel}>
         <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="15 18 9 12 15 6" />
         </svg>
       </button>
-      <h1>Practice · {levelLabel(level)}</h1>
+      <h1>Practice<span class="screen-context"> · {levelLabel(level)}</span></h1>
     </header>
     <p class="reassurance">Slipped on one? Just backspace and try it again — that's the practice.</p>
   </div>
@@ -234,15 +234,7 @@
 
   /* ---------- State 1: level select ---------- */
 
-  .level-select header {
-    margin-bottom: 0.25rem;
-  }
-  .level-select h1 {
-    margin: 0 0 0.4rem;
-    font-size: 1.85rem;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-  }
+  /* Title uses the shared .screen-header h1 in app.css. */
   .instruction {
     margin: 0;
     color: var(--text-secondary);
@@ -297,9 +289,9 @@
 
   /* ---------- State 2: round ---------- */
 
-  /* Header uses the shared .subview-header + .subview-back classes (Pattern A).
-     `order: -1` keeps it visually at the top while DOM order puts it after
-     the passage, so Tab from the passage lands on the chevron next. */
+  /* Header uses the shared .screen-header + .screen-back classes. `order: -1`
+     keeps it visually at the top while DOM order puts it after the passage,
+     so Tab from the passage lands on the chevron next. */
   .round-header {
     order: -1;
   }
