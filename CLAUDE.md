@@ -91,6 +91,14 @@ TypeAssist surfaces insight across three surfaces — **Today**, **Progress**, *
 
 The same number that motivates on a good day can sting on a bad one. Progress is rich and available in the views the user **goes to** (Progress, Practice), framed as capability growing — never a daily verdict, notification, or streak that greets them. **The good day and the bad day both belong.**
 
+## Typing surfaces
+
+TypeAssist sees user typing on three kinds of surface: the **ambient** OS-wide capture (no UI), **Warm-up** (opt-in, unmeasured), and **Practice** (opt-in, measured — future). These share one rule and diverge on another.
+
+- **Backspace always works (universal).** On every typing surface, backspace moves the caret back one character so the user can retype. Never block backspace, never discourage it — self-correction is signal, not failure (see Correction-engine state model → `SelfCorrected`).
+- **Warm-up — unmeasured: smooth and advance.** A wrong key never blocks and never displays as an error: the caret advances one character and the *correct target character* appears (the slip is silently smoothed). No red, no "try again," no error state of any kind, anywhere. The caret must never stick waiting for the correct key. **Passages are always all-lowercase** — no proper nouns, no capitals, no shifted punctuation. Shift is a hard two-key chord for our users and Warm-up must never require it. Lives in `apps/tauri/src/routes/WarmUp.svelte`.
+- **Practice — measured: behaviour TBD.** Where structured measurement legitimately belongs (the user opted into an exercise). Whether a wrong key blocks and requires correction, or smooth-and-advances with accuracy tracked silently, is a separate decision to be made when we design Practice.
+
 ## Correction-engine state model
 
 - **Confidence tiers**: `Gentle`, `Balanced`, `Bold`.
