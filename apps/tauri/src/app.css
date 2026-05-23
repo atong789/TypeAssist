@@ -30,25 +30,32 @@
   outline-offset: 2px;
 }
 
-/* ===== Header patterns — pick ONE per screen, never hand-size. =====
-   See CLAUDE.md "Accessibility standards" → Header patterns. */
+/* ===== Screen title — ONE style, every screen. =====
+   See CLAUDE.md "Accessibility standards" → Screen title. Every screen wraps
+   its name in <header class="screen-header"><h1>...</h1></header>. Sub-views
+   with a back path (Progress, the Practice round) add a standalone
+   `.screen-back` chevron button before the h1 — that chevron is the ONLY
+   visual difference between a sub-view header and a top-level header. */
 
-/* Pattern A — back-navigable sub-views (Progress, the Practice round):
-   a standalone focusable chevron button + the screen name as an <h1> at
-   the standard subview heading size. The chevron alone is the focus ring's
-   target; the heading text is non-interactive. */
-.subview-header {
+.screen-header {
   display: flex;
   align-items: center;
   gap: 0.5rem;
 }
-.subview-header h1 {
+.screen-header h1 {
   margin: 0;
   font-size: 1.65rem;
   font-weight: 700;
   letter-spacing: -0.02em;
 }
-.subview-back {
+/* Muted "· suffix" within a title (e.g. "Today · Friday, May 23",
+   "Practice · Steady") — reads as context next to the screen name without
+   changing the heading's size, family, or position. */
+.screen-context {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+.screen-back {
   width: 36px;
   height: 36px;
   display: flex;
@@ -60,21 +67,12 @@
   border-radius: 8px;
   cursor: pointer;
 }
-.subview-back:hover {
+.screen-back:hover {
   background: color-mix(in srgb, canvastext 6%, canvas);
 }
-.subview-back:focus {
+.screen-back:focus {
   outline: 3px solid var(--focus-ring);
   outline-offset: 2px;
-}
-
-/* Pattern B — top-level working states (Today, Warm-up): a small eyebrow
-   label, no h1. */
-.eyebrow {
-  margin: 0;
-  font-size: 0.95rem;
-  font-weight: 600;
-  color: var(--text-secondary);
 }
 
 html,

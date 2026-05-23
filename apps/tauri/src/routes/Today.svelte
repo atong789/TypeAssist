@@ -47,7 +47,9 @@
 </script>
 
 <div class="today">
-  <p class="eyebrow">Today · {dateLabel}</p>
+  <header class="screen-header">
+    <h1>Today<span class="screen-context"> · {dateLabel}</span></h1>
+  </header>
 
   <p class="narrative">{narrative}</p>
 

@@ -79,9 +79,9 @@
 </script>
 
 <div class="progress">
-  <header class="subview-header">
+  <header class="screen-header">
     <button
-      class="subview-back"
+      class="screen-back"
       aria-label="Back to Today"
       bind:this={backEl}
       on:click={() => dispatch("navigate-back")}
@@ -167,7 +167,7 @@
     min-height: 100%;
   }
 
-  /* Header uses the shared .subview-header + .subview-back classes (Pattern A). */
+  /* Header uses the shared .screen-header + .screen-back classes. */
 
   /* ---------- Hero ---------- */
 
