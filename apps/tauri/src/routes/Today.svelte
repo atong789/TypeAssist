@@ -3,9 +3,21 @@
      interactive element is the quiet link into Progress. No timeline, no
      back-arrow. Filled vs. empty morning is a simple data-driven switch. -->
 <script lang="ts">
-  import { createEventDispatcher } from "svelte";
+  import { createEventDispatcher, onMount } from "svelte";
 
   const dispatch = createEventDispatcher<{ navigate: string }>();
+
+  // One-shot hint from the parent: when set, focus the matching control on
+  // mount so the ring lands on a sensible visible target on arrival (see
+  // CLAUDE.md "Navigation lands focus on a sensible target"). Currently used
+  // when returning from Progress.
+  export let focusTarget: string | null = null;
+  let progressLinkEl: HTMLButtonElement;
+  onMount(() => {
+    if (focusTarget === "progress-link") {
+      progressLinkEl?.focus();
+    }
+  });
 
   // TODO: wire to real session data. Flip to false to preview the empty morning.
   const hasData = true;
@@ -52,7 +64,7 @@
     {/if}
   </section>
 
-  <button class="progress-link" on:click={() => dispatch("navigate", "progress")}>
+  <button class="progress-link" bind:this={progressLinkEl} on:click={() => dispatch("navigate", "progress")}>
     See your progress<span class="arrow" aria-hidden="true"> →</span>
   </button>
 </div>

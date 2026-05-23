@@ -15,7 +15,8 @@
         "label": "main",
         "title": "TypeAssist",
         "width": 960,
-        "height": 720,
+        "height": 800,
+        "minHeight": 720,
         "resizable": true
       }
     ],

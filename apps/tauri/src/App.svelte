@@ -5,6 +5,7 @@
   import WarmUp from "./routes/WarmUp.svelte";
   import Today from "./routes/Today.svelte";
   import Progress from "./routes/Progress.svelte";
+  import { tick } from "svelte";
 
   type Route = "home" | "today" | "warmup" | "practice" | "settings" | "progress";
 
@@ -61,6 +62,20 @@
   // Route changes requested by a child view (e.g. Home's "Start" → Warm-up).
   function handleNavigate(event: CustomEvent<string>) {
     route = event.detail as Route;
+  }
+
+  // Returning from a sub-view: restore focus to the control that opened it so
+  // the focus ring lands on a sensible visible target on arrival, no Tab
+  // needed (see CLAUDE.md "Navigation lands focus on a sensible target").
+  // Pairs with the focus-on-mount in the sub-view's primary anchor.
+  let focusOnArrival: string | null = null;
+  async function handleNavigateBack() {
+    focusOnArrival = "progress-link";
+    route = "today";
+    // One-shot hint: clear after Today has mounted and consumed the prop, so
+    // a later normal arrival on Today doesn't re-trigger the restore.
+    await tick();
+    focusOnArrival = null;
   }
 
   // Focus trap: keep keyboard focus inside the app's controls. In a WebView,
@@ -136,11 +151,11 @@
 
   <div class="panel" id="screen-panel" role="tabpanel" aria-labelledby={`tab-${activeTab}`}>
     {#if route === "home"}<Home on:navigate={handleNavigate} />
-    {:else if route === "today"}<Today on:navigate={handleNavigate} />
+    {:else if route === "today"}<Today on:navigate={handleNavigate} focusTarget={focusOnArrival} />
     {:else if route === "warmup"}<WarmUp />
     {:else if route === "practice"}<Practice />
     {:else if route === "settings"}<Settings />
-    {:else if route === "progress"}<Progress />
+    {:else if route === "progress"}<Progress on:navigate-back={handleNavigateBack} />
     {/if}
   </div>
 </main>
