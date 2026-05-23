@@ -31,8 +31,15 @@
   //  - MANUAL activation: arrows only move focus; Enter/Space (or click) selects.
   //    Chosen over auto-activation so a stray arrow press never changes screens
   //    — fewer accidental navigations for motor-impaired users.
+  // Bumping this on every sidebar click to Practice forces a remount of the
+  // Practice screen (via {#key practiceKey} below) so it always lands on
+  // level-select — never resumes a round in progress.
+  let practiceKey = 0;
+
   function selectIndex(i: number) {
-    route = items[i].route;
+    const newRoute = items[i].route;
+    if (newRoute === "practice") practiceKey += 1;
+    route = newRoute;
   }
 
   function onTabKeydown(event: KeyboardEvent, index: number) {
@@ -153,7 +160,7 @@
     {#if route === "home"}<Home on:navigate={handleNavigate} />
     {:else if route === "today"}<Today on:navigate={handleNavigate} focusTarget={focusOnArrival} />
     {:else if route === "warmup"}<WarmUp on:navigate={handleNavigate} />
-    {:else if route === "practice"}<Practice />
+    {:else if route === "practice"}{#key practiceKey}<Practice />{/key}
     {:else if route === "settings"}<Settings />
     {:else if route === "progress"}<Progress on:navigate-back={handleNavigateBack} />
     {/if}

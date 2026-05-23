@@ -45,6 +45,10 @@ TypeAssist's users have motor difficulties (stroke survivors, arthritis). Large,
 - **Visible focus rings — always.** Every focusable control shows a clear, high-contrast ring (the `--focus-ring` token) whenever focused. Style **`:focus`** (not only `:focus-visible`): a keyboard-first app must never hide focus, and `:focus-visible` silently drops when focus is moved *programmatically* (e.g. by the focus trap or roving-tabindex arrows) — which produced a real "vanishing ring" bug. There is also a global `:focus` ring in `app.css` as a backstop.
 - **Focus must never escape the app (focus trap).** In a WebView, Tab past the last control hands focus to the host window — a ringless, non-DOM location — before wrapping. A root-level `keydown` handler wraps focus: Tab on the last tabbable → first, Shift+Tab on the first → last (computing tabbables live, respecting roving `tabindex="-1"`). This keeps the ring continuous on every screen, including ones with no content yet. Lives in `apps/tauri/src/App.svelte`.
 - **Navigation lands focus on a sensible visible target.** The focus ring must never be invisible after a navigation. Opening a sub-view focuses its **primary anchor** (e.g. Progress focuses its back arrow on arrival, via `.focus()` in `onMount`). Returning from a sub-view **restores focus to the control that opened it** (e.g. returning to Today focuses the "See your progress" link). Implementation: child views dispatch `navigate-back` instead of `navigate` when returning; the parent passes a one-shot `focusTarget` prop, cleared via `tick()` after the child mounts. Because rings are styled on `:focus` (not only `:focus-visible`), programmatic focus shows the ring immediately — no Tab needed.
+- **Header patterns — two, no hand-sizing.** Every screen header uses ONE of two shared styles, defined in `apps/tauri/src/app.css`:
+  - **Pattern A — back-navigable sub-views** (Progress, the Practice round): a standalone focusable chevron button (`.subview-back`) plus the screen name as an `<h1>` at the standard subview heading size (`.subview-header h1`). The chevron alone is the focus ring's target; the heading text is non-interactive.
+  - **Pattern B — top-level working states** (Today, Warm-up): a small eyebrow label (`.eyebrow`), no `<h1>`.
+  Reuse the shared classes — never hand-size or hand-style a header per screen.
 - **Fit the launch window — nothing important below the fold.** Every screen must lay out so all of its read-only content sits within the launch window without scrolling. Read-only content is *not* keyboard-reachable, so anything below the fold can only be reached with a mouse — which a keyboard-first app must not require. Pair a tight, compact layout with a Tauri default + `minHeight` that holds the densest screen, and cap any expandable list (e.g. Progress's "See all fingers") to what fits. Window dimensions live in `apps/tauri/src-tauri/tauri.conf.json`.
 - **WCAG AA contrast.** Body and secondary ("quiet") text must clear **4.5:1** against the background in *both* light and dark mode (3:1 for large text and non-text UI). Use the `--text-secondary` token, not translucent gray — gray mixed with `transparent` fails contrast unpredictably over varied backgrounds.
 - **Semantic elements.** Use real `<button>`/`<a>` with appropriate ARIA (e.g. `aria-current="page"` on the active nav item), never click-handler `<div>`s, so screen readers announce roles correctly.
@@ -83,9 +87,10 @@ TypeAssist surfaces insight across three surfaces — **Today**, **Progress**, *
 - **Footer**: restate the on-device privacy promise. The opt-in therapist-share link is a **v2 footer element** — never pushed.
 - **Never on this surface**: WPM, streaks, daily scores, comparison to other users, goals/targets, prescriptions.
 
-### Practice — opt-in targeted training (future surface)
+### Practice — opt-in targeted training
 
-- Where structured measurement legitimately belongs (the user opted into an exercise). Typing-Club style: accuracy and improvement on focused letter-combinations, in TypeAssist's voice. Levels: **Gentle / Steady / Spirited**.
+- Where structured measurement legitimately belongs (the user opted into an exercise). Typing-Club style: accuracy and improvement on focused letter-combinations, in TypeAssist's voice. Levels: **Gentle / Steady / Spirited** (kinds of day, not difficulty grades).
+- **Content is personalised to the user's own tricky keys and finger-transitions** (drawn from the volatility map) — not a generic keyboard-row curriculum. Real lowercase words, short and focused, denser by level. At cold start, a sensible common set until the map has learned the user.
 
 ### Cross-cutting — progress is offered, never imposed
 
@@ -97,7 +102,7 @@ TypeAssist sees user typing on three kinds of surface: the **ambient** OS-wide c
 
 - **Backspace always works (universal).** On every typing surface, backspace moves the caret back one character so the user can retype. Never block backspace, never discourage it — self-correction is signal, not failure (see Correction-engine state model → `SelfCorrected`).
 - **Warm-up — unmeasured: smooth and advance.** A wrong key never blocks and never displays as an error: the caret advances one character and the *correct target character* appears (the slip is silently smoothed). No red, no "try again," no error state of any kind, anywhere. The caret must never stick waiting for the correct key. **Passages are always all-lowercase** — no proper nouns, no capitals, no shifted punctuation. Shift is a hard two-key chord for our users and Warm-up must never require it. Lives in `apps/tauri/src/routes/WarmUp.svelte`.
-- **Practice — measured: behaviour TBD.** Where structured measurement legitimately belongs (the user opted into an exercise). Whether a wrong key blocks and requires correction, or smooth-and-advances with accuracy tracked silently, is a separate decision to be made when we design Practice.
+- **Practice — measured: slips are visible.** A wrong key *does* appear in the rendered stream, marked with **both amber colour and a wavy underline** so the slip is visible without colour perception (never red). The caret advances past the slip; backspace removes the slip so the user can retype (universal backspace rule applies). Slips are counted internally for the end-of-round readout, but **no live score, percentage, timer, or WPM** is shown during the round. Lives in `apps/tauri/src/routes/Practice.svelte`.
 
 ## Correction-engine state model
 

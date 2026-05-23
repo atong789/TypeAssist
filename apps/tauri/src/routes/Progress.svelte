@@ -79,9 +79,9 @@
 </script>
 
 <div class="progress">
-  <header class="head">
+  <header class="subview-header">
     <button
-      class="back"
+      class="subview-back"
       aria-label="Back to Today"
       bind:this={backEl}
       on:click={() => dispatch("navigate-back")}
@@ -167,38 +167,7 @@
     min-height: 100%;
   }
 
-  /* ---------- Header ---------- */
-
-  .head {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-  h1 {
-    margin: 0;
-    font-size: 1.65rem;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-  }
-  .back {
-    width: 36px;
-    height: 36px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border: none;
-    background: transparent;
-    color: inherit;
-    border-radius: 8px;
-    cursor: pointer;
-  }
-  .back:hover {
-    background: color-mix(in srgb, canvastext 6%, canvas);
-  }
-  .back:focus {
-    outline: 3px solid var(--focus-ring);
-    outline-offset: 2px;
-  }
+  /* Header uses the shared .subview-header + .subview-back classes (Pattern A). */
 
   /* ---------- Hero ---------- */
 

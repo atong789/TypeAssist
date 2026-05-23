@@ -16,6 +16,9 @@
 
   /* Keyboard focus ring — high contrast in both light and dark mode. */
   --focus-ring: #0a84ff;
+
+  /* Warning (amber) — for visible slips in measured surfaces. Never red. */
+  --warning: color-mix(in srgb, #e0a82e 70%, canvastext);
 }
 
 /* Keyboard focus is load-bearing for users navigating without a mouse:
@@ -25,6 +28,53 @@
 :focus {
   outline: 3px solid var(--focus-ring);
   outline-offset: 2px;
+}
+
+/* ===== Header patterns — pick ONE per screen, never hand-size. =====
+   See CLAUDE.md "Accessibility standards" → Header patterns. */
+
+/* Pattern A — back-navigable sub-views (Progress, the Practice round):
+   a standalone focusable chevron button + the screen name as an <h1> at
+   the standard subview heading size. The chevron alone is the focus ring's
+   target; the heading text is non-interactive. */
+.subview-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.subview-header h1 {
+  margin: 0;
+  font-size: 1.65rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.subview-back {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: inherit;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.subview-back:hover {
+  background: color-mix(in srgb, canvastext 6%, canvas);
+}
+.subview-back:focus {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Pattern B — top-level working states (Today, Warm-up): a small eyebrow
+   label, no h1. */
+.eyebrow {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text-secondary);
 }
 
 html,
