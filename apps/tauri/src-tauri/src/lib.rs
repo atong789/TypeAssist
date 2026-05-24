@@ -1,7 +1,9 @@
 //! Layer 5 — Tauri shell.
 //!
-//! Hosts the Svelte webview, spawns the Swift sidecar (Layer 1), and wires its
-//! event stream into the Rust behavioural model (Layer 2).
+//! Hosts the Svelte webview and the engine (Swift sidecar + walking-skeleton
+//! loop). See `engine.rs`.
+
+mod engine;
 
 pub fn run() {
     tracing_subscriber::fmt()
@@ -13,9 +15,10 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .setup(|_app| {
-            // TODO: spawn the Swift sidecar, parse its line-delimited JSON events,
-            // and feed them into a BehaviouralModel. See CLAUDE.md.
+        .setup(|app| {
+            if let Err(e) = engine::spawn(&app.handle()) {
+                tracing::error!("failed to spawn engine: {e}");
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

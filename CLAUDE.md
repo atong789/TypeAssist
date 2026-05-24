@@ -131,6 +131,12 @@ Before the first `just dev`, run `npm install` inside `apps/tauri/`.
 
 The Swift sidecar needs Accessibility permission (System Settings → Privacy & Security → Accessibility). On launch, if the permission is missing, it emits `{"type":"permission_required"}` on stdout rather than crashing. The UI surfaces this gracefully. See `adapters/macos/README.md`.
 
+## Known design questions / future
+
+Open questions surfaced during development that don't have a settled answer yet. Each is parked here so it isn't forgotten; revisit when the relevant layer is being built out.
+
+- **Coexistence with macOS system autocorrect.** Most macOS text fields run their own autocorrect, so it operates on the same keystroke stream as TypeAssist. The two solve different problems — macOS is dictionary-based (whole known words), TypeAssist is motor/spatial (the specific slip a hand makes) — but they can collide on the same keystroke, and a system correction can easily be mistaken for one of ours. Open question: how the two should coexist. Options to weigh: detect-and-defer when a system correction is in flight; document testing with system autocorrect off; or confirm it's a non-issue in practice. Surfaced during debug-view testing when macOS corrected `cuty → city` while our engine correctly reported `LEFT ALONE`.
+
 ## Things to never do
 
 - Do not introduce a slider control anywhere in the UI.
