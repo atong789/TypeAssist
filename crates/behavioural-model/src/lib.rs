@@ -12,10 +12,12 @@ pub mod asymmetry;
 pub mod events;
 pub mod fatigue;
 pub mod ghost_keys;
+pub mod slip_detector;
 pub mod temporal;
 pub mod timing;
 
 pub use events::{InputEvent, Modifiers, OutboundCommand};
+pub use slip_detector::{PairSlipRow, SlipDetector, SlipEvent, SlipsSnapshot};
 
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +45,9 @@ pub struct BehaviouralModel {
     pub asymmetry: asymmetry::AsymmetryTracker,
     pub fatigue: fatigue::FatigueCurve,
     pub temporal: temporal::TemporalProfiles,
+    /// First L3 learning loop: detects backspace-correction slips and
+    /// writes them into a live `VolatilityMap`.
+    pub slip_detector: slip_detector::SlipDetector,
 }
 
 impl BehaviouralModel {
@@ -59,6 +64,13 @@ impl BehaviouralModel {
         self.asymmetry.observe(event);
         self.fatigue.observe(event);
         self.temporal.observe(event);
+        self.slip_detector.observe(event);
+    }
+
+    /// Drain slips detected during ingest since the last call. The engine
+    /// host emits these as `engine://slip` Tauri events for the debug view.
+    pub fn take_new_slips(&mut self) -> Vec<slip_detector::SlipEvent> {
+        self.slip_detector.take_new_slips()
     }
 
     /// Diagnostic snapshot of the live aggregator state.
@@ -70,6 +82,7 @@ impl BehaviouralModel {
             timing: self.timing.snapshot(),
             asymmetry: self.asymmetry.snapshot(),
             ghost_keys: self.ghost_keys.snapshot(),
+            slips: self.slip_detector.snapshot(),
         }
     }
 }
@@ -79,6 +92,7 @@ pub struct ModelSnapshot {
     pub timing: timing::TimingSnapshot,
     pub asymmetry: asymmetry::AsymmetrySnapshot,
     pub ghost_keys: ghost_keys::GhostKeysSnapshot,
+    pub slips: slip_detector::SlipsSnapshot,
 }
 
 #[cfg(test)]
