@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use volatility_map::{finger_for, Finger, Hand};
 
 use crate::events::InputEvent;
+use crate::MAX_TYPING_INTERVAL_MS;
 
 #[derive(Debug, Default)]
 pub struct TimingAggregator {
@@ -57,8 +58,14 @@ impl TimingAggregator {
             // Guard against out-of-order or duplicate timestamps from the
             // sidecar — saturating_sub keeps the sum monotonic instead of
             // wrapping to a huge value.
-            entry.interval_sum_ms += timestamp_ms.saturating_sub(prev);
-            entry.interval_count += 1;
+            let gap = timestamp_ms.saturating_sub(prev);
+            // Drop pause-length gaps so a 5s think doesn't poison the next
+            // key's interval mean. Anchor still advances (next real interval
+            // is measured from this key, not the one before the pause).
+            if gap <= MAX_TYPING_INTERVAL_MS {
+                entry.interval_sum_ms += gap;
+                entry.interval_count += 1;
+            }
         }
         self.last_key_timestamp_ms = Some(*timestamp_ms);
     }
@@ -307,6 +314,41 @@ mod tests {
         let snap = agg.snapshot();
         let b = snap.per_key.iter().find(|r| r.key == "b").unwrap();
         assert!((b.avg_interval_ms - 300.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pause_length_gaps_are_excluded_from_intervals() {
+        let mut agg = TimingAggregator::default();
+        agg.observe(&key("a", 100, 70));
+        // 5 second gap — clearly a pause, must NOT show up as the next key's
+        // interval (otherwise per-key/per-finger means become useless).
+        agg.observe(&key("b", 5_100, 70));
+        // Then resume normal typing: 200 ms gap counts.
+        agg.observe(&key("a", 5_300, 70));
+
+        let snap = agg.snapshot();
+        let b = snap.per_key.iter().find(|r| r.key == "b").unwrap();
+        // No interval was attributed to "b" — the 5s gap was dropped.
+        assert_eq!(b.avg_interval_ms, 0.0);
+        // The fast 200ms gap from b→a IS counted for "a".
+        let a = snap.per_key.iter().find(|r| r.key == "a").unwrap();
+        // "a" has two occurrences; only the second one has an interval (200ms).
+        assert!((a.avg_interval_ms - 200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn boundary_around_pause_threshold() {
+        let mut agg = TimingAggregator::default();
+        agg.observe(&key("a", 0, 70));
+        // Exactly at threshold (1500ms) — kept.
+        agg.observe(&key("b", 1_500, 70));
+        // Just over threshold — dropped.
+        agg.observe(&key("c", 3_001, 70));
+        let snap = agg.snapshot();
+        let b = snap.per_key.iter().find(|r| r.key == "b").unwrap();
+        assert!((b.avg_interval_ms - 1500.0).abs() < 1e-9);
+        let c = snap.per_key.iter().find(|r| r.key == "c").unwrap();
+        assert_eq!(c.avg_interval_ms, 0.0);
     }
 
     #[test]
