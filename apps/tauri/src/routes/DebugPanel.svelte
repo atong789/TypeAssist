@@ -71,10 +71,51 @@
     overall_score: number;
     steadier_hand: Hand | null;
   };
+  type KeyGhostRow = {
+    key: string;
+    hand: Hand | null;
+    finger: Finger | null;
+    events: number;
+    short_dwell: number;
+    rapid_repeat: number;
+    self_corrected: number;
+  };
+  type FingerGhostRow = {
+    hand: Hand;
+    finger: Finger;
+    events: number;
+  };
+  type HandGhostRow = {
+    hand: Hand;
+    events: number;
+    short_dwell: number;
+    rapid_repeat: number;
+    self_corrected: number;
+  };
+  type GhostKeysSnapshot = {
+    total_ghost_events: number;
+    short_dwell_count: number;
+    rapid_repeat_count: number;
+    self_corrected_count: number;
+    /// Always exactly two rows: [Left, Right]. Both present even with zero
+    /// data, so the L vs R comparison is always visible.
+    per_hand: HandGhostRow[];
+    per_key: KeyGhostRow[];
+    per_finger: FingerGhostRow[];
+    /// Adaptive cutoff in ms; 0 while warming up.
+    dwell_threshold_ms: number;
+    /// Keystrokes left before the threshold goes live; 0 once active.
+    warmup_remaining: number;
+  };
   type ModelSnapshot = {
     timing: { per_key: KeyTimingRow[]; per_finger: FingerTimingRow[] };
     asymmetry: AsymmetrySnapshot;
+    ghost_keys: GhostKeysSnapshot;
   };
+
+  /// Cap on the per-key ghost list — keep the worst offenders visible,
+  /// drop the long tail to keep the panel tidy.
+  const GHOST_PER_KEY_LIMIT = 10;
 
   type Row =
     | { id: number; kind: "key"; key: string; dwell_ms: number; ingest_latency_ms: number }
@@ -112,6 +153,7 @@
   let modelRows: KeyTimingRow[] = [];
   let fingerRows: FingerTimingRow[] = [];
   let asymmetry: AsymmetrySnapshot | null = null;
+  let ghostKeys: GhostKeysSnapshot | null = null;
 
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
@@ -246,6 +288,7 @@
         modelRows = e.payload.timing.per_key;
         fingerRows = e.payload.timing.per_finger;
         asymmetry = e.payload.asymmetry;
+        ghostKeys = e.payload.ghost_keys;
       }),
     );
   });
@@ -269,7 +312,7 @@
     const h = hand === "left" ? "L" : "R";
     return `${h} ${finger}`;
   }
-  function fmtKeyFinger(row: KeyTimingRow): string {
+  function fmtKeyFinger(row: { hand: Hand | null; finger: Finger | null }): string {
     if (!row.hand || !row.finger) return "—";
     return fmtFinger(row.hand, row.finger);
   }
@@ -429,8 +472,107 @@
         </div>
       </div>
 
-      <!-- Scrolling: per-key table, header sticks while you scroll. -->
+      <!-- Scrolling: GHOST KEYS (candidate ghosts) then PER KEY table.
+           Each section's sub-header is sticky so it stays visible as you
+           scroll within the section. -->
       <div class="model-scroll">
+        <div class="model-sub model-sub-sticky">GHOST KEYS · likely, not certain</div>
+        <div class="ghost-block">
+          {#if ghostKeys === null}
+            <div class="empty">no data yet…</div>
+          {:else}
+            <div class="ghost-status">
+              {#if ghostKeys.warmup_remaining > 0}
+                calibrating — {ghostKeys.warmup_remaining} more keystrokes before short-dwell flagging
+              {:else}
+                flagging dwell &lt; <span class="num">{fmtMs(ghostKeys.dwell_threshold_ms)}</span> ms
+              {/if}
+            </div>
+            <div class="ghost-totals">
+              <span class="ghost-totals-label">total</span>
+              <span class="num ghost-totals-val">{ghostKeys.total_ghost_events}</span>
+              <span class="ghost-totals-detail">
+                short-dwell <span class="num">{ghostKeys.short_dwell_count}</span>
+                · rapid-repeat <span class="num">{ghostKeys.rapid_repeat_count}</span>
+                · self-corrected <span class="num">{ghostKeys.self_corrected_count}</span>
+              </span>
+            </div>
+
+            <div class="ghost-sub">per hand · signature breakdown</div>
+            <div class="ghost-hand-table">
+              <div class="ghost-hand-row ghost-hand-head">
+                <span class="col-ghh">hand</span>
+                <span class="col-ghe num">events</span>
+                <span class="col-ghs num">short</span>
+                <span class="col-ghr num">repeat</span>
+                <span class="col-ghc num">self</span>
+              </div>
+              {#each ghostKeys.per_hand as h (h.hand)}
+                <div
+                  class="ghost-hand-row"
+                  class:finger-left={h.hand === "left"}
+                  class:finger-right={h.hand === "right"}
+                >
+                  <span class="col-ghh">{h.hand === "left" ? "L" : "R"}</span>
+                  <span class="col-ghe num">{h.events}</span>
+                  <span class="col-ghs num">{h.short_dwell}</span>
+                  <span class="col-ghr num">{h.rapid_repeat}</span>
+                  <span class="col-ghc num">{h.self_corrected}</span>
+                </div>
+              {/each}
+            </div>
+
+            <div class="ghost-sub">per finger · anatomical</div>
+            {#if ghostKeys.per_finger.length === 0}
+              <div class="empty">none yet…</div>
+            {:else}
+              <div class="ghost-finger-table">
+                {#each ghostKeys.per_finger as f (`${f.hand}-${f.finger}`)}
+                  <div
+                    class="ghost-finger-row"
+                    class:finger-left={f.hand === "left"}
+                    class:finger-right={f.hand === "right"}
+                  >
+                    <span class="col-gff">{fmtFinger(f.hand, f.finger)}</span>
+                    <span class="col-gfn num">{f.events}</span>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+
+            <div class="ghost-sub">per key · worst first</div>
+            {#if ghostKeys.per_key.length === 0}
+              <div class="empty">none yet…</div>
+            {:else}
+              <div class="ghost-key-table">
+                <div class="ghost-key-row ghost-key-head">
+                  <span class="col-gk">key</span>
+                  <span class="col-gf">finger</span>
+                  <span class="col-ge num">events</span>
+                  <span class="col-gs num">short</span>
+                  <span class="col-gr num">repeat</span>
+                  <span class="col-gc num">self</span>
+                </div>
+                {#each ghostKeys.per_key.slice(0, GHOST_PER_KEY_LIMIT) as r (r.key)}
+                  <div class="ghost-key-row">
+                    <span class="col-gk">{fmtKey(r.key)}</span>
+                    <span class="col-gf">{fmtKeyFinger(r)}</span>
+                    <span class="col-ge num">{r.events}</span>
+                    <span class="col-gs num">{r.short_dwell}</span>
+                    <span class="col-gr num">{r.rapid_repeat}</span>
+                    <span class="col-gc num">{r.self_corrected}</span>
+                  </div>
+                {/each}
+                {#if ghostKeys.per_key.length > GHOST_PER_KEY_LIMIT}
+                  <div class="ghost-more">
+                    + {ghostKeys.per_key.length - GHOST_PER_KEY_LIMIT} more keys with ghost activity
+                  </div>
+                {/if}
+              </div>
+            {/if}
+          {/if}
+        </div>
+
         <div class="model-sub model-sub-sticky">PER KEY · most-typed first</div>
         <div class="model-table">
           <div class="model-row model-head">
@@ -733,6 +875,110 @@
   .col-ff { color: #e6e6e6; font-weight: 600; }
   .col-fn { color: #d5d5d5; }
   .col-fd, .col-fi { color: #8aa1b8; }
+
+  /* GHOST KEYS — totals header + per-finger rollup + per-key worst-first.
+     Sits at the top of .model-scroll, above PER KEY. */
+  .ghost-block {
+    padding: 0.25rem 0 0.5rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .ghost-status {
+    color: #8893a0;
+    padding: 0.15rem 0.75rem 0.3rem;
+    font-size: 11px;
+  }
+  .ghost-totals {
+    display: grid;
+    grid-template-columns: auto auto 1fr;
+    column-gap: 0.6rem;
+    align-items: baseline;
+    padding: 0.1rem 0.75rem 0.4rem;
+  }
+  .ghost-totals-label {
+    color: #7f8a96;
+    letter-spacing: 0.08em;
+  }
+  .ghost-totals-val {
+    color: #e6e6e6;
+    font-weight: 600;
+  }
+  .ghost-totals-detail {
+    color: #8aa1b8;
+    font-size: 11px;
+  }
+  .ghost-sub {
+    padding: 0.4rem 0.75rem 0.1rem;
+    color: #6a747f;
+    letter-spacing: 0.08em;
+    font-size: 11px;
+  }
+  /* Per-hand × per-signature ghost breakdown. Two rows (L, R) reusing the
+     same hand tints as PER FINGER / ASYMMETRY for visual continuity. */
+  .ghost-hand-table {
+    padding: 0 0 0.2rem;
+  }
+  .ghost-hand-row {
+    display: grid;
+    grid-template-columns: 32px 56px 48px 56px 44px;
+    column-gap: 0.5rem;
+    align-items: baseline;
+    padding: 0.18rem 0.75rem;
+    white-space: nowrap;
+  }
+  .ghost-hand-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.25rem;
+    margin-bottom: 0.1rem;
+  }
+  .col-ghh { color: #e6e6e6; font-weight: 600; }
+  .col-ghe { color: #e6e6e6; font-weight: 600; }
+  .col-ghs, .col-ghr, .col-ghc { color: #8aa1b8; }
+
+  /* Per-finger ghost mini-table (one number per finger). */
+  .ghost-finger-table {
+    padding: 0 0 0.2rem;
+  }
+  .ghost-finger-row {
+    display: grid;
+    grid-template-columns: 90px minmax(0, 1fr);
+    column-gap: 0.6rem;
+    align-items: baseline;
+    padding: 0.18rem 0.75rem;
+    white-space: nowrap;
+  }
+  .col-gff { color: #e6e6e6; font-weight: 600; }
+  .col-gfn { color: #d5d5d5; }
+  /* Per-key ghost table (worst offenders). */
+  .ghost-key-table {
+    padding: 0 0 0.2rem;
+  }
+  .ghost-key-row {
+    display: grid;
+    grid-template-columns: 36px 80px 56px 44px 48px 44px;
+    column-gap: 0.4rem;
+    align-items: baseline;
+    padding: 0.18rem 0.75rem;
+    white-space: nowrap;
+  }
+  .ghost-key-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.25rem;
+    margin-bottom: 0.1rem;
+  }
+  .ghost-key-row:not(.ghost-key-head):nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
+  }
+  .col-gk { color: #e6e6e6; font-weight: 600; }
+  .col-gf { color: #8aa1b8; }
+  .col-ge { color: #e6e6e6; font-weight: 600; }
+  .col-gs, .col-gr, .col-gc { color: #8aa1b8; }
+  .ghost-more {
+    color: #6a747f;
+    font-style: italic;
+    padding: 0.25rem 0.75rem;
+  }
 
   /* Per-key table — scrolls inside .model-scroll. Header is sticky inside it. */
   .model-table {

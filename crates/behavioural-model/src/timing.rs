@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use volatility_map::{finger_for, Finger, Hand};
+use volatility_map::{anatomical_order, finger_for, Finger, Hand};
 
 use crate::events::InputEvent;
 use crate::MAX_TYPING_INTERVAL_MS;
@@ -141,21 +141,6 @@ fn mean(sum: u64, count: u64) -> f64 {
         0.0
     } else {
         sum as f64 / count as f64
-    }
-}
-
-fn anatomical_order(hand: Hand, finger: Finger) -> u8 {
-    match (hand, finger) {
-        (Hand::Left, Finger::Pinky) => 0,
-        (Hand::Left, Finger::Ring) => 1,
-        (Hand::Left, Finger::Middle) => 2,
-        (Hand::Left, Finger::Index) => 3,
-        (Hand::Left, Finger::Thumb) => 4,
-        (Hand::Right, Finger::Thumb) => 5,
-        (Hand::Right, Finger::Index) => 6,
-        (Hand::Right, Finger::Middle) => 7,
-        (Hand::Right, Finger::Ring) => 8,
-        (Hand::Right, Finger::Pinky) => 9,
     }
 }
 
