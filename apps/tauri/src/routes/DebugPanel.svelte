@@ -57,8 +57,23 @@
     avg_dwell_ms: number;
     avg_interval_ms: number;
   };
+  type HandStats = {
+    hand: Hand;
+    count: number;
+    avg_dwell_ms: number;
+    avg_interval_ms: number;
+  };
+  type AsymmetrySnapshot = {
+    left: HandStats;
+    right: HandStats;
+    dwell_ratio: number;
+    interval_ratio: number;
+    overall_score: number;
+    steadier_hand: Hand | null;
+  };
   type ModelSnapshot = {
     timing: { per_key: KeyTimingRow[]; per_finger: FingerTimingRow[] };
+    asymmetry: AsymmetrySnapshot;
   };
 
   type Row =
@@ -96,6 +111,7 @@
   // Latest L2 snapshot. Replaced wholesale on every model-snapshot event.
   let modelRows: KeyTimingRow[] = [];
   let fingerRows: FingerTimingRow[] = [];
+  let asymmetry: AsymmetrySnapshot | null = null;
 
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
@@ -229,6 +245,7 @@
       await listen<ModelSnapshot>("engine://model-snapshot", (e) => {
         modelRows = e.payload.timing.per_key;
         fingerRows = e.payload.timing.per_finger;
+        asymmetry = e.payload.asymmetry;
       }),
     );
   });
@@ -255,6 +272,25 @@
   function fmtKeyFinger(row: KeyTimingRow): string {
     if (!row.hand || !row.finger) return "—";
     return fmtFinger(row.hand, row.finger);
+  }
+  function fmtRatio(r: number): string {
+    return `${r.toFixed(2)}×`;
+  }
+  /**
+   * One-liner read of the asymmetry score. The aggregator now drives the
+   * decision off **dwell** only — interval is shown for diagnostics but is
+   * too easily contaminated by reading/thinking pauses to lead with, even
+   * after gap filtering. So the readout always cites dwell.
+   */
+  function asymmetryReadout(a: AsymmetrySnapshot): string {
+    if (a.left.count === 0 && a.right.count === 0) return "no keys observed yet";
+    if (a.steadier_hand === null) {
+      if (a.left.count === 0) return "only right hand observed so far";
+      if (a.right.count === 0) return "only left hand observed so far";
+      return "left and right have equal dwell";
+    }
+    const steadier = a.steadier_hand === "left" ? "Left" : "Right";
+    return `${steadier} hand steadier — ${fmtRatio(a.overall_score)} on dwell`;
   }
 </script>
 
@@ -336,6 +372,40 @@
 
       <!-- Pinned: small enough to always fit, important enough not to scroll away. -->
       <div class="model-pinned">
+        <div class="model-sub">ASYMMETRY · left vs right</div>
+        <div class="asym-table">
+          <div class="asym-row asym-head">
+            <span class="col-ah">hand</span>
+            <span class="col-an num">count</span>
+            <span class="col-ad num">avg dwell</span>
+            <span class="col-ai num">avg interval</span>
+          </div>
+          {#if asymmetry === null}
+            <div class="empty">no data yet…</div>
+          {:else}
+            <div class="asym-row asym-left">
+              <span class="col-ah">L</span>
+              <span class="col-an num">{asymmetry.left.count}</span>
+              <span class="col-ad num">{fmtMs(asymmetry.left.avg_dwell_ms)} ms</span>
+              <span class="col-ai num">{fmtMs(asymmetry.left.avg_interval_ms)} ms</span>
+            </div>
+            <div class="asym-row asym-right">
+              <span class="col-ah">R</span>
+              <span class="col-an num">{asymmetry.right.count}</span>
+              <span class="col-ad num">{fmtMs(asymmetry.right.avg_dwell_ms)} ms</span>
+              <span class="col-ai num">{fmtMs(asymmetry.right.avg_interval_ms)} ms</span>
+            </div>
+            <div class="asym-score">
+              <span class="asym-score-label">score</span>
+              <span class="asym-score-val num">{fmtRatio(asymmetry.overall_score)}</span>
+              <span class="asym-score-detail">
+                (dwell {fmtRatio(asymmetry.dwell_ratio)} · interval {fmtRatio(asymmetry.interval_ratio)})
+              </span>
+            </div>
+            <div class="asym-readout">{asymmetryReadout(asymmetry)}</div>
+          {/if}
+        </div>
+
         <div class="model-sub">PER FINGER · anatomical order</div>
         <div class="finger-table">
           <div class="finger-row finger-head">
@@ -581,6 +651,60 @@
     top: 0;
     background: #0d1117;
     z-index: 1;
+  }
+
+  /* Asymmetry block — left vs right rollup + single score + plain-language read.
+     Sits above PER FINGER inside .model-pinned (always visible). */
+  .asym-table {
+    padding: 0 0 0.4rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .asym-row {
+    display: grid;
+    grid-template-columns: 32px 60px minmax(0, 1fr) minmax(0, 1fr);
+    column-gap: 0.6rem;
+    align-items: baseline;
+    padding: 0.22rem 0.75rem;
+    white-space: nowrap;
+  }
+  .asym-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.3rem;
+    margin-bottom: 0.15rem;
+  }
+  /* Same hand tints as PER FINGER so left/right map visually between the
+     two tables. Letter labels ("L"/"R") still carry the meaning so it's
+     never colour-only. */
+  .asym-left:not(.asym-head) { background: rgba(120, 160, 220, 0.045); }
+  .asym-right:not(.asym-head) { background: rgba(220, 160, 120, 0.045); }
+  .col-ah { color: #e6e6e6; font-weight: 600; }
+  .col-an { color: #d5d5d5; }
+  .col-ad, .col-ai { color: #8aa1b8; }
+
+  .asym-score {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.35rem 0.75rem 0.1rem;
+    border-top: 1px dashed #2a2f36;
+    margin-top: 0.1rem;
+  }
+  .asym-score-label {
+    color: #7f8a96;
+    letter-spacing: 0.08em;
+  }
+  .asym-score-val {
+    color: #e6e6e6;
+    font-weight: 600;
+  }
+  .asym-score-detail {
+    color: #6a747f;
+    font-size: 11px;
+  }
+  .asym-readout {
+    color: #cdd5de;
+    padding: 0.1rem 0.75rem 0.3rem;
   }
 
   /* Per-finger rollup table. */

@@ -19,6 +19,20 @@ pub use events::{InputEvent, Modifiers, OutboundCommand};
 
 use serde::{Deserialize, Serialize};
 
+/// Inter-key intervals longer than this are treated as **pauses** (thinking,
+/// reading, glancing away) rather than typing motor speed, and excluded from
+/// the running aggregates. The anchor timestamp still advances, so the next
+/// genuinely-fast interval after a pause is counted normally.
+///
+/// Picked at the slow edge of active typing: 1500 ms ≈ 40 WPM minimum (5
+/// chars × 60 / 1.5 = 200 chars/min). Real typing is faster than this even
+/// for slow typists; anything above it is almost certainly a pause.
+///
+/// Shared by `timing` and `asymmetry` so the two aggregators apply the same
+/// rule. If we ever need a tighter cap for a specific surface, give it its
+/// own constant rather than relaxing this one.
+pub const MAX_TYPING_INTERVAL_MS: u64 = 1500;
+
 /// The aggregate state Layer 2 maintains. Layer 3 will eventually project this
 /// into a `VolatilityMap`; for now `snapshot()` returns a diagnostic
 /// [`ModelSnapshot`] for the debug view.
@@ -54,6 +68,7 @@ impl BehaviouralModel {
     pub fn snapshot(&self) -> ModelSnapshot {
         ModelSnapshot {
             timing: self.timing.snapshot(),
+            asymmetry: self.asymmetry.snapshot(),
         }
     }
 }
@@ -61,6 +76,7 @@ impl BehaviouralModel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSnapshot {
     pub timing: timing::TimingSnapshot,
+    pub asymmetry: asymmetry::AsymmetrySnapshot,
 }
 
 #[cfg(test)]
