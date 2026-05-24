@@ -7,7 +7,7 @@
 pub mod confidence;
 pub mod schema;
 
-pub use confidence::{Confidence, Finger, Hand};
+pub use confidence::{finger_for, Confidence, Finger, Hand};
 pub use schema::{
     KeyConfidence, ProfileContext, SwapPair, TimeOfDay, VolatilityMap, SCHEMA_VERSION,
 };
