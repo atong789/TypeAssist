@@ -35,6 +35,16 @@ Persistence: `crates/storage/` (SQLite via sqlx).
 
 These override implementation convenience. If a feature seems to want a slider, find another shape.
 
+## Recovery physiology
+
+After stroke, fingers recover at physiologically different rates — not by the user's choice. **Thumb and index regain independent control fastest**; the outer three (middle, ring, little) are more tendon-interconnected and recover slowest, **ring and little especially**. This is anatomy, not effort. The engine must be finger-aware about it:
+
+1. **Frame as physiology, not failure.** Higher slip rates and slower improvement on slow-recovery fingers are NORMAL physiology — never the user's failure. UI copy, progress framings, and insights treat a slow ring finger the way physical therapy treats a slow leg: expected, not a deficit.
+2. **Weight correction priors by finger.** Downstream of L2, the correction engine should bias confidence by which finger is involved. A slip on a slow-recovery finger is more likely a motor error to smooth; an unusual key under thumb or index is more likely intentional and should be left alone. This applies to the L4 confidence tiers (`Gentle`/`Balanced`/`Bold`) and to swap-pair scoring in L3.
+3. **Calibrate progress per finger.** Grade each finger against *its own* expected recovery curve, so a slow finger is never made to feel like it's lagging the others. Progress on Progress's "where your hands are gaining ground" is per-finger, not whole-hand.
+
+Sourced from the builder's lived stroke-recovery experience — load-bearing for both engine weighting and UI tone.
+
 ## Accessibility standards — non-negotiable
 
 TypeAssist's users have motor difficulties (stroke survivors, arthritis). Large, mouse-forgiving targets and full keyboard operability are the *core of the product*, not enhancements. Every screen must meet all of these:
