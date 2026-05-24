@@ -151,6 +151,8 @@ Open questions surfaced during development that don't have a settled answer yet.
 
 - **Coexistence with macOS system autocorrect.** Most macOS text fields run their own autocorrect, so it operates on the same keystroke stream as TypeAssist. The two solve different problems — macOS is dictionary-based (whole known words), TypeAssist is motor/spatial (the specific slip a hand makes) — but they can collide on the same keystroke, and a system correction can easily be mistaken for one of ours. Open question: how the two should coexist. Options to weigh: detect-and-defer when a system correction is in flight; document testing with system autocorrect off; or confirm it's a non-issue in practice. Surfaced during debug-view testing when macOS corrected `cuty → city` while our engine correctly reported `LEFT ALONE`.
 
+- **L2 fatigue and temporal aggregators are deferred until after L4 correction exists.** Both are **modifiers** — they adjust *how much help* the correction engine gives (e.g. lean in more as a hand or finger tires within a session; bias differently for cold-start morning vs steady afternoon). With no correction engine to modulate, there's nothing for them to act on, so building them now would be observation-without-purpose. Revisit once L4 is live — the fatigue-aware "help more when you're tiring" idea is valuable then.
+
 ## Things to never do
 
 - Do not introduce a slider control anywhere in the UI.

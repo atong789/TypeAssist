@@ -30,6 +30,9 @@ pub const EVT_KEYSTROKE: &str = "engine://keystroke";
 pub const EVT_DECISION: &str = "engine://decision";
 pub const EVT_INJECTION: &str = "engine://injection";
 pub const EVT_MODEL_SNAPSHOT: &str = "engine://model-snapshot";
+/// Fired once per confirmed slip detected by L2's `SlipDetector` during
+/// ingest. The debug panel marks these in the feed.
+pub const EVT_SLIP: &str = "engine://slip";
 
 #[derive(Serialize, Clone)]
 struct KeystrokePayload {
@@ -110,8 +113,14 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                         let t_ingest = Instant::now();
                         model.ingest(&parsed);
                         let lat = t_ingest.elapsed().as_secs_f64() * 1000.0;
+                        // Drain any slips L2 confirmed during this ingest
+                        // and broadcast them — one event per slip so the
+                        // panel can mark each in the feed in order.
+                        for slip in model.take_new_slips() {
+                            let _ = app_handle.emit(EVT_SLIP, slip);
+                        }
                         // Broadcast the new model state so the debug "Model
-                        // state" table updates live as the user types.
+                        // state" tables update live as the user types.
                         let _ = app_handle.emit(EVT_MODEL_SNAPSHOT, model.snapshot());
                         lat
                     } else {

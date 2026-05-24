@@ -107,10 +107,32 @@
     /// Keystrokes left before the threshold goes live; 0 once active.
     warmup_remaining: number;
   };
+  type PairSlipRow = {
+    aimed_for: string;
+    hit_instead: string;
+    hand: Hand | null;
+    finger: Finger | null;
+    count: number;
+    last_seen_ms: number;
+  };
+  type SlipsSnapshot = {
+    total_slips: number;
+    per_pair: PairSlipRow[];
+    map_swap_pairs: number;
+    map_key_confidence: number;
+  };
+  type SlipPayload = {
+    aimed_for: string;
+    hit_instead: string;
+    hand: Hand | null;
+    finger: Finger | null;
+    timestamp_ms: number;
+  };
   type ModelSnapshot = {
     timing: { per_key: KeyTimingRow[]; per_finger: FingerTimingRow[] };
     asymmetry: AsymmetrySnapshot;
     ghost_keys: GhostKeysSnapshot;
+    slips: SlipsSnapshot;
   };
 
   /// Cap on the per-key ghost list — keep the worst offenders visible,
@@ -133,6 +155,14 @@
         delete_count: number;
         replacement: string;
         injection_latency_ms: number;
+      }
+    | {
+        id: number;
+        kind: "slip";
+        aimed_for: string;
+        hit_instead: string;
+        hand: Hand | null;
+        finger: Finger | null;
       };
 
   // Cap the feed so a long session doesn't pin unbounded memory / DOM.
@@ -154,6 +184,7 @@
   let fingerRows: FingerTimingRow[] = [];
   let asymmetry: AsymmetrySnapshot | null = null;
   let ghostKeys: GhostKeysSnapshot | null = null;
+  let slips: SlipsSnapshot | null = null;
 
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
@@ -289,6 +320,19 @@
         fingerRows = e.payload.timing.per_finger;
         asymmetry = e.payload.asymmetry;
         ghostKeys = e.payload.ghost_keys;
+        slips = e.payload.slips;
+      }),
+    );
+    unlistens.push(
+      await listen<SlipPayload>("engine://slip", (e) => {
+        push({
+          id: nextId++,
+          kind: "slip",
+          aimed_for: e.payload.aimed_for,
+          hit_instead: e.payload.hit_instead,
+          hand: e.payload.hand,
+          finger: e.payload.finger,
+        });
       }),
     );
   });
@@ -401,6 +445,13 @@
               <span class="col-word">deleted {row.delete_count}, typed "{row.replacement}"</span>
               <span class="col-lat">e2e {fmtMs(row.injection_latency_ms)} ms</span>
             </div>
+          {:else if row.kind === "slip"}
+            <div class="row row-slip">
+              <span class="tag">SLIP</span>
+              <span class="badge badge-slip">CANDIDATE</span>
+              <span class="col-word">aimed {fmtKey(row.aimed_for)} · hit {fmtKey(row.hit_instead)}</span>
+              <span class="col-lat">{fmtKeyFinger(row)}</span>
+            </div>
           {/if}
         {/each}
         {#if rows.length === 0}
@@ -472,10 +523,43 @@
         </div>
       </div>
 
-      <!-- Scrolling: GHOST KEYS (candidate ghosts) then PER KEY table.
+      <!-- Scrolling: SLIPS (first L3 learning loop) → GHOST KEYS → PER KEY.
            Each section's sub-header is sticky so it stays visible as you
            scroll within the section. -->
       <div class="model-scroll">
+        <div class="model-sub model-sub-sticky">SLIPS · strict-filtered candidates · writes to L3 map</div>
+        <div class="slip-block">
+          {#if slips === null}
+            <div class="empty">no data yet…</div>
+          {:else}
+            <div class="slip-status">
+              total <span class="num slip-total">{slips.total_slips}</span>
+              · L3 map: <span class="num">{slips.map_swap_pairs}</span> swap pairs,
+              <span class="num">{slips.map_key_confidence}</span> key entries
+            </div>
+            {#if slips.per_pair.length === 0}
+              <div class="empty">no slips confirmed yet…</div>
+            {:else}
+              <div class="slip-table">
+                <div class="slip-row slip-head">
+                  <span class="col-sa">aimed</span>
+                  <span class="col-sh">hit</span>
+                  <span class="col-sf">finger</span>
+                  <span class="col-sn num">count</span>
+                </div>
+                {#each slips.per_pair as p (`${p.aimed_for}-${p.hit_instead}`)}
+                  <div class="slip-row">
+                    <span class="col-sa">{fmtKey(p.aimed_for)}</span>
+                    <span class="col-sh">{fmtKey(p.hit_instead)}</span>
+                    <span class="col-sf">{fmtKeyFinger(p)}</span>
+                    <span class="col-sn num">{p.count}</span>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          {/if}
+        </div>
+
         <div class="model-sub model-sub-sticky">GHOST KEYS · likely, not certain</div>
         <div class="ghost-block">
           {#if ghostKeys === null}
@@ -755,6 +839,13 @@
     color: #c8c8c8;
     border: 1px solid #3a3a3a;
   }
+  /* Slip candidate — distinct amber so it stands apart from CORRECTED green
+     and LEFT-ALONE grey, but text label still carries the meaning. */
+  .badge-slip {
+    background: #3a2f1a;
+    color: #e6c98a;
+    border: 1px solid #6a5320;
+  }
 
   .col-key { color: #e6e6e6; font-weight: 600; }
   .col-dwell, .col-lat { color: #8aa1b8; }
@@ -765,6 +856,13 @@
   .row-injection,
   .row-matched {
     border-left: 2px solid #2e5a2e;
+    padding-left: 0.6rem;
+  }
+  /* Same trick for SLIP rows — amber rail mirrors the badge colour but the
+     text tag is still load-bearing. */
+  .row-slip {
+    grid-template-columns: 70px auto minmax(0, 1fr) auto;
+    border-left: 2px solid #6a5320;
     padding-left: 0.6rem;
   }
 
@@ -875,6 +973,46 @@
   .col-ff { color: #e6e6e6; font-weight: 600; }
   .col-fn { color: #d5d5d5; }
   .col-fd, .col-fi { color: #8aa1b8; }
+
+  /* SLIPS — first L3 learning loop. Status + per-pair table.
+     Sits at the very top of .model-scroll. */
+  .slip-block {
+    padding: 0.25rem 0 0.5rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .slip-status {
+    color: #8893a0;
+    padding: 0.15rem 0.75rem 0.4rem;
+    font-size: 11px;
+  }
+  .slip-total {
+    color: #e6c98a;
+    font-weight: 600;
+  }
+  .slip-table {
+    padding: 0 0 0.2rem;
+  }
+  .slip-row {
+    display: grid;
+    grid-template-columns: 44px 44px minmax(0, 1fr) 56px;
+    column-gap: 0.5rem;
+    align-items: baseline;
+    padding: 0.2rem 0.75rem;
+    white-space: nowrap;
+  }
+  .slip-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.25rem;
+    margin-bottom: 0.1rem;
+  }
+  .slip-row:not(.slip-head):nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
+  }
+  .col-sa { color: #e6c98a; font-weight: 600; }
+  .col-sh { color: #d5d5d5; }
+  .col-sf { color: #8aa1b8; }
+  .col-sn { color: #e6e6e6; font-weight: 600; }
 
   /* GHOST KEYS — totals header + per-finger rollup + per-key worst-first.
      Sits at the top of .model-scroll, above PER KEY. */
