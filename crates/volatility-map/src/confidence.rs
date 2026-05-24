@@ -65,6 +65,29 @@ pub fn finger_for(key: &str) -> Option<(Hand, Finger)> {
     Some(pair)
 }
 
+/// Stable left-to-right ordering of every `(Hand, Finger)` pair, anatomical:
+/// left pinky first, right pinky last. Use as a sort key wherever per-finger
+/// data is displayed so the rows read like a keyboard.
+///
+/// Lives at L3 next to `Finger`/`Hand`/`finger_for` so L2's aggregators
+/// (timing, ghost-keys, …) share one definition.
+pub fn anatomical_order(hand: Hand, finger: Finger) -> u8 {
+    use Finger::*;
+    use Hand::*;
+    match (hand, finger) {
+        (Left, Pinky) => 0,
+        (Left, Ring) => 1,
+        (Left, Middle) => 2,
+        (Left, Index) => 3,
+        (Left, Thumb) => 4,
+        (Right, Thumb) => 5,
+        (Right, Index) => 6,
+        (Right, Middle) => 7,
+        (Right, Ring) => 8,
+        (Right, Pinky) => 9,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

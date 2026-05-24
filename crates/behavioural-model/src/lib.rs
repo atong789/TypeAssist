@@ -69,6 +69,7 @@ impl BehaviouralModel {
         ModelSnapshot {
             timing: self.timing.snapshot(),
             asymmetry: self.asymmetry.snapshot(),
+            ghost_keys: self.ghost_keys.snapshot(),
         }
     }
 }
@@ -77,6 +78,7 @@ impl BehaviouralModel {
 pub struct ModelSnapshot {
     pub timing: timing::TimingSnapshot,
     pub asymmetry: asymmetry::AsymmetrySnapshot,
+    pub ghost_keys: ghost_keys::GhostKeysSnapshot,
 }
 
 #[cfg(test)]

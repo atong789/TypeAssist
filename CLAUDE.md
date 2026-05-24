@@ -117,6 +117,10 @@ TypeAssist sees user typing on three kinds of surface: the **ambient** OS-wide c
 - **Space-error types**: `MissingSpace`, `ExtraSpace`, `ModifierDrift`.
 - **Outcome states** (per word): `CleanHit`, `SelfCorrected`, `UncorrectedMiss`, `TwoKeysTogether`. All four are intentional — do not collapse to three. Self-corrections via backspace are signal, not failure.
 
+## Ghost-key signals (L2)
+
+Ghost-key detections are **low-confidence candidate signals only** — the aggregator flags phantom-like patterns (graze-short dwell, rapid same-key repeats, key-then-immediate-backspace) but cannot confirm intent. Confidence stays low until the slip-detection loop provides labeled corrections.
+
 ## Target platform
 
 macOS 13 (Ventura) or later. Windows and Android adapters are future work; the L1 boundary is shaped to make them pluggable. L2–L4 must never call OS-specific APIs directly.
