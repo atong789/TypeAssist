@@ -5,7 +5,11 @@
   import WarmUp from "./routes/WarmUp.svelte";
   import Today from "./routes/Today.svelte";
   import Progress from "./routes/Progress.svelte";
+  import DebugPanel from "./routes/DebugPanel.svelte";
   import { tick } from "svelte";
+
+  // Builder's debug view — hidden behind Cmd+Shift+D. Not a user feature.
+  let debugOpen = false;
 
   type Route = "home" | "today" | "warmup" | "practice" | "settings" | "progress";
 
@@ -103,6 +107,13 @@
   }
 
   function onWindowKeydown(event: KeyboardEvent) {
+    // Cmd+Shift+D toggles the builder's debug panel. Caught here so it works
+    // from any screen and doesn't depend on focus being inside the panel.
+    if (event.metaKey && event.shiftKey && (event.key === "d" || event.key === "D")) {
+      event.preventDefault();
+      debugOpen = !debugOpen;
+      return;
+    }
     if (event.key !== "Tab" || !rootEl) return;
     const tabbables = realTabbables();
     if (tabbables.length === 0) return;
@@ -166,6 +177,10 @@
     {/if}
   </div>
 </main>
+
+{#if debugOpen}
+  <DebugPanel />
+{/if}
 
 <style>
   main {

@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 use behavioural_model::{InputEvent, OutboundCommand};
-use correction_engine::skeleton_lookup;
+use correction_engine::{boundary_char, is_word_char, skeleton_lookup};
 
 fn main() {
     let raw_path = std::env::args().nth(1).unwrap_or_else(|| {
@@ -98,25 +98,6 @@ fn main() {
     }
 
     let _ = child.wait();
-}
-
-/// If `key` is a single word-boundary character, return it; else `None`.
-fn boundary_char(key: &str) -> Option<char> {
-    let mut chars = key.chars();
-    let c = chars.next()?;
-    if chars.next().is_some() {
-        return None;
-    }
-    c.is_whitespace().then_some(c)
-}
-
-/// A single printable, non-whitespace, non-control character belongs to a word.
-fn is_word_char(key: &str) -> bool {
-    let mut chars = key.chars();
-    match (chars.next(), chars.next()) {
-        (Some(c), None) => !c.is_control() && !c.is_whitespace(),
-        _ => false,
-    }
 }
 
 fn send(stdin: &mut impl Write, cmd: &OutboundCommand) {

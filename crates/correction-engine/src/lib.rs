@@ -75,3 +75,25 @@ pub fn skeleton_lookup(word: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// If `key` is a single whitespace word-boundary character, return it.
+///
+/// Shared by the walking-skeleton binary and the Tauri host so they assemble
+/// words identically.
+pub fn boundary_char(key: &str) -> Option<char> {
+    let mut chars = key.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    c.is_whitespace().then_some(c)
+}
+
+/// A single printable, non-whitespace, non-control character belongs to a word.
+pub fn is_word_char(key: &str) -> bool {
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => !c.is_control() && !c.is_whitespace(),
+        _ => false,
+    }
+}
