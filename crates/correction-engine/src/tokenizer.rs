@@ -802,6 +802,21 @@ mod tests {
     }
 
     #[test]
+    fn mid_line_insert_rebuild_produces_correct_token() {
+        // Mirrors the engine's behaviour after the user types "color",
+        // Left, "u", space. The engine rebuilds the tokenizer from the
+        // line buffer after the mid-line 'u' insert, so the sealed token
+        // is "colour" — not the forward-only "coloru" that streaming
+        // alone would produce. We test the rebuild outcome directly.
+        let toks = tokenize("colour ");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].core, "colour");
+        assert_eq!((toks[0].start, toks[0].end), (0, 6));
+        assert_eq!(toks[0].kind, TokenKind::Word);
+        assert!(toks[0].correctable);
+    }
+
+    #[test]
     fn classifier_does_not_break_pre_existing_kinds() {
         // 3.14 stays Number, don't / well-known stay Word — guard the
         // happy-path cases the regression brief calls out.
