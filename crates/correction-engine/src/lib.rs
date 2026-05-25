@@ -8,6 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod tokenizer;
+pub use tokenizer::{Token, TokenKind, Tokenizer, TOKENIZER_VERSION};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfidenceTier {

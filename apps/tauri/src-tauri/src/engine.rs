@@ -16,11 +16,14 @@
 //!   `engine://decision`        — at a word boundary, with decision latency
 //!   `engine://injection`       — when a correction fired, with end-to-end latency
 //!   `engine://model-snapshot`  — L2 state after each ingested event
+//!   `engine://slip`            — one event per confirmed slip (L3 learning loop)
+//!   `engine://token`           — one event per sealed L4 token (Observing brief Component 1)
+//!   `engine://line-reset`      — fired when the tokenizer line resets (newline / backspace rebuild / special key)
 
 use std::time::Instant;
 
 use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
-use correction_engine::{boundary_char, is_word_char, skeleton_lookup};
+use correction_engine::{boundary_char, is_word_char, skeleton_lookup, Tokenizer};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_shell::process::CommandEvent;
@@ -33,6 +36,12 @@ pub const EVT_MODEL_SNAPSHOT: &str = "engine://model-snapshot";
 /// Fired once per confirmed slip detected by L2's `SlipDetector` during
 /// ingest. The debug panel marks these in the feed.
 pub const EVT_SLIP: &str = "engine://slip";
+/// Fired when the streaming tokenizer seals a token on the current line.
+/// Payload is a [`Token`]. The debug panel's TOKENS section listens.
+pub const EVT_TOKEN: &str = "engine://token";
+/// Fired when the tokenizer resets to a new line — newline pressed, or the
+/// caller rebuilt after a backspace. Payload is empty.
+pub const EVT_LINE_RESET: &str = "engine://line-reset";
 
 #[derive(Serialize, Clone)]
 struct KeystrokePayload {
@@ -81,6 +90,13 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
         // L2 lives here for the life of the engine. Single owner, single async
         // task — no sync needed.
         let mut model = BehaviouralModel::new();
+        // L4 streaming tokenizer (Component 1 of the Observing brief).
+        // Observe-only: it produces Tokens for the debug view; it does NOT
+        // influence the correction decision yet. We also keep a tiny char
+        // buffer for the current line so backspaces can rebuild cheaply
+        // (the tokenizer itself is forward-only).
+        let mut tokenizer = Tokenizer::new();
+        let mut line_buf: Vec<char> = Vec::new();
 
         while let Some(event) = rx.recv().await {
             match event {
@@ -150,6 +166,23 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                 },
                             );
                             word.pop();
+
+                            // Tokenizer is forward-only; rebuild the current
+                            // line from `line_buf` minus the last char and
+                            // re-emit tokens to the panel.
+                            if !line_buf.is_empty() {
+                                line_buf.pop();
+                            }
+                            tokenizer.reset_line();
+                            let _ = app_handle.emit(EVT_LINE_RESET, ());
+                            // Snapshot the buffer up front — observe_char
+                            // borrows tokenizer mutably during iteration.
+                            let replay: Vec<char> = line_buf.clone();
+                            for c in replay {
+                                if let Some(tok) = tokenizer.observe_char(c) {
+                                    let _ = app_handle.emit(EVT_TOKEN, tok);
+                                }
+                            }
                         }
                         InputEvent::Key { key, dwell_ms, .. } => {
                             let _ = app_handle.emit(
@@ -160,6 +193,38 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                     ingest_latency_ms,
                                 },
                             );
+
+                            // Feed the tokenizer (L4 Observing, Component 1).
+                            // Single-char keys go through; multi-char keys
+                            // ("Escape", "ArrowLeft", …) reset the line —
+                            // we've lost the typing context anyway.
+                            {
+                                let mut ch_iter = key.chars();
+                                match (ch_iter.next(), ch_iter.next()) {
+                                    (Some(c), None) => {
+                                        if c == '\n' || c == '\r' {
+                                            // observe_char will seal-and-reset internally;
+                                            // we still emit LINE_RESET so the panel clears.
+                                            if let Some(tok) = tokenizer.observe_char(c) {
+                                                let _ = app_handle.emit(EVT_TOKEN, tok);
+                                            }
+                                            line_buf.clear();
+                                            let _ = app_handle.emit(EVT_LINE_RESET, ());
+                                        } else {
+                                            line_buf.push(c);
+                                            if let Some(tok) = tokenizer.observe_char(c) {
+                                                let _ = app_handle.emit(EVT_TOKEN, tok);
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        // Special key — abandon current line context.
+                                        tokenizer.reset_line();
+                                        line_buf.clear();
+                                        let _ = app_handle.emit(EVT_LINE_RESET, ());
+                                    }
+                                }
+                            }
 
                             if let Some(boundary) = boundary_char(&key) {
                                 let lookup_result = skeleton_lookup(&word);
