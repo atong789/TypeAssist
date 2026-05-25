@@ -8,7 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod anchor;
 pub mod tokenizer;
+pub use anchor::{AnchorState, AnchorTracker, AnchorsSnapshot, SpanAnchor, VoidReason};
 pub use tokenizer::{Token, TokenKind, Tokenizer, TOKENIZER_VERSION};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

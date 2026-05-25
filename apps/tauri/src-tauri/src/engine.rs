@@ -19,11 +19,14 @@
 //!   `engine://slip`            — one event per confirmed slip (L3 learning loop)
 //!   `engine://token`           — one event per sealed L4 token (Observing brief Component 1)
 //!   `engine://line-reset`      — fired when the tokenizer line resets (newline / backspace rebuild / special key)
+//!   `engine://anchor-snapshot` — full `AnchorsSnapshot` after every anchor change (Observing brief Component 2)
 
 use std::time::Instant;
 
 use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
-use correction_engine::{boundary_char, is_word_char, skeleton_lookup, Tokenizer};
+use correction_engine::{
+    boundary_char, is_word_char, skeleton_lookup, AnchorTracker, TokenKind, Tokenizer,
+};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_shell::process::CommandEvent;
@@ -42,6 +45,120 @@ pub const EVT_TOKEN: &str = "engine://token";
 /// Fired when the tokenizer resets to a new line — newline pressed, or the
 /// caller rebuilt after a backspace. Payload is empty.
 pub const EVT_LINE_RESET: &str = "engine://line-reset";
+/// Fired after every change to L4's anchor tracker (register / edit-delta /
+/// clear). Payload is an `AnchorsSnapshot`. Debug-view ANCHORS section
+/// listens — it doesn't try to derive anchor state from individual edits.
+pub const EVT_ANCHOR_SNAPSHOT: &str = "engine://anchor-snapshot";
+
+// macOS's `CGEvent.keyboardGetUnicodeString` translates navigation /
+// function keys differently depending on the layout and the Fn modifier
+// state. Both forms turn up in practice:
+//
+//   * C0 cursor-control range (US English layout, Fn off):
+//     U+001C Left, U+001D Right, U+001E Up, U+001F Down.
+//   * AppKit NSEvent function-key constants (private-use, with Fn on or
+//     other layouts): U+F700..=U+F8FF — Left U+F702, Home U+F729, etc.
+//
+// Neither form is text. They must never reach line_buf, the tokenizer
+// core, or the skeleton word buffer (otherwise they render as box glyphs
+// inside tokens). Both forms are filtered out by `is_non_text_key`; the
+// known-nav codepoints below are mapped to caret moves.
+const KEY_C0_LEFT: char = '\u{001C}';
+const KEY_C0_RIGHT: char = '\u{001D}';
+// Up/Down kept here for documentation and tests — they're filtered out
+// (via `is_non_text_key`) but deliberately not mapped to caret moves in
+// the single-line model. Marked dead_code so the binary build doesn't
+// warn; the test module references them.
+#[allow(dead_code)]
+const KEY_C0_UP: char = '\u{001E}';
+#[allow(dead_code)]
+const KEY_C0_DOWN: char = '\u{001F}';
+const KEY_NS_LEFT: char = '\u{F702}';
+const KEY_NS_RIGHT: char = '\u{F703}';
+#[allow(dead_code)]
+const KEY_NS_UP: char = '\u{F700}';
+#[allow(dead_code)]
+const KEY_NS_DOWN: char = '\u{F701}';
+const KEY_NS_HOME: char = '\u{F729}';
+const KEY_NS_END: char = '\u{F72B}';
+
+/// True if `c` is a non-text key signal — a control character or an
+/// AppKit private-use function-key code. These codepoints exist only to
+/// tell the app "the user pressed this key"; they must not enter any text
+/// buffer.
+///
+/// `\n` `\r` `\t` are deliberate exceptions: the engine handles newline /
+/// carriage-return as line resets and treats tab as a whitespace boundary
+/// the tokenizer is allowed to see. Every other control char and every
+/// codepoint in U+F700..=U+F8FF is filtered.
+fn is_non_text_key(c: char) -> bool {
+    if c == '\n' || c == '\r' || c == '\t' {
+        return false;
+    }
+    c.is_control() || (0xF700..=0xF8FF).contains(&(c as u32))
+}
+
+/// THE coherent nav-key handler: given a non-text codepoint, the current
+/// caret + line length, and whether the Command modifier is held, return
+/// the caret's new position. `None` means the char isn't a mapped nav key
+/// (caller leaves the caret alone — function key, etc.).
+///
+/// All four nav keys live here so they can't drift apart between fixes:
+///   Left            → caret − 1 (saturating)
+///   Right           → caret + 1 (clamped to line_len)
+///   Cmd+Left        → 0          (macOS convention for Home)
+///   Cmd+Right       → line_len   (macOS convention for End)
+///   Home (NS Home)  → 0          (dedicated key, external keyboard)
+///   End (NS End)    → line_len   (dedicated key, external keyboard)
+///
+/// **`modifiers.function` is deliberately not consulted.** On a MacBook
+/// every arrow press has `fn=true` (the arrows live in the function-key
+/// cluster), so a Fn-modifier branch routes every plain Left into the
+/// Home branch — the regression we already hit. The Command modifier IS
+/// safe: it distinguishes the user's deliberate "go to start of line"
+/// gesture from plain navigation.
+fn nav_action(c: char, caret: usize, line_len: usize, command: bool) -> Option<usize> {
+    match c {
+        KEY_C0_LEFT | KEY_NS_LEFT => {
+            if command {
+                Some(0)
+            } else {
+                Some(caret.saturating_sub(1))
+            }
+        }
+        KEY_C0_RIGHT | KEY_NS_RIGHT => {
+            if command {
+                Some(line_len)
+            } else {
+                Some((caret + 1).min(line_len))
+            }
+        }
+        KEY_NS_HOME => Some(0),
+        KEY_NS_END => Some(line_len),
+        _ => None,
+    }
+}
+
+/// THE single entry point that puts a character into `line_buf`. Anything
+/// that would write to the buffer goes through here so the non-text guard
+/// is impossible to bypass. Returns the new caret position, or `None` if
+/// the char was rejected (control or function-key code) — in which case
+/// the buffer is unchanged.
+fn insert_text_char(line_buf: &mut Vec<char>, caret: usize, c: char) -> Option<usize> {
+    if is_non_text_key(c) {
+        // Defensive log — should be unreachable now that the Key arm
+        // gates non-text codepoints earlier, but if it ever fires we see
+        // exactly which codepoint slipped through.
+        tracing::warn!(
+            "rejected non-text codepoint U+{:04X} at line_buf entry",
+            c as u32
+        );
+        return None;
+    }
+    let p = caret.min(line_buf.len());
+    line_buf.insert(p, c);
+    Some(p + 1)
+}
 
 #[derive(Serialize, Clone)]
 struct KeystrokePayload {
@@ -60,6 +177,28 @@ struct DecisionPayload {
     /// Time from receiving the boundary keystroke to the decision being made.
     /// Includes the ingest cost above — measured from key arrival.
     decision_latency_ms: f64,
+}
+
+/// Emission wrapper for an anchor snapshot. The pure
+/// [`correction_engine::AnchorsSnapshot`] is kept minimal for tests; this
+/// adds the current line buffer so the panel can render text-now-at-span
+/// without doing its own keystroke book-keeping.
+#[derive(Serialize, Clone)]
+struct AnchorEmitPayload<'a> {
+    anchors: &'a [correction_engine::SpanAnchor],
+    void_count: u32,
+    current_line: String,
+}
+
+fn anchor_emit_payload<'a>(
+    snap: &'a correction_engine::AnchorsSnapshot,
+    line: &[char],
+) -> AnchorEmitPayload<'a> {
+    AnchorEmitPayload {
+        anchors: &snap.anchors,
+        void_count: snap.void_count,
+        current_line: line.iter().collect(),
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -97,6 +236,16 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
         // (the tokenizer itself is forward-only).
         let mut tokenizer = Tokenizer::new();
         let mut line_buf: Vec<char> = Vec::new();
+        // L4 Observing brief, Component 2: span anchor tracker. The tracker
+        // is engine-owned (not panel-side) so its edit-delta logic is pure
+        // Rust and the panel just renders snapshots. Each sealed Word token
+        // is offered to `try_register` (it dedupes replay).
+        let mut anchors = AnchorTracker::new();
+        // Caret position in `line_buf` (char index). Anchor edit deltas
+        // (p, d, i) are computed from this. Updated on inserts, backspaces,
+        // and Left / Right / Home / End nav keys; mouse-click moves and
+        // paste are intentionally out of scope (Component 5 AX backstop).
+        let mut caret: usize = 0;
 
         while let Some(event) = rx.recv().await {
             match event {
@@ -167,24 +316,58 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                             );
                             word.pop();
 
-                            // Tokenizer is forward-only; rebuild the current
-                            // line from `line_buf` minus the last char and
-                            // re-emit tokens to the panel.
-                            if !line_buf.is_empty() {
-                                line_buf.pop();
+                            // Anchor delta — apply BEFORE mutating line_buf
+                            // so we can read the deleted char (needed for
+                            // Merge detection on boundary whitespace).
+                            if caret > 0 && caret <= line_buf.len() {
+                                let p = caret - 1;
+                                let deleted = line_buf[p];
+                                anchors.apply_delete(p, deleted);
+                                line_buf.remove(p);
+                                caret -= 1;
                             }
+
+                            // Tokenizer is forward-only; rebuild the line
+                            // and re-emit tokens. `try_register` dedupes
+                            // replay so the anchor list isn't disturbed —
+                            // the deltas above already updated existing
+                            // anchors to their new positions.
                             tokenizer.reset_line();
                             let _ = app_handle.emit(EVT_LINE_RESET, ());
-                            // Snapshot the buffer up front — observe_char
-                            // borrows tokenizer mutably during iteration.
                             let replay: Vec<char> = line_buf.clone();
                             for c in replay {
                                 if let Some(tok) = tokenizer.observe_char(c) {
+                                    if matches!(tok.kind, TokenKind::Word) {
+                                        anchors.try_register(tok.start, tok.end, &tok.core);
+                                    }
                                     let _ = app_handle.emit(EVT_TOKEN, tok);
                                 }
                             }
+                            let snap = anchors.snapshot();
+                            let _ = app_handle.emit(
+                                EVT_ANCHOR_SNAPSHOT,
+                                anchor_emit_payload(&snap, &line_buf),
+                            );
                         }
-                        InputEvent::Key { key, dwell_ms, .. } => {
+                        InputEvent::Key { key, dwell_ms, modifiers, .. } => {
+                            // Diagnostic log of the raw incoming codepoint(s)
+                            // and modifier flags, so we can verify what the
+                            // sidecar is actually emitting. INFO level on
+                            // purpose — load-bearing while the nav-key story
+                            // settles; demote once stable.
+                            tracing::info!(
+                                "key in: {:?} chars=[{}] fn={} shift={} ctrl={} opt={} cmd={}",
+                                key,
+                                key.chars()
+                                    .map(|c| format!("U+{:04X}", c as u32))
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                modifiers.function,
+                                modifiers.shift,
+                                modifiers.control,
+                                modifiers.option,
+                                modifiers.command,
+                            );
                             let _ = app_handle.emit(
                                 EVT_KEYSTROKE,
                                 KeystrokePayload {
@@ -194,36 +377,155 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                 },
                             );
 
-                            // Feed the tokenizer (L4 Observing, Component 1).
-                            // Single-char keys go through; multi-char keys
-                            // ("Escape", "ArrowLeft", …) reset the line —
-                            // we've lost the typing context anyway.
-                            {
+                            // macOS reports navigation / function keys as
+                            // either C0 control codes (U+001C–U+001F for
+                            // arrows on US English layout) or AppKit
+                            // private-use codes (U+F700..=U+F8FF, with Fn
+                            // on or other layouts). Neither form is text —
+                            // they must never reach line_buf, the tokenizer
+                            // core, or the skeleton word buffer (otherwise
+                            // they render as box glyphs inside tokens).
+                            // Filter first, then map the known nav codes.
+                            let single_char = {
+                                let mut it = key.chars();
+                                match (it.next(), it.next()) {
+                                    (Some(c), None) => Some(c),
+                                    _ => None,
+                                }
+                            };
+                            let is_non_text = matches!(
+                                single_char,
+                                Some(c) if is_non_text_key(c)
+                            );
+
+                            if is_non_text {
+                                // Caret-only handling. Left/Right/Home/End
+                                // map to caret moves; Up/Down and every
+                                // other non-text codepoint are intentional
+                                // no-ops for the single-line model. No
+                                // edit, no token feed, no skeleton-word
+                                // touch — and the buffer is never written.
+                                let c = single_char.unwrap();
+                                tracing::info!(
+                                    "non-text key U+{:04X} — caret-only handling",
+                                    c as u32
+                                );
+                                // ONE coherent handler for all four nav
+                                // keys. Anything not mapped (Up/Down,
+                                // F1–F12, other PU codepoints) returns
+                                // `None` and we no-op. The Command flag
+                                // distinguishes Cmd+Left/Right (= Home/End
+                                // on macOS) from plain arrow navigation.
+                                if let Some(new_caret) =
+                                    nav_action(c, caret, line_buf.len(), modifiers.command)
+                                {
+                                    caret = new_caret;
+                                }
+                                // Anchor positions don't move on pure
+                                // navigation, so no snapshot emit needed.
+                            } else {
+                                // Feed the tokenizer + drive the anchor tracker.
+                                // Component 1 (token) and Component 2 (anchor)
+                                // both live downstream of this block.
                                 let mut ch_iter = key.chars();
                                 match (ch_iter.next(), ch_iter.next()) {
                                     (Some(c), None) => {
                                         if c == '\n' || c == '\r' {
-                                            // observe_char will seal-and-reset internally;
-                                            // we still emit LINE_RESET so the panel clears.
+                                            // True line reset. Tokens panel clears,
+                                            // anchors are dropped.
                                             if let Some(tok) = tokenizer.observe_char(c) {
                                                 let _ = app_handle.emit(EVT_TOKEN, tok);
                                             }
                                             line_buf.clear();
+                                            caret = 0;
+                                            anchors.clear();
                                             let _ = app_handle.emit(EVT_LINE_RESET, ());
+                                            let snap = anchors.snapshot();
+                                            let _ = app_handle.emit(
+                                                EVT_ANCHOR_SNAPSHOT,
+                                                anchor_emit_payload(&snap, &line_buf),
+                                            );
                                         } else {
-                                            line_buf.push(c);
-                                            if let Some(tok) = tokenizer.observe_char(c) {
-                                                let _ = app_handle.emit(EVT_TOKEN, tok);
+                                            // Normal char insert. The single
+                                            // `insert_text_char` entry point
+                                            // guards the buffer against PU
+                                            // codepoints — anchor delta and
+                                            // tokenizer feed only run if the
+                                            // char was actually accepted.
+                                            let was_end_of_line = caret == line_buf.len();
+                                            let Some(new_caret) =
+                                                insert_text_char(&mut line_buf, caret, c)
+                                            else {
+                                                continue;
+                                            };
+                                            anchors.apply_insert(caret, c);
+                                            caret = new_caret;
+
+                                            if was_end_of_line {
+                                                if let Some(tok) = tokenizer.observe_char(c) {
+                                                    if matches!(tok.kind, TokenKind::Word) {
+                                                        anchors.try_register(
+                                                            tok.start, tok.end, &tok.core,
+                                                        );
+                                                    }
+                                                    let _ = app_handle.emit(EVT_TOKEN, tok);
+                                                }
+                                            } else {
+                                                // Mid-line insert: forward
+                                                // streaming would produce
+                                                // tokens whose cores don't
+                                                // match the line. Rebuild
+                                                // from line_buf. `try_register`
+                                                // dedupes; the apply_insert
+                                                // above already updated the
+                                                // existing anchors' spans.
+                                                tokenizer.reset_line();
+                                                let _ = app_handle.emit(EVT_LINE_RESET, ());
+                                                let replay: Vec<char> = line_buf.clone();
+                                                for c in replay {
+                                                    if let Some(tok) = tokenizer.observe_char(c) {
+                                                        if matches!(tok.kind, TokenKind::Word) {
+                                                            anchors.try_register(
+                                                                tok.start, tok.end, &tok.core,
+                                                            );
+                                                        }
+                                                        let _ = app_handle.emit(EVT_TOKEN, tok);
+                                                    }
+                                                }
                                             }
+
+                                            let snap = anchors.snapshot();
+                                            let _ = app_handle.emit(
+                                                EVT_ANCHOR_SNAPSHOT,
+                                                anchor_emit_payload(&snap, &line_buf),
+                                            );
                                         }
                                     }
                                     _ => {
-                                        // Special key — abandon current line context.
+                                        // Multi-char / unknown special key —
+                                        // abandon current line context entirely.
                                         tokenizer.reset_line();
                                         line_buf.clear();
+                                        caret = 0;
+                                        anchors.clear();
                                         let _ = app_handle.emit(EVT_LINE_RESET, ());
+                                        let snap = anchors.snapshot();
+                                        let _ = app_handle.emit(
+                                            EVT_ANCHOR_SNAPSHOT,
+                                            anchor_emit_payload(&snap, &line_buf),
+                                        );
                                     }
                                 }
+                            }
+
+                            // PU function keys also bypass the L4
+                            // walking-skeleton word buffer below — they
+                            // aren't word chars (and `is_word_char` would
+                            // wrongly accept C0 controls + PU codes because
+                            // they're not whitespace). Skip the skeleton
+                            // path entirely for them.
+                            if is_non_text {
+                                continue;
                             }
 
                             if let Some(boundary) = boundary_char(&key) {
@@ -318,4 +620,160 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
     });
 
     Ok(())
+}
+
+// ---- Tests -----------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- Each of the four nav keys ---------------------------------------
+
+    #[test]
+    fn left_moves_caret_back_one() {
+        // Both forms macOS may emit (C0 cursor control and AppKit PU).
+        assert_eq!(nav_action(KEY_C0_LEFT, 5, 10, false), Some(4));
+        assert_eq!(nav_action(KEY_NS_LEFT, 5, 10, false), Some(4));
+    }
+
+    #[test]
+    fn left_at_start_saturates_at_zero() {
+        assert_eq!(nav_action(KEY_C0_LEFT, 0, 10, false), Some(0));
+    }
+
+    #[test]
+    fn right_moves_caret_forward_one() {
+        assert_eq!(nav_action(KEY_C0_RIGHT, 5, 10, false), Some(6));
+        assert_eq!(nav_action(KEY_NS_RIGHT, 5, 10, false), Some(6));
+    }
+
+    #[test]
+    fn right_at_end_clamps_at_line_len() {
+        assert_eq!(nav_action(KEY_C0_RIGHT, 10, 10, false), Some(10));
+    }
+
+    #[test]
+    fn home_moves_caret_to_zero() {
+        // External-keyboard Home key (NSHomeFunctionKey).
+        assert_eq!(nav_action(KEY_NS_HOME, 7, 10, false), Some(0));
+        assert_eq!(nav_action(KEY_NS_HOME, 0, 10, false), Some(0));
+    }
+
+    #[test]
+    fn end_moves_caret_to_line_len() {
+        // External-keyboard End key (NSEndFunctionKey).
+        assert_eq!(nav_action(KEY_NS_END, 3, 10, false), Some(10));
+        assert_eq!(nav_action(KEY_NS_END, 10, 10, false), Some(10));
+        assert_eq!(nav_action(KEY_NS_END, 0, 0, false), Some(0));
+    }
+
+    #[test]
+    fn cmd_left_is_home_on_macos() {
+        // The actual MacBook gesture: Cmd+Left = Home. Diagnosed from
+        // the live "key in:" log — every Home press arrives as the Left
+        // arrow codepoint with the Command modifier set.
+        assert_eq!(nav_action(KEY_C0_LEFT, 7, 10, true), Some(0));
+        assert_eq!(nav_action(KEY_NS_LEFT, 7, 10, true), Some(0));
+    }
+
+    #[test]
+    fn cmd_right_is_end_on_macos() {
+        assert_eq!(nav_action(KEY_C0_RIGHT, 3, 10, true), Some(10));
+        assert_eq!(nav_action(KEY_NS_RIGHT, 3, 10, true), Some(10));
+    }
+
+    // ---- Cross-key regression guards --------------------------------------
+
+    #[test]
+    fn plain_arrows_never_jump_to_zero_unless_already_there() {
+        // Regression: previously the Fn-modifier fallback routed Left to
+        // Home. Plain Left from any non-zero caret must decrement by
+        // exactly 1, regardless of any other state.
+        for caret in 1..20 {
+            assert_eq!(nav_action(KEY_C0_LEFT, caret, 30, false), Some(caret - 1));
+            assert_eq!(nav_action(KEY_NS_LEFT, caret, 30, false), Some(caret - 1));
+        }
+    }
+
+    #[test]
+    fn plain_arrows_and_home_end_are_distinct_outcomes() {
+        // Plain Left vs Cmd+Left at the same caret give different results
+        // (except at caret=0). Same for Right vs Cmd+Right at line_len.
+        assert_eq!(nav_action(KEY_C0_LEFT, 5, 10, false), Some(4));
+        assert_eq!(nav_action(KEY_C0_LEFT, 5, 10, true), Some(0));
+        assert_ne!(
+            nav_action(KEY_C0_LEFT, 5, 10, false),
+            nav_action(KEY_C0_LEFT, 5, 10, true)
+        );
+    }
+
+    #[test]
+    fn unmapped_function_key_returns_none() {
+        // Up/Down arrows are PU codepoints we filter but don't map — they
+        // must return None so the caller no-ops, NOT default to 0 or len.
+        assert_eq!(nav_action(KEY_C0_UP, 5, 10, false), None);
+        assert_eq!(nav_action(KEY_C0_DOWN, 5, 10, false), None);
+        assert_eq!(nav_action(KEY_NS_UP, 5, 10, false), None);
+        assert_eq!(nav_action(KEY_NS_DOWN, 5, 10, false), None);
+        // Random unmapped PU codepoint (e.g. some F-key).
+        assert_eq!(nav_action('\u{F710}', 5, 10, false), None);
+        // Cmd modifier doesn't rescue an unmapped codepoint.
+        assert_eq!(nav_action('\u{F710}', 5, 10, true), None);
+    }
+
+    // ---- Filter --------------------------------------------------------
+
+    #[test]
+    fn is_non_text_filters_the_full_pu_function_range() {
+        // Every codepoint in U+F700..=U+F8FF must be non-text.
+        assert!(is_non_text_key('\u{F700}'));
+        assert!(is_non_text_key('\u{F702}'));
+        assert!(is_non_text_key('\u{F729}'));
+        assert!(is_non_text_key('\u{F72B}'));
+        assert!(is_non_text_key('\u{F8FF}'));
+    }
+
+    #[test]
+    fn is_non_text_filters_c0_cursor_codes() {
+        // The actual codepoints macOS emits for arrows on US English.
+        assert!(is_non_text_key('\u{001C}'));
+        assert!(is_non_text_key('\u{001D}'));
+        assert!(is_non_text_key('\u{001E}'));
+        assert!(is_non_text_key('\u{001F}'));
+    }
+
+    #[test]
+    fn is_non_text_allows_text_chars() {
+        assert!(!is_non_text_key('a'));
+        assert!(!is_non_text_key('Z'));
+        assert!(!is_non_text_key('!'));
+        assert!(!is_non_text_key(' '));
+        assert!(!is_non_text_key('3'));
+    }
+
+    #[test]
+    fn is_non_text_keeps_newline_tab_cr_as_text() {
+        // These are control codepoints but the engine handles them upstream
+        // — newline triggers a line reset, tab is a tokenizer whitespace
+        // boundary. They must NOT be filtered out.
+        assert!(!is_non_text_key('\n'));
+        assert!(!is_non_text_key('\r'));
+        assert!(!is_non_text_key('\t'));
+    }
+
+    #[test]
+    fn insert_text_char_rejects_pu_and_c0() {
+        // Defensive guard at the single line_buf entry point: any non-text
+        // codepoint that somehow reaches here is rejected and the buffer
+        // is unchanged.
+        let mut line: Vec<char> = vec!['a', 'b', 'c'];
+        assert_eq!(insert_text_char(&mut line, 1, '\u{F702}'), None);
+        assert_eq!(line, vec!['a', 'b', 'c']);
+        assert_eq!(insert_text_char(&mut line, 1, '\u{001C}'), None);
+        assert_eq!(line, vec!['a', 'b', 'c']);
+        // Plain text still works.
+        assert_eq!(insert_text_char(&mut line, 1, 'X'), Some(2));
+        assert_eq!(line, vec!['a', 'X', 'b', 'c']);
+    }
 }

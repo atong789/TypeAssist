@@ -142,6 +142,27 @@
     correctable: boolean;
     tokenizer_version: number;
   };
+  /// Mirrors `correction_engine::anchor::SpanAnchor`. Component 2: span
+  /// anchor tracking via edit deltas.
+  type VoidReason = "split" | "merge" | "deleted";
+  type AnchorState =
+    | { kind: "tracking" }
+    | { kind: "void"; reason: VoidReason };
+  type SpanAnchorRow = {
+    id: number;
+    original_core: string;
+    start: number;
+    end: number;
+    state: AnchorState;
+  };
+  type AnchorsSnapshot = {
+    anchors: SpanAnchorRow[];
+    void_count: number;
+    /// Engine wraps the pure tracker snapshot with the current line buffer
+    /// so the panel can show text-now-at-span without needing its own
+    /// keystroke book-keeping.
+    current_line: string;
+  };
   type ModelSnapshot = {
     timing: { per_key: KeyTimingRow[]; per_finger: FingerTimingRow[] };
     asymmetry: AsymmetrySnapshot;
@@ -202,6 +223,10 @@
   /// Tokens sealed by the L4 tokenizer for the CURRENT line. Cleared by
   /// `engine://line-reset` events (newline, backspace rebuild, special key).
   let lineTokens: TokenPayload[] = [];
+  /// Latest anchor snapshot from the engine. Replaced wholesale on each
+  /// `engine://anchor-snapshot`. The panel doesn't infer anchor state from
+  /// edits — engine is the source of truth.
+  let anchorsSnap: AnchorsSnapshot | null = null;
 
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
@@ -362,6 +387,11 @@
         lineTokens = [];
       }),
     );
+    unlistens.push(
+      await listen<AnchorsSnapshot>("engine://anchor-snapshot", (e) => {
+        anchorsSnap = e.payload;
+      }),
+    );
   });
 
   onDestroy(() => {
@@ -391,6 +421,16 @@
   /// with core highlighted (the brief: span anchor tracks core only).
   function fmtTokenText(leading: string, core: string, trailing: string): string {
     return `${leading}${core}${trailing}`;
+  }
+  /// Char-indexed slice of `current_line` at `[start, end)` for an anchor.
+  /// JS strings are UTF-16, so we go via Array.from to count chars properly.
+  function sliceLine(line: string, start: number, end: number): string {
+    const arr = Array.from(line);
+    return arr.slice(start, end).join("");
+  }
+  function fmtAnchorState(state: AnchorState): string {
+    if (state.kind === "tracking") return "Tracking";
+    return `Void:${state.reason}`;
   }
   function fmtRatio(r: number): string {
     return `${r.toFixed(2)}×`;
@@ -579,6 +619,37 @@
                   <span class="col-tx">{t.correctable ? "yes" : "—"}</span>
                   <span class="col-ts num">[{t.start},{t.end})</span>
                   <span class="col-tt">{t.terminator === null ? "—" : fmtKey(t.terminator)}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+
+        <div class="model-sub model-sub-sticky">ANCHORS · L4 spans · edit-delta tracked</div>
+        <div class="anchor-block">
+          {#if anchorsSnap === null || anchorsSnap.anchors.length === 0}
+            <div class="empty">no anchors registered yet…</div>
+          {:else}
+            <div class="anchor-status">
+              <span class="num">{anchorsSnap.anchors.length}</span> total ·
+              <span class="num anchor-void-count">{anchorsSnap.void_count}</span> void
+            </div>
+            <div class="anchor-table">
+              <div class="anchor-row anchor-head">
+                <span class="col-ao">original</span>
+                <span class="col-as num">[start,end)</span>
+                <span class="col-an">text-now</span>
+                <span class="col-ast">state</span>
+              </div>
+              {#each anchorsSnap.anchors as a (a.id)}
+                {@const voided = a.state.kind === "void"}
+                <div class="anchor-row" class:anchor-voided={voided}>
+                  <span class="col-ao">{a.original_core}</span>
+                  <span class="col-as num">[{a.start},{a.end})</span>
+                  <span class="col-an">
+                    {voided ? "—" : sliceLine(anchorsSnap.current_line, a.start, a.end) || "—"}
+                  </span>
+                  <span class="col-ast">{fmtAnchorState(a.state)}</span>
                 </div>
               {/each}
             </div>
@@ -1074,6 +1145,69 @@
   .col-tx { color: #d5d5d5; }
   .col-ts { color: #8aa1b8; }
   .col-tt { color: #d5d5d5; }
+
+  /* ANCHORS — L4 Observing, Component 2. Sibling of TOKENS; one row per
+     live anchor on the current line. Voided rows get a faded look but
+     stay in the list (the state label carries the meaning). */
+  .anchor-block {
+    padding: 0.25rem 0 0.5rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .anchor-status {
+    color: #8893a0;
+    padding: 0.15rem 0.75rem 0.3rem;
+    font-size: 11px;
+  }
+  .anchor-void-count {
+    color: #e6c98a;
+    font-weight: 600;
+  }
+  .anchor-table {
+    padding: 0 0 0.2rem;
+  }
+  .anchor-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) 70px minmax(0, 1.1fr) 96px;
+    column-gap: 0.5rem;
+    align-items: baseline;
+    padding: 0.2rem 0.75rem;
+    white-space: nowrap;
+  }
+  .anchor-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.25rem;
+    margin-bottom: 0.1rem;
+  }
+  .anchor-row:not(.anchor-head):nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
+  }
+  .anchor-voided {
+    color: #7f8a96;
+  }
+  .anchor-voided .col-ao,
+  .anchor-voided .col-an,
+  .anchor-voided .col-as {
+    text-decoration: line-through;
+    text-decoration-thickness: 1px;
+  }
+  .col-ao {
+    color: #e6e6e6;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .col-as { color: #8aa1b8; }
+  .col-an {
+    color: #d5d5d5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .col-ast {
+    color: #d5d5d5;
+    font-weight: 600;
+  }
+  .anchor-voided .col-ast { color: #e6c98a; }
 
   /* SLIPS — first L3 learning loop. Status + per-pair table.
      Sits at the very top of .model-scroll. */
