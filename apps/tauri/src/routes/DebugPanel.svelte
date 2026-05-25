@@ -128,6 +128,20 @@
     finger: Finger | null;
     timestamp_ms: number;
   };
+  /// Mirrors `correction_engine::tokenizer::Token`. The L4 Observing brief,
+  /// Component 1: shared boundary-of-truth tokenizer.
+  type TokenKind = "word" | "number" | "url" | "email" | "code" | "acronym";
+  type TokenPayload = {
+    core: string;
+    start: number;
+    end: number;
+    leading: string;
+    trailing: string;
+    terminator: string | null;
+    kind: TokenKind;
+    correctable: boolean;
+    tokenizer_version: number;
+  };
   type ModelSnapshot = {
     timing: { per_key: KeyTimingRow[]; per_finger: FingerTimingRow[] };
     asymmetry: AsymmetrySnapshot;
@@ -185,6 +199,9 @@
   let asymmetry: AsymmetrySnapshot | null = null;
   let ghostKeys: GhostKeysSnapshot | null = null;
   let slips: SlipsSnapshot | null = null;
+  /// Tokens sealed by the L4 tokenizer for the CURRENT line. Cleared by
+  /// `engine://line-reset` events (newline, backspace rebuild, special key).
+  let lineTokens: TokenPayload[] = [];
 
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
@@ -335,6 +352,16 @@
         });
       }),
     );
+    unlistens.push(
+      await listen<TokenPayload>("engine://token", (e) => {
+        lineTokens = [...lineTokens, e.payload];
+      }),
+    );
+    unlistens.push(
+      await listen("engine://line-reset", () => {
+        lineTokens = [];
+      }),
+    );
   });
 
   onDestroy(() => {
@@ -359,6 +386,11 @@
   function fmtKeyFinger(row: { hand: Hand | null; finger: Finger | null }): string {
     if (!row.hand || !row.finger) return "—";
     return fmtFinger(row.hand, row.finger);
+  }
+  /// Compose a token's raw form for display: leading + core + trailing,
+  /// with core highlighted (the brief: span anchor tracks core only).
+  function fmtTokenText(leading: string, core: string, trailing: string): string {
+    return `${leading}${core}${trailing}`;
   }
   function fmtRatio(r: number): string {
     return `${r.toFixed(2)}×`;
@@ -523,10 +555,36 @@
         </div>
       </div>
 
-      <!-- Scrolling: SLIPS (first L3 learning loop) → GHOST KEYS → PER KEY.
+      <!-- Scrolling: TOKENS (L4 Observing) → SLIPS → GHOST KEYS → PER KEY.
            Each section's sub-header is sticky so it stays visible as you
            scroll within the section. -->
       <div class="model-scroll">
+        <div class="model-sub model-sub-sticky">TOKENS · current line · L4 boundary truth</div>
+        <div class="token-block">
+          {#if lineTokens.length === 0}
+            <div class="empty">no tokens on this line yet…</div>
+          {:else}
+            <div class="token-table">
+              <div class="token-row token-head">
+                <span class="col-tc">core</span>
+                <span class="col-tk">kind</span>
+                <span class="col-tx">corr</span>
+                <span class="col-ts num">[start,end)</span>
+                <span class="col-tt">term</span>
+              </div>
+              {#each lineTokens as t, i (`${i}-${t.start}-${t.core}`)}
+                <div class="token-row" class:token-correctable={t.correctable}>
+                  <span class="col-tc">{fmtTokenText(t.leading, t.core, t.trailing)}</span>
+                  <span class="col-tk">{t.kind}</span>
+                  <span class="col-tx">{t.correctable ? "yes" : "—"}</span>
+                  <span class="col-ts num">[{t.start},{t.end})</span>
+                  <span class="col-tt">{t.terminator === null ? "—" : fmtKey(t.terminator)}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+
         <div class="model-sub model-sub-sticky">SLIPS · strict-filtered candidates · writes to L3 map</div>
         <div class="slip-block">
           {#if slips === null}
@@ -973,6 +1031,49 @@
   .col-ff { color: #e6e6e6; font-weight: 600; }
   .col-fn { color: #d5d5d5; }
   .col-fd, .col-fi { color: #8aa1b8; }
+
+  /* TOKENS — L4 Observing brief, Component 1. Live tokens for the current
+     line; cleared on engine://line-reset. */
+  .token-block {
+    padding: 0.25rem 0 0.5rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .token-table {
+    padding: 0 0 0.2rem;
+  }
+  .token-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) 64px 40px 70px 36px;
+    column-gap: 0.5rem;
+    align-items: baseline;
+    padding: 0.2rem 0.75rem;
+    white-space: nowrap;
+  }
+  .token-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.25rem;
+    margin-bottom: 0.1rem;
+  }
+  .token-row:not(.token-head):nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
+  }
+  /* Correctable tokens get a subtle green rail — text label "yes" still
+     carries the meaning so this is supplementary, not color-only. */
+  .token-correctable {
+    border-left: 2px solid #2e5a2e;
+    padding-left: calc(0.75rem - 2px);
+  }
+  .col-tc {
+    color: #e6e6e6;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .col-tk { color: #8aa1b8; }
+  .col-tx { color: #d5d5d5; }
+  .col-ts { color: #8aa1b8; }
+  .col-tt { color: #d5d5d5; }
 
   /* SLIPS — first L3 learning loop. Status + per-pair table.
      Sits at the very top of .model-scroll. */
