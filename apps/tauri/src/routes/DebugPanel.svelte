@@ -163,6 +163,14 @@
     /// keystroke book-keeping.
     current_line: string;
   };
+  /// Mirrors `LexiconPayload` in engine.rs. Emitted once per sealed Word
+  /// token (Component 3a — read-only word source, no scoring yet).
+  type LexiconPayload = {
+    word: string;
+    known: boolean;
+    frequency: number;
+    lexicon_version: number;
+  };
   type ModelSnapshot = {
     timing: { per_key: KeyTimingRow[]; per_finger: FingerTimingRow[] };
     asymmetry: AsymmetrySnapshot;
@@ -227,6 +235,9 @@
   /// `engine://anchor-snapshot`. The panel doesn't infer anchor state from
   /// edits — engine is the source of truth.
   let anchorsSnap: AnchorsSnapshot | null = null;
+  /// Lexicon lookups for words sealed on the CURRENT line. One row per
+  /// Word token, appended in order. Cleared by `engine://line-reset`.
+  let lineLexicon: LexiconPayload[] = [];
 
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
@@ -385,11 +396,17 @@
     unlistens.push(
       await listen("engine://line-reset", () => {
         lineTokens = [];
+        lineLexicon = [];
       }),
     );
     unlistens.push(
       await listen<AnchorsSnapshot>("engine://anchor-snapshot", (e) => {
         anchorsSnap = e.payload;
+      }),
+    );
+    unlistens.push(
+      await listen<LexiconPayload>("engine://lexicon", (e) => {
+        lineLexicon = [...lineLexicon, e.payload];
       }),
     );
   });
@@ -427,6 +444,11 @@
   function sliceLine(line: string, start: number, end: number): string {
     const arr = Array.from(line);
     return arr.slice(start, end).join("");
+  }
+  /// Group separators for raw unigram counts so 23,135,851,162 is readable.
+  function fmtFreq(n: number): string {
+    if (n === 0) return "—";
+    return n.toLocaleString("en-US");
   }
   function fmtAnchorState(state: AnchorState): string {
     if (state.kind === "tracking") return "Tracking";
@@ -619,6 +641,28 @@
                   <span class="col-tx">{t.correctable ? "yes" : "—"}</span>
                   <span class="col-ts num">[{t.start},{t.end})</span>
                   <span class="col-tt">{t.terminator === null ? "—" : fmtKey(t.terminator)}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+
+        <div class="model-sub model-sub-sticky">LEXICON · current line · L4 word source</div>
+        <div class="lex-block">
+          {#if lineLexicon.length === 0}
+            <div class="empty">no word lookups on this line yet…</div>
+          {:else}
+            <div class="lex-table">
+              <div class="lex-row lex-head">
+                <span class="col-lw">word</span>
+                <span class="col-lk">known?</span>
+                <span class="col-lf num">frequency</span>
+              </div>
+              {#each lineLexicon as l, i (`${i}-${l.word}`)}
+                <div class="lex-row" class:lex-known={l.known} class:lex-unknown={!l.known}>
+                  <span class="col-lw">{l.word}</span>
+                  <span class="col-lk">{l.known ? "yes" : "no"}</span>
+                  <span class="col-lf num">{fmtFreq(l.frequency)}</span>
                 </div>
               {/each}
             </div>
@@ -1145,6 +1189,51 @@
   .col-tx { color: #d5d5d5; }
   .col-ts { color: #8aa1b8; }
   .col-tt { color: #d5d5d5; }
+
+  /* LEXICON — L4 Component 3a, read-only word source. One row per sealed
+     Word token on the current line. "known" gets a quiet green rail; "no"
+     gets an amber rail — text labels still carry the meaning, the rails
+     are just glanceability. */
+  .lex-block {
+    padding: 0.25rem 0 0.5rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .lex-table {
+    padding: 0 0 0.2rem;
+  }
+  .lex-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) 60px minmax(0, 1fr);
+    column-gap: 0.5rem;
+    align-items: baseline;
+    padding: 0.2rem 0.75rem;
+    white-space: nowrap;
+  }
+  .lex-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.25rem;
+    margin-bottom: 0.1rem;
+  }
+  .lex-row:not(.lex-head):nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
+  }
+  .lex-known {
+    border-left: 2px solid #2e5a2e;
+    padding-left: calc(0.75rem - 2px);
+  }
+  .lex-unknown {
+    border-left: 2px solid #6a5320;
+    padding-left: calc(0.75rem - 2px);
+  }
+  .col-lw {
+    color: #e6e6e6;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .col-lk { color: #d5d5d5; }
+  .col-lf { color: #8aa1b8; }
 
   /* ANCHORS — L4 Observing, Component 2. Sibling of TOKENS; one row per
      live anchor on the current line. Voided rows get a faded look but

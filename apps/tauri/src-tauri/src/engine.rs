@@ -25,7 +25,8 @@ use std::time::Instant;
 
 use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
 use correction_engine::{
-    boundary_char, is_word_char, skeleton_lookup, AnchorTracker, TokenKind, Tokenizer,
+    boundary_char, is_word_char, skeleton_lookup, AnchorTracker, Lexicon, Token, TokenKind,
+    Tokenizer, LEXICON_VERSION,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
@@ -49,6 +50,10 @@ pub const EVT_LINE_RESET: &str = "engine://line-reset";
 /// clear). Payload is an `AnchorsSnapshot`. Debug-view ANCHORS section
 /// listens — it doesn't try to derive anchor state from individual edits.
 pub const EVT_ANCHOR_SNAPSHOT: &str = "engine://anchor-snapshot";
+/// Fired once per sealed correctable token (Word kind) with the L4 lexicon
+/// lookup result. Read-only — Component 3a is a word source only; scoring
+/// and correction come later. The debug-view LEXICON section listens.
+pub const EVT_LEXICON: &str = "engine://lexicon";
 
 // macOS's `CGEvent.keyboardGetUnicodeString` translates navigation /
 // function keys differently depending on the layout and the Fn modifier
@@ -201,6 +206,43 @@ fn anchor_emit_payload<'a>(
     }
 }
 
+/// Handle one sealed token: register an anchor if it's a Word, look it up in
+/// the lexicon (Word only), and emit the token event. Centralised so the
+/// three emission sites (end-of-line, mid-line replay, backspace replay)
+/// can't drift on which side-effects fire in which order.
+fn emit_sealed_token<R: Runtime>(
+    app: &AppHandle<R>,
+    tok: Token,
+    anchors: &mut AnchorTracker,
+    lexicon: &Lexicon,
+) {
+    if matches!(tok.kind, TokenKind::Word) {
+        anchors.try_register(tok.start, tok.end, &tok.core);
+        let _ = app.emit(
+            EVT_LEXICON,
+            LexiconPayload {
+                word: tok.core.clone(),
+                known: lexicon.is_known(&tok.core),
+                frequency: lexicon.frequency(&tok.core),
+                lexicon_version: LEXICON_VERSION,
+            },
+        );
+    }
+    let _ = app.emit(EVT_TOKEN, tok);
+}
+
+/// Per-Word-token lexicon lookup. Emitted alongside `EVT_TOKEN` so the
+/// debug panel can show known/freq next to the same words it lists in
+/// TOKENS, without changing the L4 `Token` contract itself.
+#[derive(Serialize, Clone)]
+struct LexiconPayload {
+    /// The token's core, case preserved. Lookup itself is case-insensitive.
+    word: String,
+    known: bool,
+    frequency: u64,
+    lexicon_version: u32,
+}
+
 #[derive(Serialize, Clone)]
 struct InjectionPayload {
     delete_count: u32,
@@ -241,6 +283,10 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
         // Rust and the panel just renders snapshots. Each sealed Word token
         // is offered to `try_register` (it dedupes replay).
         let mut anchors = AnchorTracker::new();
+        // L4 lexicon (Component 3a). Process-wide singleton — first touch
+        // parses the ~50k-entry bundled list; subsequent reads are HashMap
+        // lookups. Read-only this slice: scoring/correction come later.
+        let lexicon: &'static Lexicon = Lexicon::shared();
         // Caret position in `line_buf` (char index). Anchor edit deltas
         // (p, d, i) are computed from this. Updated on inserts, backspaces,
         // and Left / Right / Home / End nav keys; mouse-click moves and
@@ -337,10 +383,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                             let replay: Vec<char> = line_buf.clone();
                             for c in replay {
                                 if let Some(tok) = tokenizer.observe_char(c) {
-                                    if matches!(tok.kind, TokenKind::Word) {
-                                        anchors.try_register(tok.start, tok.end, &tok.core);
-                                    }
-                                    let _ = app_handle.emit(EVT_TOKEN, tok);
+                                    emit_sealed_token(&app_handle, tok, &mut anchors, lexicon);
                                 }
                             }
                             let snap = anchors.snapshot();
@@ -432,9 +475,17 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                     (Some(c), None) => {
                                         if c == '\n' || c == '\r' {
                                             // True line reset. Tokens panel clears,
-                                            // anchors are dropped.
+                                            // anchors are dropped. Any token the
+                                            // newline sealed goes through the same
+                                            // helper as every other emission so the
+                                            // lexicon panel sees that final word.
                                             if let Some(tok) = tokenizer.observe_char(c) {
-                                                let _ = app_handle.emit(EVT_TOKEN, tok);
+                                                emit_sealed_token(
+                                                    &app_handle,
+                                                    tok,
+                                                    &mut anchors,
+                                                    lexicon,
+                                                );
                                             }
                                             line_buf.clear();
                                             caret = 0;
@@ -463,12 +514,12 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
 
                                             if was_end_of_line {
                                                 if let Some(tok) = tokenizer.observe_char(c) {
-                                                    if matches!(tok.kind, TokenKind::Word) {
-                                                        anchors.try_register(
-                                                            tok.start, tok.end, &tok.core,
-                                                        );
-                                                    }
-                                                    let _ = app_handle.emit(EVT_TOKEN, tok);
+                                                    emit_sealed_token(
+                                                        &app_handle,
+                                                        tok,
+                                                        &mut anchors,
+                                                        lexicon,
+                                                    );
                                                 }
                                             } else {
                                                 // Mid-line insert: forward
@@ -484,12 +535,12 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                                 let replay: Vec<char> = line_buf.clone();
                                                 for c in replay {
                                                     if let Some(tok) = tokenizer.observe_char(c) {
-                                                        if matches!(tok.kind, TokenKind::Word) {
-                                                            anchors.try_register(
-                                                                tok.start, tok.end, &tok.core,
-                                                            );
-                                                        }
-                                                        let _ = app_handle.emit(EVT_TOKEN, tok);
+                                                        emit_sealed_token(
+                                                            &app_handle,
+                                                            tok,
+                                                            &mut anchors,
+                                                            lexicon,
+                                                        );
                                                     }
                                                 }
                                             }
