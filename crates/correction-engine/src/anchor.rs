@@ -13,7 +13,7 @@
 //! * log record / confidence score / outcome resolution
 //! * mouse-click caret repositioning, paste — those need the
 //!   Accessibility-read backstop (Component 5)
-//! * the L4 correction decision (`skeleton_lookup` is untouched)
+//! * the L4 correction decision (lives in `crate::decision`)
 //!
 //! ## Edit-delta model (no replay, no re-scan)
 //!

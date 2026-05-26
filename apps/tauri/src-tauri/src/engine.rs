@@ -1,40 +1,45 @@
-//! Engine host — spawns the Swift sidecar (L1) and runs the walking-skeleton
-//! capture → decide → inject loop in-process.
+//! Engine host — spawns the Swift sidecar (L1) and runs the L4 capture →
+//! tokenize → score → decide loop in-process. **Observe-only**: the engine
+//! computes a real decision per sealed Word token but does not inject
+//! anything (injection is Component 3c-3).
 //!
-//! L2 (`BehaviouralModel`) observes every keystroke; its `timing` aggregator is
-//! the only one with real logic for now, the rest are safe no-ops. The
-//! correction *decision* is still the walking-skeleton `skeleton_lookup` — L2
-//! is observe-only and doesn't influence behaviour.
+//! L2 (`BehaviouralModel`) observes every keystroke; its `timing` aggregator
+//! is the only one with real logic for now, the rest are safe no-ops. The
+//! correction *decision* now runs the real L4 pipeline (lexicon → candidates
+//! → score → decide). The tokenizer is the **single source of word-boundary
+//! truth** — there is no parallel skeleton word-buffer.
 //!
-//! Three measurements per keystroke, so the debug view can attribute time:
-//!   - `ingest_latency_ms`    — just the L2 dispatch (on the keystroke event)
-//!   - `decision_latency_ms`  — keystroke arrival → decision made (includes ingest)
-//!   - `injection_latency_ms` — keystroke arrival → sidecar.stdin write returned
+//! Two measurements per keystroke, so the debug view can attribute time:
+//!   - `ingest_latency_ms`   — just the L2 dispatch (on the keystroke event)
+//!   - `decide_time_ms`      — scoring + decision cost on a sealed token
 //!
 //! Events emitted to the debug panel:
 //!   `engine://keystroke`       — every key (or backspace) + dwell + ingest cost
-//!   `engine://decision`        — at a word boundary, with decision latency
-//!   `engine://injection`       — when a correction fired, with end-to-end latency
+//!   `engine://decision`        — per sealed Word token, with would-correct / leave-alone outcome
 //!   `engine://model-snapshot`  — L2 state after each ingested event
 //!   `engine://slip`            — one event per confirmed slip (L3 learning loop)
 //!   `engine://token`           — one event per sealed L4 token (Observing brief Component 1)
 //!   `engine://line-reset`      — fired when the tokenizer line resets (newline / backspace rebuild / special key)
 //!   `engine://anchor-snapshot` — full `AnchorsSnapshot` after every anchor change (Observing brief Component 2)
+//!   `engine://lexicon`         — per Word token: known? + frequency (Component 3a)
+//!   `engine://candidates`      — per UNKNOWN Word token: scored edit-1 candidates + tier (Components 3b + 3c-1)
 
 use std::time::Instant;
 
-use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
+use behavioural_model::{BehaviouralModel, InputEvent};
 use correction_engine::{
-    boundary_char, is_word_char, skeleton_lookup, AnchorTracker, TokenKind, Tokenizer,
+    decide, ranked_known_candidates, score_candidates, AnchorTracker, Confidence, ConfidenceTier,
+    DecisionOutcome, Lexicon, ScoredCandidate, Token, TokenKind, Tokenizer, ACTIVE_TIER,
+    CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION, SCORE_VERSION,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
+use volatility_map::VolatilityMap;
 
 pub const EVT_KEYSTROKE: &str = "engine://keystroke";
 pub const EVT_DECISION: &str = "engine://decision";
-pub const EVT_INJECTION: &str = "engine://injection";
 pub const EVT_MODEL_SNAPSHOT: &str = "engine://model-snapshot";
 /// Fired once per confirmed slip detected by L2's `SlipDetector` during
 /// ingest. The debug panel marks these in the feed.
@@ -49,6 +54,21 @@ pub const EVT_LINE_RESET: &str = "engine://line-reset";
 /// clear). Payload is an `AnchorsSnapshot`. Debug-view ANCHORS section
 /// listens — it doesn't try to derive anchor state from individual edits.
 pub const EVT_ANCHOR_SNAPSHOT: &str = "engine://anchor-snapshot";
+/// Fired once per sealed correctable token (Word kind) with the L4 lexicon
+/// lookup result. Read-only — Component 3a is a word source only; scoring
+/// and correction come later. The debug-view LEXICON section listens.
+pub const EVT_LEXICON: &str = "engine://lexicon";
+/// Fired once per sealed UNKNOWN Word token with the top-N ranked known
+/// edit-1 neighbours (Component 3b). Read-only — no score, no tier, no
+/// correction. Known words don't emit this event (they're protected).
+/// Empty `candidates` is a legitimate outcome and IS emitted, so the panel
+/// can render "(no known candidates within edit-1)". The debug-view
+/// CANDIDATES section listens.
+pub const EVT_CANDIDATES: &str = "engine://candidates";
+
+/// Top-N candidates the engine surfaces per unknown word. Keep small so the
+/// debug panel and any future spatial-scorer aren't paying for a long tail.
+const CANDIDATES_TOP_N: usize = 3;
 
 // macOS's `CGEvent.keyboardGetUnicodeString` translates navigation /
 // function keys differently depending on the layout and the Fn modifier
@@ -59,10 +79,10 @@ pub const EVT_ANCHOR_SNAPSHOT: &str = "engine://anchor-snapshot";
 //   * AppKit NSEvent function-key constants (private-use, with Fn on or
 //     other layouts): U+F700..=U+F8FF — Left U+F702, Home U+F729, etc.
 //
-// Neither form is text. They must never reach line_buf, the tokenizer
-// core, or the skeleton word buffer (otherwise they render as box glyphs
-// inside tokens). Both forms are filtered out by `is_non_text_key`; the
-// known-nav codepoints below are mapped to caret moves.
+// Neither form is text. They must never reach line_buf or the tokenizer
+// core (otherwise they render as box glyphs inside tokens). Both forms
+// are filtered out by `is_non_text_key`; the known-nav codepoints below
+// are mapped to caret moves.
 const KEY_C0_LEFT: char = '\u{001C}';
 const KEY_C0_RIGHT: char = '\u{001D}';
 // Up/Down kept here for documentation and tests — they're filtered out
@@ -169,14 +189,18 @@ struct KeystrokePayload {
     ingest_latency_ms: f64,
 }
 
+/// Per-Word-token decision (Component 3c-2). Observe-only — `would-correct`
+/// is a *proposal*, not an injection. `outcome` is the full
+/// [`DecisionOutcome`] tagged enum (`would_correct` / `leave_alone` with
+/// reason). `decide_time_ms` is the scoring + decision cost; latency from
+/// the triggering keystroke is no longer single-valued under the new
+/// per-token-seal model (replays can re-fire).
 #[derive(Serialize, Clone)]
 struct DecisionPayload {
-    word: String,
-    matched: bool,
-    replacement: Option<String>,
-    /// Time from receiving the boundary keystroke to the decision being made.
-    /// Includes the ingest cost above — measured from key arrival.
-    decision_latency_ms: f64,
+    outcome: DecisionOutcome,
+    active_tier: ConfidenceTier,
+    decide_time_ms: f64,
+    decision_version: u32,
 }
 
 /// Emission wrapper for an anchor snapshot. The pure
@@ -201,13 +225,120 @@ fn anchor_emit_payload<'a>(
     }
 }
 
+/// Handle one sealed token: register an anchor if it's a Word, run the
+/// full L4 pipeline (lexicon → candidates → score → decide), emit the
+/// per-stage panel events. Centralised so every emission site (end-of-line,
+/// mid-line replay, backspace replay, newline final seal) gets the same
+/// side-effects in the same order.
+///
+/// **Observe-only** (Component 3c-2): the decision is computed and
+/// emitted but the engine does NOT inject anything. Injection is 3c-3.
+fn emit_sealed_token<R: Runtime>(
+    app: &AppHandle<R>,
+    tok: Token,
+    anchors: &mut AnchorTracker,
+    lexicon: &Lexicon,
+    map: &VolatilityMap,
+) {
+    if matches!(tok.kind, TokenKind::Word) {
+        anchors.try_register(tok.start, tok.end, &tok.core);
+        let row = lexicon_row_for(&tok.core, lexicon);
+        let known = row.known;
+        let _ = app.emit(EVT_LEXICON, row);
+
+        // Compute the score report once, used for both CANDIDATES (display)
+        // and DECISION (policy). Known words produce no candidates and the
+        // decision short-circuits to LeaveAlone(Known) — but we still emit a
+        // DECISION row so the FEED has one entry per Word token.
+        let t_decide_start = Instant::now();
+        let candidates = if known {
+            Vec::new()
+        } else {
+            ranked_known_candidates(&tok.core, lexicon, CANDIDATES_TOP_N)
+        };
+        let report = score_candidates(&tok.core, &candidates, map);
+        let outcome = decide(&tok.core, known, &report, ACTIVE_TIER);
+        let decide_time_ms = t_decide_start.elapsed().as_secs_f64() * 1000.0;
+
+        // CANDIDATES only when there's something to show — known words
+        // get no candidate set.
+        if !known {
+            let _ = app.emit(
+                EVT_CANDIDATES,
+                CandidatesPayload {
+                    word: tok.core.clone(),
+                    scored: report.scored,
+                    top_score: report.top_score,
+                    top_confidence: report.top_confidence,
+                    candidates_version: CANDIDATES_VERSION,
+                    score_version: SCORE_VERSION,
+                },
+            );
+        }
+
+        // DECISION fires for every Word token (known included — its reason
+        // is `known`). The FEED needs one row per word so the builder can
+        // see why each token did or didn't fire.
+        let _ = app.emit(
+            EVT_DECISION,
+            DecisionPayload {
+                outcome,
+                active_tier: ACTIVE_TIER,
+                decide_time_ms,
+                decision_version: DECISION_VERSION,
+            },
+        );
+    }
+    let _ = app.emit(EVT_TOKEN, tok);
+}
+
+/// Build the lexicon-row payload for a Word token. Pure function — pulled
+/// out so the v2 "membership vs frequency" invariant can be pinned by
+/// tests. **Membership MUST come from [`Lexicon::is_known`], not from
+/// `frequency > 0`** — the Norvig freq table contains web typos with real
+/// counts that are not real words, and we must never let those pass as
+/// known. This was a real regression (engine reported `teh known=yes,
+/// freq 1.7M` even after the lexicon module was correctly split).
+fn lexicon_row_for(core: &str, lexicon: &Lexicon) -> LexiconPayload {
+    LexiconPayload {
+        word: core.to_string(),
+        known: lexicon.is_known(core),
+        frequency: lexicon.frequency(core),
+        lexicon_version: LEXICON_VERSION,
+    }
+}
+
+/// Per-Word-token lexicon lookup. Emitted alongside `EVT_TOKEN` so the
+/// debug panel can show known/freq next to the same words it lists in
+/// TOKENS, without changing the L4 `Token` contract itself.
 #[derive(Serialize, Clone)]
-struct InjectionPayload {
-    delete_count: u32,
-    /// Full string sent to the sidecar (includes the trailing boundary char).
-    replacement: String,
-    /// End-to-end: keystroke received → sidecar.stdin write returned.
-    injection_latency_ms: f64,
+struct LexiconPayload {
+    /// The token's core, case preserved. Lookup itself is case-insensitive.
+    word: String,
+    known: bool,
+    frequency: u64,
+    lexicon_version: u32,
+}
+
+/// Per-unknown-Word-token candidate set with confidence scoring
+/// Per-unknown-Word-token candidate set with confidence scoring
+/// (Components 3b + 3c-1 + 3c-3). Empty `scored` is emitted when the word
+/// has no known edit-1 neighbour — the panel renders that as "(no known
+/// candidates within edit-1)", a real outcome the brief wants visible.
+///
+/// `top_confidence` is the per-candidate label (`Low` / `Medium` / `High`)
+/// — **the panel's badge**. The active-mode gate that drives the actual
+/// decision lives in [`DecisionPayload`]. Modes and corrections use
+/// separate vocabularies (3c-3): a candidate has confidence, a mode
+/// chooses what confidence to act on.
+#[derive(Serialize, Clone)]
+struct CandidatesPayload {
+    word: String,
+    scored: Vec<ScoredCandidate>,
+    top_score: Option<f64>,
+    top_confidence: Option<Confidence>,
+    candidates_version: u32,
+    score_version: u32,
 }
 
 pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::Error>> {
@@ -219,19 +350,21 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
         .sidecar("typeassist-input-macos")?
         .env("TYPEASSIST_AX_PROMPT", "1");
 
-    let (mut rx, mut child) = sidecar.spawn()?;
+    // `sidecar_child` owns the parent-side write-end of the sidecar's
+    // stdin pipe. It is **moved into the async task below** and dropped
+    // when that task ends — see the load-bearing comment at the bottom
+    // of the closure for the lifetime contract.
+    let (mut rx, sidecar_child) = sidecar.spawn()?;
     let app_handle = app.clone();
 
     tauri::async_runtime::spawn(async move {
-        // Word currently being typed, assembled from key events — same state
-        // shape the skeleton binary uses.
-        let mut word = String::new();
         // L2 lives here for the life of the engine. Single owner, single async
         // task — no sync needed.
         let mut model = BehaviouralModel::new();
-        // L4 streaming tokenizer (Component 1 of the Observing brief).
-        // Observe-only: it produces Tokens for the debug view; it does NOT
-        // influence the correction decision yet. We also keep a tiny char
+        // L4 streaming tokenizer (Component 1 of the Observing brief) —
+        // the SINGLE source of word-boundary truth. The lexicon / candidate
+        // / score / decision pipeline all consume sealed Word tokens from
+        // here; no parallel word-buffer exists. We do keep a tiny char
         // buffer for the current line so backspaces can rebuild cheaply
         // (the tokenizer itself is forward-only).
         let mut tokenizer = Tokenizer::new();
@@ -241,6 +374,10 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
         // Rust and the panel just renders snapshots. Each sealed Word token
         // is offered to `try_register` (it dedupes replay).
         let mut anchors = AnchorTracker::new();
+        // L4 lexicon (Component 3a). Process-wide singleton — first touch
+        // parses the ~50k-entry bundled list; subsequent reads are HashMap
+        // lookups. Read-only this slice: scoring/correction come later.
+        let lexicon: &'static Lexicon = Lexicon::shared();
         // Caret position in `line_buf` (char index). Anchor edit deltas
         // (p, d, i) are computed from this. Updated on inserts, backspaces,
         // and Left / Right / Home / End nav keys; mouse-click moves and
@@ -261,11 +398,6 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                     let Ok(parsed) = serde_json::from_str::<InputEvent>(line) else {
                         continue;
                     };
-
-                    // t0 for the existing decision/injection latencies. Captured
-                    // BEFORE ingest so those numbers continue to mean
-                    // "key arrival → X" (i.e. include the ingest cost).
-                    let t_received = Instant::now();
 
                     // Observe-only L2 dispatch. Only Key/Backspace flow into
                     // the model — sidecar lifecycle events (Ready/Shutdown/…)
@@ -314,7 +446,6 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                     ingest_latency_ms,
                                 },
                             );
-                            word.pop();
 
                             // Anchor delta — apply BEFORE mutating line_buf
                             // so we can read the deleted char (needed for
@@ -337,10 +468,13 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                             let replay: Vec<char> = line_buf.clone();
                             for c in replay {
                                 if let Some(tok) = tokenizer.observe_char(c) {
-                                    if matches!(tok.kind, TokenKind::Word) {
-                                        anchors.try_register(tok.start, tok.end, &tok.core);
-                                    }
-                                    let _ = app_handle.emit(EVT_TOKEN, tok);
+                                    emit_sealed_token(
+                                        &app_handle,
+                                        tok,
+                                        &mut anchors,
+                                        lexicon,
+                                        model.slip_detector.map(),
+                                    );
                                 }
                             }
                             let snap = anchors.snapshot();
@@ -403,8 +537,8 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                 // map to caret moves; Up/Down and every
                                 // other non-text codepoint are intentional
                                 // no-ops for the single-line model. No
-                                // edit, no token feed, no skeleton-word
-                                // touch — and the buffer is never written.
+                                // edit, no token feed — and the buffer is
+                                // never written.
                                 let c = single_char.unwrap();
                                 tracing::info!(
                                     "non-text key U+{:04X} — caret-only handling",
@@ -432,9 +566,18 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                     (Some(c), None) => {
                                         if c == '\n' || c == '\r' {
                                             // True line reset. Tokens panel clears,
-                                            // anchors are dropped.
+                                            // anchors are dropped. Any token the
+                                            // newline sealed goes through the same
+                                            // helper as every other emission so the
+                                            // lexicon panel sees that final word.
                                             if let Some(tok) = tokenizer.observe_char(c) {
-                                                let _ = app_handle.emit(EVT_TOKEN, tok);
+                                                emit_sealed_token(
+                                                    &app_handle,
+                                                    tok,
+                                                    &mut anchors,
+                                                    lexicon,
+                                                    model.slip_detector.map(),
+                                                );
                                             }
                                             line_buf.clear();
                                             caret = 0;
@@ -463,12 +606,13 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
 
                                             if was_end_of_line {
                                                 if let Some(tok) = tokenizer.observe_char(c) {
-                                                    if matches!(tok.kind, TokenKind::Word) {
-                                                        anchors.try_register(
-                                                            tok.start, tok.end, &tok.core,
-                                                        );
-                                                    }
-                                                    let _ = app_handle.emit(EVT_TOKEN, tok);
+                                                    emit_sealed_token(
+                                                        &app_handle,
+                                                        tok,
+                                                        &mut anchors,
+                                                        lexicon,
+                                                        model.slip_detector.map(),
+                                                    );
                                                 }
                                             } else {
                                                 // Mid-line insert: forward
@@ -484,12 +628,13 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                                 let replay: Vec<char> = line_buf.clone();
                                                 for c in replay {
                                                     if let Some(tok) = tokenizer.observe_char(c) {
-                                                        if matches!(tok.kind, TokenKind::Word) {
-                                                            anchors.try_register(
-                                                                tok.start, tok.end, &tok.core,
-                                                            );
-                                                        }
-                                                        let _ = app_handle.emit(EVT_TOKEN, tok);
+                                                        emit_sealed_token(
+                                                            &app_handle,
+                                                            tok,
+                                                            &mut anchors,
+                                                            lexicon,
+                                                            model.slip_detector.map(),
+                                                        );
                                                     }
                                                 }
                                             }
@@ -518,80 +663,13 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                 }
                             }
 
-                            // PU function keys also bypass the L4
-                            // walking-skeleton word buffer below — they
-                            // aren't word chars (and `is_word_char` would
-                            // wrongly accept C0 controls + PU codes because
-                            // they're not whitespace). Skip the skeleton
-                            // path entirely for them.
-                            if is_non_text {
-                                continue;
-                            }
-
-                            if let Some(boundary) = boundary_char(&key) {
-                                let lookup_result = skeleton_lookup(&word);
-                                let decision_latency_ms =
-                                    t_received.elapsed().as_secs_f64() * 1000.0;
-
-                                // Skip empty-word boundaries (e.g. typing two
-                                // spaces in a row): no decision was made, so
-                                // emitting a row would just be noise.
-                                if !word.is_empty() {
-                                    let _ = app_handle.emit(
-                                        EVT_DECISION,
-                                        DecisionPayload {
-                                            word: word.clone(),
-                                            matched: lookup_result.is_some(),
-                                            replacement: lookup_result.map(String::from),
-                                            decision_latency_ms,
-                                        },
-                                    );
-                                }
-
-                                if let Some(replacement) = lookup_result {
-                                    let delete_count = word.chars().count() as u32 + 1;
-                                    let full_replacement = format!("{replacement}{boundary}");
-                                    let cmd = OutboundCommand::InjectCorrection {
-                                        delete_count,
-                                        replacement: full_replacement.clone(),
-                                    };
-                                    if let Ok(mut json) = serde_json::to_string(&cmd) {
-                                        json.push('\n');
-                                        match child.write(json.as_bytes()) {
-                                            Ok(()) => {
-                                                let injection_latency_ms =
-                                                    t_received.elapsed().as_secs_f64() * 1000.0;
-                                                let _ = app_handle.emit(
-                                                    EVT_INJECTION,
-                                                    InjectionPayload {
-                                                        delete_count,
-                                                        replacement: full_replacement,
-                                                        injection_latency_ms,
-                                                    },
-                                                );
-                                                tracing::info!(
-                                                    "corrected {:?} → {:?} (decision {:.2}ms, e2e {:.2}ms)",
-                                                    word,
-                                                    replacement,
-                                                    decision_latency_ms,
-                                                    injection_latency_ms,
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    "sidecar stdin write failed: {e}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                word.clear();
-                            } else if is_word_char(&key) {
-                                word.push_str(&key);
-                            } else {
-                                // Unmodeled key (arrow, escape, …) ends the word.
-                                word.clear();
-                            }
+                            // No parallel word-buffer / boundary detection:
+                            // the tokenizer above already sealed any token
+                            // that this keystroke triggered, and
+                            // `emit_sealed_token` ran the full L4 pipeline
+                            // (lexicon → candidates → score → decide)
+                            // emitting per-stage panel events. The skeleton
+                            // tge→the lookup is retired.
                         }
                     }
                 }
@@ -617,6 +695,37 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                 _ => {}
             }
         }
+
+        // ---- Sidecar lifetime guard — DO NOT REMOVE ---------------------
+        //
+        // Keep this drop here, at the END of the event loop. It is the
+        // mechanism that ties the Swift sidecar's lifetime to this async
+        // task's lifetime.
+        //
+        // `sidecar_child` owns the parent-side write-end of the sidecar's
+        // stdin pipe. When it drops, that pipe closes; the sidecar's
+        // input thread (`adapters/macos/.../Bridge.swift::runInputLoop`)
+        // reads EOF on `stdin.availableData`, dispatches `.shutdown`,
+        // and the sidecar exits cleanly via `EventTap::handleCommand`
+        // → `exit(0)`. That EOF-as-shutdown path IS the intended
+        // graceful teardown — firing it here when the loop ends (Tauri
+        // quitting, `CommandEvent::Terminated`, panic unwind) means the
+        // sidecar dies with us instead of leaking.
+        //
+        // Why this can't move earlier or disappear:
+        //   * Drop it before the loop runs (e.g. let it fall out of the
+        //     outer `spawn()` function) → sidecar sees EOF instantly,
+        //     `exit(0)` before any keystroke arrives, KEYS stays at 0
+        //     forever. This was the 3c-2 regression — the binding
+        //     looked unused, so it died with the outer function.
+        //   * Replace with `let _ = sidecar_child;` or rename to
+        //     `_sidecar_child` → same problem the moment a future
+        //     refactor removes the "unused" line.
+        //
+        // If you're here to retire this drop, FIRST check that the
+        // sidecar has another mechanism for staying alive — and read
+        // `Bridge.swift` to understand the EOF=shutdown contract.
+        drop(sidecar_child);
     });
 
     Ok(())
@@ -775,5 +884,79 @@ mod tests {
         // Plain text still works.
         assert_eq!(insert_text_char(&mut line, 1, 'X'), Some(2));
         assert_eq!(line, vec!['a', 'X', 'b', 'c']);
+    }
+
+    // ---- Lexicon row payload — v2 membership/frequency split -----------
+
+    #[test]
+    fn lexicon_row_known_comes_from_is_known_not_frequency() {
+        // Regression: emit_sealed_token once computed `known = frequency
+        // > 0`, which under lexicon v2 admits Norvig web typos. The
+        // following must hold:
+        //   - `teh`: in Norvig (count > 0) but NOT in SCOWL → known=false
+        //   - `recieve`: same shape — Norvig has it, SCOWL doesn't
+        //   - the freq field still carries the honest count (the engine
+        //     reports the data; the panel suppresses display)
+        let lex = correction_engine::Lexicon::shared();
+
+        let row = lexicon_row_for("teh", lex);
+        assert!(
+            !row.known,
+            "teh must be known=false even though Norvig has a count"
+        );
+        assert!(
+            row.frequency > 0,
+            "test premise: teh has a Norvig count — pin so this regression test isn't toothless"
+        );
+
+        let row = lexicon_row_for("recieve", lex);
+        assert!(!row.known, "recieve must be known=false");
+    }
+
+    #[test]
+    fn lexicon_row_known_words_keep_their_freq() {
+        let lex = correction_engine::Lexicon::shared();
+        for w in &["the", "because", "it", "should"] {
+            let row = lexicon_row_for(w, lex);
+            assert!(row.known, "{w} should be known");
+            assert!(row.frequency > 0, "{w} should have a Norvig frequency");
+        }
+    }
+
+    #[test]
+    fn lexicon_row_contractions_are_known() {
+        // The other v2 fix — SCOWL contractions list includes these, so
+        // the engine never flags them as needing correction.
+        let lex = correction_engine::Lexicon::shared();
+        for w in &["didn't", "can't", "should've", "they're"] {
+            let row = lexicon_row_for(w, lex);
+            assert!(row.known, "contraction {w:?} should be known");
+        }
+    }
+
+    #[test]
+    fn lexicon_row_seed_proper_nouns_are_known() {
+        let lex = correction_engine::Lexicon::shared();
+        for w in &["Krutrim", "ZAMS", "ONDC"] {
+            let row = lexicon_row_for(w, lex);
+            assert!(row.known, "seed {w} should be known (case-insensitive)");
+        }
+    }
+
+    #[test]
+    fn lexicon_row_nonsense_is_unknown_with_zero_freq() {
+        let lex = correction_engine::Lexicon::shared();
+        for w in &["asdfqwerty", "qzxjvk"] {
+            let row = lexicon_row_for(w, lex);
+            assert!(!row.known);
+            assert_eq!(row.frequency, 0);
+        }
+    }
+
+    #[test]
+    fn lexicon_row_carries_current_version() {
+        let lex = correction_engine::Lexicon::shared();
+        let row = lexicon_row_for("the", lex);
+        assert_eq!(row.lexicon_version, correction_engine::LEXICON_VERSION);
     }
 }

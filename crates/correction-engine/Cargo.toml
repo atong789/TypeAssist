@@ -9,7 +9,3 @@ description = "Layer 4 — lexicon-aware spatial correction. Three tiers, three 
 serde.workspace = true
 thiserror.workspace = true
 volatility-map = { path = "../volatility-map" }
-
-# Walking-skeleton daemon (src/bin/skeleton.rs) only.
-behavioural-model = { path = "../behavioural-model" }
-serde_json.workspace = true

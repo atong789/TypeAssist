@@ -7,9 +7,14 @@
 
   Listens to engine events emitted from `apps/tauri/src-tauri/src/engine.rs`:
     engine://keystroke       — every key (or backspace) + dwell + ingest cost
-    engine://decision        — at a word boundary
-    engine://injection       — when a correction fired
+    engine://decision        — per sealed Word token: would-correct OR leave-alone (reason)
     engine://model-snapshot  — L2 BehaviouralModel state (per-key + per-finger)
+    engine://slip            — confirmed L2 slip
+    engine://token           — per L4 token (Observing Component 1)
+    engine://line-reset      — tokenizer line reset (newline / backspace rebuild)
+    engine://anchor-snapshot — per L4 anchor change (Observing Component 2)
+    engine://lexicon         — per Word token: known? + frequency (Component 3a)
+    engine://candidates      — per unknown Word token: scored edit-1 candidates (3b + 3c-1)
 
   Layout:
     [resize handle — drag to resize, height persisted in sessionStorage]
@@ -27,16 +32,38 @@
     dwell_ms: number;
     ingest_latency_ms: number;
   };
+  /// Mirrors `correction_engine::decision::LeaveAloneReason`.
+  type LeaveAloneReason =
+    | "known"
+    | "no_candidates"
+    | "below_floor"
+    | "below_active_tier"
+    | "ambiguous";
+  /// Mirrors `correction_engine::DecisionOutcome`. Tag-internal `kind`
+  /// matches the serde tag on the Rust enum. 3c-3: `WouldCorrect` carries
+  /// the candidate's `confidence`, not a mode name.
+  type DecisionOutcome =
+    | {
+        kind: "would_correct";
+        original: string;
+        suggested: string;
+        confidence: Confidence;
+        score: number;
+        runner_up_score: number | null;
+      }
+    | {
+        kind: "leave_alone";
+        original: string;
+        reason: LeaveAloneReason;
+      };
+  /// Mirrors `DecisionPayload` in engine.rs (Components 3c-2 + 3c-3).
+  /// Observe-only — `would_correct` is a proposal, not an injection.
+  /// `active_tier` is the engine's mode (Cautious / Balanced / Eager).
   type DecisionPayload = {
-    word: string;
-    matched: boolean;
-    replacement: string | null;
-    decision_latency_ms: number;
-  };
-  type InjectionPayload = {
-    delete_count: number;
-    replacement: string;
-    injection_latency_ms: number;
+    outcome: DecisionOutcome;
+    active_tier: ConfidenceTier;
+    decide_time_ms: number;
+    decision_version: number;
   };
 
   // Mirrors `behavioural_model::ModelSnapshot`.
@@ -163,6 +190,46 @@
     /// keystroke book-keeping.
     current_line: string;
   };
+  /// Mirrors `LexiconPayload` in engine.rs. Emitted once per sealed Word
+  /// token (Component 3a — read-only word source, no scoring yet).
+  type LexiconPayload = {
+    word: string;
+    known: boolean;
+    frequency: number;
+    lexicon_version: number;
+  };
+  /// Mirrors `correction_engine::score::EditType`. Slip-perspective:
+  /// the user added an extra key (insertion) or missed one (deletion).
+  type EditType = "substitution" | "transposition" | "insertion" | "deletion";
+  /// Mirrors `correction_engine::ConfidenceTier` — the engine **mode**.
+  /// Names how aggressive the engine should be; never used as a per-
+  /// candidate label.
+  type ConfidenceTier = "cautious" | "balanced" | "eager";
+  /// Mirrors `correction_engine::Confidence` — the per-candidate
+  /// **confidence label** the badge renders. Separate vocabulary from
+  /// the mode (3c-3 contract).
+  type Confidence = "high" | "medium" | "low";
+  /// Mirrors `correction_engine::ScoredCandidate` — one row in the
+  /// CANDIDATES panel under 3c-1 scoring.
+  type ScoredCandidate = {
+    word: string;
+    frequency: number;
+    edit_type: EditType;
+    lexicon_evidence: number;
+    motor_evidence: number;
+    score: number;
+  };
+  /// Mirrors `CandidatesPayload` in engine.rs (Components 3b + 3c-1 +
+  /// 3c-3). Empty `scored` is a real outcome ("no known candidates
+  /// within edit-1"). `top_confidence` is what the badge renders.
+  type CandidatesPayload = {
+    word: string;
+    scored: ScoredCandidate[];
+    top_score: number | null;
+    top_confidence: Confidence | null;
+    candidates_version: number;
+    score_version: number;
+  };
   type ModelSnapshot = {
     timing: { per_key: KeyTimingRow[]; per_finger: FingerTimingRow[] };
     asymmetry: AsymmetrySnapshot;
@@ -179,17 +246,9 @@
     | {
         id: number;
         kind: "decision";
-        word: string;
-        matched: boolean;
-        replacement: string | null;
-        decision_latency_ms: number;
-      }
-    | {
-        id: number;
-        kind: "injection";
-        delete_count: number;
-        replacement: string;
-        injection_latency_ms: number;
+        outcome: DecisionOutcome;
+        active_tier: ConfidenceTier;
+        decide_time_ms: number;
       }
     | {
         id: number;
@@ -207,12 +266,18 @@
   let nextId = 0;
 
   // Running totals — kept separate from `rows` so the strip stays accurate
-  // even after old rows are evicted from the visible feed.
+  // even after old rows are evicted from the visible feed. Under 3c-2 the
+  // engine is observe-only, so we count "would-correct" decisions and
+  // average their per-token decide time (scoring + decision policy cost).
   let keystrokeCount = 0;
-  let correctionCount = 0;
-  let latencySum = 0;
-  let latencyMax = 0;
-  $: latencyAvg = correctionCount === 0 ? 0 : latencySum / correctionCount;
+  let wouldCorrectCount = 0;
+  let decideSum = 0;
+  let decideMax = 0;
+  let decideCount = 0;
+  $: decideAvg = decideCount === 0 ? 0 : decideSum / decideCount;
+  /// Active engine mode, latched from the most recent DECISION payload.
+  /// `null` until the first decision arrives (no decisions yet).
+  let activeMode: ConfidenceTier | null = null;
 
   // Latest L2 snapshot. Replaced wholesale on every model-snapshot event.
   let modelRows: KeyTimingRow[] = [];
@@ -227,6 +292,13 @@
   /// `engine://anchor-snapshot`. The panel doesn't infer anchor state from
   /// edits — engine is the source of truth.
   let anchorsSnap: AnchorsSnapshot | null = null;
+  /// Lexicon lookups for words sealed on the CURRENT line. One row per
+  /// Word token, appended in order. Cleared by `engine://line-reset`.
+  let lineLexicon: LexiconPayload[] = [];
+  /// Candidate sets for UNKNOWN Word tokens on the CURRENT line. One row
+  /// per unknown word (known words never emit). Cleared by
+  /// `engine://line-reset` alongside the other line-scoped state.
+  let lineCandidates: CandidatesPayload[] = [];
 
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
@@ -295,9 +367,10 @@
   function clear() {
     rows = [];
     keystrokeCount = 0;
-    correctionCount = 0;
-    latencySum = 0;
-    latencyMax = 0;
+    wouldCorrectCount = 0;
+    decideSum = 0;
+    decideMax = 0;
+    decideCount = 0;
     // Note: Clear only resets the *view*. The L2 model in the backend keeps
     // its own counts — modelRows/fingerRows will repopulate on the next keystroke.
   }
@@ -330,29 +403,21 @@
     );
     unlistens.push(
       await listen<DecisionPayload>("engine://decision", (e) => {
+        decideCount += 1;
+        decideSum += e.payload.decide_time_ms;
+        if (e.payload.decide_time_ms > decideMax) {
+          decideMax = e.payload.decide_time_ms;
+        }
+        if (e.payload.outcome.kind === "would_correct") {
+          wouldCorrectCount += 1;
+        }
+        activeMode = e.payload.active_tier;
         push({
           id: nextId++,
           kind: "decision",
-          word: e.payload.word,
-          matched: e.payload.matched,
-          replacement: e.payload.replacement,
-          decision_latency_ms: e.payload.decision_latency_ms,
-        });
-      }),
-    );
-    unlistens.push(
-      await listen<InjectionPayload>("engine://injection", (e) => {
-        correctionCount += 1;
-        latencySum += e.payload.injection_latency_ms;
-        if (e.payload.injection_latency_ms > latencyMax) {
-          latencyMax = e.payload.injection_latency_ms;
-        }
-        push({
-          id: nextId++,
-          kind: "injection",
-          delete_count: e.payload.delete_count,
-          replacement: e.payload.replacement,
-          injection_latency_ms: e.payload.injection_latency_ms,
+          outcome: e.payload.outcome,
+          active_tier: e.payload.active_tier,
+          decide_time_ms: e.payload.decide_time_ms,
         });
       }),
     );
@@ -385,11 +450,23 @@
     unlistens.push(
       await listen("engine://line-reset", () => {
         lineTokens = [];
+        lineLexicon = [];
+        lineCandidates = [];
       }),
     );
     unlistens.push(
       await listen<AnchorsSnapshot>("engine://anchor-snapshot", (e) => {
         anchorsSnap = e.payload;
+      }),
+    );
+    unlistens.push(
+      await listen<LexiconPayload>("engine://lexicon", (e) => {
+        lineLexicon = [...lineLexicon, e.payload];
+      }),
+    );
+    unlistens.push(
+      await listen<CandidatesPayload>("engine://candidates", (e) => {
+        lineCandidates = [...lineCandidates, e.payload];
       }),
     );
   });
@@ -427,6 +504,55 @@
   function sliceLine(line: string, start: number, end: number): string {
     const arr = Array.from(line);
     return arr.slice(start, end).join("");
+  }
+  /// Group separators for raw unigram counts so 23,135,851,162 is readable.
+  function fmtFreq(n: number): string {
+    if (n === 0) return "—";
+    return n.toLocaleString("en-US");
+  }
+  /// Compact "23.1B" style for the CANDIDATES inline list — same numbers,
+  /// just shorter so the per-word row fits e.g. `thge → the (23.1B), thee
+  /// (8.6M), tage (695K)`.
+  function fmtFreqCompact(n: number): string {
+    if (n === 0) return "—";
+    if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+    return String(n);
+  }
+  /// Two-decimal score formatter for the CANDIDATES table.
+  function fmtScore(n: number | null): string {
+    if (n === null) return "—";
+    return n.toFixed(2);
+  }
+  /// Human-readable label for the LeaveAlone reason in DECISION rows.
+  /// Maps the serde snake_case wire value to the panel's preferred
+  /// phrasing. Uses mode/confidence vocabulary per the 3c-3 split.
+  function fmtLeaveAloneReason(r: LeaveAloneReason): string {
+    switch (r) {
+      case "known":
+        return "known word";
+      case "no_candidates":
+        return "no known candidates";
+      case "below_floor":
+        return "below confidence floor";
+      case "below_active_tier":
+        return "below active mode";
+      case "ambiguous":
+        return "ambiguous — top two too close";
+    }
+  }
+  /// Human-readable confidence label for the candidate badge — never a
+  /// mode name. `null` is rendered separately ("below floor").
+  function fmtConfidence(c: Confidence): string {
+    switch (c) {
+      case "high":
+        return "HIGH";
+      case "medium":
+        return "MED";
+      case "low":
+        return "LOW";
+    }
   }
   function fmtAnchorState(state: AnchorState): string {
     if (state.kind === "tracking") return "Tracking";
@@ -475,9 +601,18 @@
 
   <header class="strip">
     <div class="stat"><span class="stat-label">KEYS</span><span class="stat-val">{keystrokeCount}</span></div>
-    <div class="stat"><span class="stat-label">CORR</span><span class="stat-val">{correctionCount}</span></div>
-    <div class="stat"><span class="stat-label">AVG</span><span class="stat-val">{fmtMs(latencyAvg)} ms</span></div>
-    <div class="stat"><span class="stat-label">MAX</span><span class="stat-val">{fmtMs(latencyMax)} ms</span></div>
+    <!-- MODE = active engine setting (Cautious / Balanced / Eager). Per
+         3c-3, modes and per-candidate confidences use SEPARATE vocabularies
+         — the badge in CANDIDATES is HIGH/MED/LOW, never a mode name. -->
+    <div class="stat">
+      <span class="stat-label">MODE</span>
+      <span class="stat-val mode-pill mode-pill-{activeMode ?? 'none'}"
+        >{activeMode ?? '—'}</span
+      >
+    </div>
+    <div class="stat"><span class="stat-label">WOULD-CORR</span><span class="stat-val">{wouldCorrectCount}</span></div>
+    <div class="stat"><span class="stat-label">DECIDE AVG</span><span class="stat-val">{fmtMs(decideAvg)} ms</span></div>
+    <div class="stat"><span class="stat-label">DECIDE MAX</span><span class="stat-val">{fmtMs(decideMax)} ms</span></div>
     <div class="spacer" />
     <button type="button" class="clear" on:click={clear}>Clear</button>
   </header>
@@ -496,27 +631,28 @@
               <span class="col-lat">ingest {fmtMs(row.ingest_latency_ms)} ms</span>
             </div>
           {:else if row.kind === "decision"}
-            {#if row.matched}
+            {#if row.outcome.kind === "would_correct"}
               <div class="row row-decision row-matched">
                 <span class="tag">DECISION</span>
-                <span class="badge badge-corrected">CORRECTED</span>
-                <span class="col-word">{row.word} → {row.replacement}</span>
-                <span class="col-lat">decided in {fmtMs(row.decision_latency_ms)} ms</span>
+                <span class="badge badge-corrected">WOULD CORRECT</span>
+                <span class="col-word"
+                  >{row.outcome.original} → {row.outcome.suggested} ({fmtConfidence(
+                    row.outcome.confidence,
+                  )},
+                  {fmtScore(row.outcome.score)})</span
+                >
+                <span class="col-lat">decide {fmtMs(row.decide_time_ms)} ms</span>
               </div>
             {:else}
               <div class="row row-decision">
                 <span class="tag">DECISION</span>
-                <span class="badge badge-left">LEFT ALONE</span>
-                <span class="col-word">{row.word} — no match</span>
-                <span class="col-lat">decided in {fmtMs(row.decision_latency_ms)} ms</span>
+                <span class="badge badge-left">LEAVE ALONE</span>
+                <span class="col-word"
+                  >{row.outcome.original} — {fmtLeaveAloneReason(row.outcome.reason)}</span
+                >
+                <span class="col-lat">decide {fmtMs(row.decide_time_ms)} ms</span>
               </div>
             {/if}
-          {:else if row.kind === "injection"}
-            <div class="row row-injection">
-              <span class="tag">INJECT</span>
-              <span class="col-word">deleted {row.delete_count}, typed "{row.replacement}"</span>
-              <span class="col-lat">e2e {fmtMs(row.injection_latency_ms)} ms</span>
-            </div>
           {:else if row.kind === "slip"}
             <div class="row row-slip">
               <span class="tag">SLIP</span>
@@ -622,6 +758,85 @@
                 </div>
               {/each}
             </div>
+          {/if}
+        </div>
+
+        <div class="model-sub model-sub-sticky">LEXICON · current line · L4 word source</div>
+        <div class="lex-block">
+          {#if lineLexicon.length === 0}
+            <div class="empty">no word lookups on this line yet…</div>
+          {:else}
+            <div class="lex-table">
+              <div class="lex-row lex-head">
+                <span class="col-lw">word</span>
+                <span class="col-lk">known?</span>
+                <span class="col-lf num">frequency</span>
+              </div>
+              {#each lineLexicon as l, i (`${i}-${l.word}`)}
+                <div class="lex-row" class:lex-known={l.known} class:lex-unknown={!l.known}>
+                  <span class="col-lw">{l.word}</span>
+                  <span class="col-lk">{l.known ? "yes" : "no"}</span>
+                  <!-- Frequency is a ranking-only signal under lexicon v2:
+                       it's meaningless for unknown words (a Norvig typo
+                       like `teh` has 1.7M occurrences but isn't a real
+                       word). Suppress to "—" when known=NO so the panel
+                       doesn't suggest the count is load-bearing. -->
+                  <span class="col-lf num">{l.known ? fmtFreq(l.frequency) : "—"}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+
+        <div class="model-sub model-sub-sticky">CANDIDATES · unknown words · L4 score (display-only)</div>
+        <div class="cand-block">
+          {#if lineCandidates.length === 0}
+            <div class="empty">no unknown words on this line yet…</div>
+          {:else}
+            {#each lineCandidates as c, i (`${i}-${c.word}`)}
+              <div class="cand-group">
+                <div class="cand-header">
+                  <span class="cand-src">{c.word}</span>
+                  <span class="cand-arrow">→</span>
+                  {#if c.scored.length === 0}
+                    <span class="cand-empty">(no known candidates within edit-1)</span>
+                  {:else if c.top_confidence !== null}
+                    <!-- 3c-3: badge shows the candidate's CONFIDENCE
+                         (High/Medium/Low) — never a mode name. The active
+                         mode lives in the strip. -->
+                    <span class="cand-conf cand-conf-{c.top_confidence}"
+                      >{fmtConfidence(c.top_confidence)}</span
+                    >
+                    <span class="cand-top-score">top {fmtScore(c.top_score)}</span>
+                  {:else}
+                    <span class="cand-conf cand-conf-none">below floor</span>
+                    <span class="cand-top-score">top {fmtScore(c.top_score)}</span>
+                  {/if}
+                </div>
+                {#if c.scored.length > 0}
+                  <div class="score-table">
+                    <div class="score-row score-head">
+                      <span class="col-sw">candidate</span>
+                      <span class="col-se">edit</span>
+                      <span class="col-sx num">freq</span>
+                      <span class="col-sl num">lex_ev</span>
+                      <span class="col-sm num">motor_ev</span>
+                      <span class="col-ss num">score</span>
+                    </div>
+                    {#each c.scored as s, j (s.word)}
+                      <div class="score-row" class:score-top={j === 0}>
+                        <span class="col-sw">{s.word}</span>
+                        <span class="col-se">{s.edit_type}</span>
+                        <span class="col-sx num">{fmtFreqCompact(s.frequency)}</span>
+                        <span class="col-sl num">{fmtScore(s.lexicon_evidence)}</span>
+                        <span class="col-sm num">{fmtScore(s.motor_evidence)}</span>
+                        <span class="col-ss num">{fmtScore(s.score)}</span>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {/each}
           {/if}
         </div>
 
@@ -944,7 +1159,6 @@
     white-space: nowrap;
   }
   .row-key { grid-template-columns: 70px auto minmax(0, 1fr) auto; }
-  .row-injection { grid-template-columns: 70px minmax(0, 1fr) auto; }
   .row:nth-child(even) { background: rgba(255, 255, 255, 0.025); }
 
   .tag {
@@ -980,9 +1194,8 @@
   .col-dwell, .col-lat { color: #8aa1b8; }
   .col-word { color: #d5d5d5; overflow: hidden; text-overflow: ellipsis; }
 
-  /* Subtle left border on injection rows so the eye can scan correction events
-     without relying on the green badge. */
-  .row-injection,
+  /* Subtle left border on would-correct rows so the eye can scan correction
+     events without relying on the green badge. */
   .row-matched {
     border-left: 2px solid #2e5a2e;
     padding-left: 0.6rem;
@@ -1145,6 +1358,185 @@
   .col-tx { color: #d5d5d5; }
   .col-ts { color: #8aa1b8; }
   .col-tt { color: #d5d5d5; }
+
+  /* LEXICON — L4 Component 3a, read-only word source. One row per sealed
+     Word token on the current line. "known" gets a quiet green rail; "no"
+     gets an amber rail — text labels still carry the meaning, the rails
+     are just glanceability. */
+  .lex-block {
+    padding: 0.25rem 0 0.5rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .lex-table {
+    padding: 0 0 0.2rem;
+  }
+  .lex-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) 60px minmax(0, 1fr);
+    column-gap: 0.5rem;
+    align-items: baseline;
+    padding: 0.2rem 0.75rem;
+    white-space: nowrap;
+  }
+  .lex-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.25rem;
+    margin-bottom: 0.1rem;
+  }
+  .lex-row:not(.lex-head):nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
+  }
+  .lex-known {
+    border-left: 2px solid #2e5a2e;
+    padding-left: calc(0.75rem - 2px);
+  }
+  .lex-unknown {
+    border-left: 2px solid #6a5320;
+    padding-left: calc(0.75rem - 2px);
+  }
+  .col-lw {
+    color: #e6e6e6;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .col-lk { color: #d5d5d5; }
+  .col-lf { color: #8aa1b8; }
+
+  /* CANDIDATES — L4 Components 3b + 3c-1. Per unknown word: a header
+     line (typed word + tier badge + top score) and a small table with
+     per-candidate edit type, frequency, lexicon evidence, motor evidence,
+     and score. Tier badge is display-only this pass; the decision path
+     is unchanged. */
+  .cand-block {
+    padding: 0.25rem 0 0.5rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .cand-group {
+    padding: 0.3rem 0.75rem 0.45rem;
+  }
+  .cand-group:nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
+  }
+  .cand-header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.45rem;
+    margin-bottom: 0.2rem;
+  }
+  .cand-src {
+    color: #e6c98a;
+    font-weight: 600;
+  }
+  .cand-arrow {
+    color: #7f8a96;
+  }
+  .cand-empty {
+    color: #7f8a96;
+    font-style: italic;
+  }
+  .cand-top-score {
+    color: #8aa1b8;
+    margin-left: auto;
+    font-variant-numeric: tabular-nums;
+  }
+  /* Confidence badges (3c-3) — colour-coded by candidate strength.
+     High = green (strong), Medium = blue, Low = amber, none = grey.
+     Text label carries the meaning; color is supplementary. */
+  .cand-conf {
+    padding: 0 0.45rem;
+    border-radius: 3px;
+    letter-spacing: 0.07em;
+    font-weight: 600;
+    font-size: 11px;
+  }
+  .cand-conf-high {
+    background: #1f3a1f;
+    color: #b6e3b6;
+    border: 1px solid #2e5a2e;
+  }
+  .cand-conf-medium {
+    background: #1f2a3a;
+    color: #9bb4d6;
+    border: 1px solid #2e4a6a;
+  }
+  .cand-conf-low {
+    background: #3a2a1f;
+    color: #e6c98a;
+    border: 1px solid #6a5320;
+  }
+  .cand-conf-none {
+    background: #1f1f1f;
+    color: #7f8a96;
+    border: 1px solid #3a3a3a;
+    font-style: italic;
+  }
+  /* Mode pill in the strip — uses muted, "setting"-feeling colors that
+     intentionally don't match the confidence palette. Modes and
+     confidence are separate vocabularies (3c-3 contract). */
+  .mode-pill {
+    padding: 0 0.5rem;
+    border-radius: 3px;
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+  }
+  .mode-pill-cautious {
+    background: #2a2230;
+    color: #c8b6e3;
+    border: 1px solid #4a3e5a;
+  }
+  .mode-pill-balanced {
+    background: #1f2a2f;
+    color: #9bd6c9;
+    border: 1px solid #2e4f4a;
+  }
+  .mode-pill-eager {
+    background: #2f261f;
+    color: #d6b69b;
+    border: 1px solid #5a432e;
+  }
+  .mode-pill-none {
+    background: #2a2f36;
+    color: #7f8a96;
+    border: 1px solid #3a414a;
+    font-style: italic;
+  }
+  /* Per-candidate score table — fixed columns, tabular numerals so the
+     numeric stacks line up. */
+  .score-table {
+    margin-top: 0.15rem;
+  }
+  .score-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) 88px 56px 56px 60px 56px;
+    column-gap: 0.4rem;
+    align-items: baseline;
+    padding: 0.18rem 0.3rem;
+    white-space: nowrap;
+  }
+  .score-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.2rem;
+    margin-bottom: 0.1rem;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+  }
+  /* Top candidate gets a subtle green rail — supplementary; the row
+     position (first) and the tier badge above carry the meaning. */
+  .score-top {
+    border-left: 2px solid #2e5a2e;
+    padding-left: calc(0.3rem - 2px);
+    background: rgba(46, 90, 46, 0.08);
+  }
+  .col-sw { color: #b6e3b6; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+  .col-se { color: #8aa1b8; }
+  .col-sx { color: #8aa1b8; }
+  .col-sl, .col-sm { color: #d5d5d5; }
+  .col-ss { color: #e6e6e6; font-weight: 600; }
 
   /* ANCHORS — L4 Observing, Component 2. Sibling of TOKENS; one row per
      live anchor on the current line. Voided rows get a faded look but
