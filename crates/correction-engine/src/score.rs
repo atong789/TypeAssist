@@ -22,9 +22,12 @@
 //!    ([`crate::keyboard`]); the personal [`VolatilityMap`] blends on
 //!    top via observed swap-pair counts.
 //! 4. **score** = `motor * lexicon` — high only when both are high.
-//! 5. **[`tier_for`]** maps the top score to Gentle / Balanced / Bold
-//!    using **PLACEHOLDER thresholds** (replace with values from real
-//!    Observing data; for now they're round numbers).
+//! 5. **[`confidence_for`]** labels the top score `Low` / `Medium` /
+//!    `High` (or `None` below the lowest floor) using **PLACEHOLDER
+//!    thresholds** (replace with values from real Observing data; for
+//!    now they're round numbers). The decision module composes this
+//!    confidence with the active engine **mode** ([`crate::ConfidenceTier`])
+//!    to decide whether to fire.
 //!
 //! ## Versioning
 //!
@@ -36,7 +39,6 @@ use volatility_map::VolatilityMap;
 
 use crate::candidates::KnownCandidate;
 use crate::keyboard;
-use crate::ConfidenceTier;
 
 /// Version of the scoring + classification + tier-thresholding logic.
 pub const SCORE_VERSION: u32 = 1;
@@ -76,15 +78,44 @@ const MAP_BOOST_WEIGHT: f64 = 0.3;
 /// pattern" for this user.
 const MAP_BOOST_SATURATION: f64 = 10.0;
 
-// ---- Tier thresholds (PLACEHOLDERS — replace with real Observing data) ---
+// ---- Confidence thresholds (PLACEHOLDERS — replace with Observing data) ---
+//
+// One set of numeric thresholds serves two views, with separate vocabulary
+// (per the brief: modes and corrections must read as distinct):
+//
+//   * Per-candidate **confidence** (this score → Low/Medium/High) — the
+//     panel badge. See [`Confidence`].
+//   * Per-engine **mode** (active threshold to fire) — Eager / Balanced /
+//     Cautious. See [`crate::ConfidenceTier`]. The lowest threshold
+//     (CONFIDENCE_LOW_FLOOR) is Eager's bar; the highest is Cautious's.
 
-/// **PLACEHOLDER.** Score >= this floor → Gentle tier (lowest tier that
-/// would propose anything). Re-tune from real Observing data.
-const TIER_GENTLE_FLOOR: f64 = 0.25;
-/// **PLACEHOLDER.** Score >= this floor → Balanced tier.
-const TIER_BALANCED_FLOOR: f64 = 0.50;
-/// **PLACEHOLDER.** Score >= this floor → Bold tier.
-const TIER_BOLD_FLOOR: f64 = 0.75;
+/// **PLACEHOLDER.** Score >= this floor → `Confidence::Low`. Also the
+/// threshold Eager mode (most permissive) requires to fire.
+pub const CONFIDENCE_LOW_FLOOR: f64 = 0.25;
+/// **PLACEHOLDER.** Score >= this floor → `Confidence::Medium`. Also the
+/// threshold Balanced mode requires to fire.
+pub const CONFIDENCE_MEDIUM_FLOOR: f64 = 0.50;
+/// **PLACEHOLDER.** Score >= this floor → `Confidence::High`. Also the
+/// threshold Cautious mode (strictest) requires to fire.
+pub const CONFIDENCE_HIGH_FLOOR: f64 = 0.75;
+
+/// Per-candidate **confidence label**. Separate vocabulary from
+/// [`crate::ConfidenceTier`] (the engine mode setting) — a *candidate*
+/// has confidence; a *mode* chooses what confidence to act on. The
+/// panel badge MUST render this, never a mode name.
+///
+/// * `High` — score clears [`CONFIDENCE_HIGH_FLOOR`]. Even the
+///   strictest mode (Cautious) would fire.
+/// * `Medium` — clears [`CONFIDENCE_MEDIUM_FLOOR`]. Balanced / Eager fire.
+/// * `Low` — clears [`CONFIDENCE_LOW_FLOOR`]. Only Eager fires.
+/// * `None` (return type) — below the lowest floor; no mode would fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    Low,
+    Medium,
+    High,
+}
 
 /// Slip-perspective edit classification. Names describe what the **user**
 /// did (typed extra / missed a key), not the Norvig-algorithm direction.
@@ -155,16 +186,17 @@ pub struct ScoredCandidate {
     pub score: f64,
 }
 
-/// All scored candidates for one unknown word, plus the tier the top
-/// score would land in (display-only this pass — see module docs).
+/// All scored candidates for one unknown word, plus the confidence
+/// label the top score earned (display-only this pass — see module docs).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfidenceReport {
     pub original: String,
     pub scored: Vec<ScoredCandidate>,
     /// Highest score in `scored`, or `None` if `scored` is empty.
     pub top_score: Option<f64>,
-    /// Tier for `top_score`, or `None` if below the lowest floor.
-    pub top_tier: Option<ConfidenceTier>,
+    /// Confidence label for `top_score`, or `None` if below the lowest
+    /// floor. The panel badge reads this — never a mode name.
+    pub top_confidence: Option<Confidence>,
     pub score_version: u32,
 }
 
@@ -287,26 +319,26 @@ pub fn score_candidates(
     });
 
     let top_score = scored.first().map(|s| s.score);
-    let top_tier = top_score.and_then(tier_for);
+    let top_confidence = top_score.and_then(confidence_for);
 
     ConfidenceReport {
         original: original.to_string(),
         scored,
         top_score,
-        top_tier,
+        top_confidence,
         score_version: SCORE_VERSION,
     }
 }
 
-/// Tier from a score, using the PLACEHOLDER thresholds at the top of the
-/// module. `None` means "below the lowest floor — no tier would fire".
-pub fn tier_for(score: f64) -> Option<ConfidenceTier> {
-    if score >= TIER_BOLD_FLOOR {
-        Some(ConfidenceTier::Bold)
-    } else if score >= TIER_BALANCED_FLOOR {
-        Some(ConfidenceTier::Balanced)
-    } else if score >= TIER_GENTLE_FLOOR {
-        Some(ConfidenceTier::Gentle)
+/// Per-candidate confidence label for a score. `None` means the score is
+/// below even [`CONFIDENCE_LOW_FLOOR`] — no mode would fire.
+pub fn confidence_for(score: f64) -> Option<Confidence> {
+    if score >= CONFIDENCE_HIGH_FLOOR {
+        Some(Confidence::High)
+    } else if score >= CONFIDENCE_MEDIUM_FLOOR {
+        Some(Confidence::Medium)
+    } else if score >= CONFIDENCE_LOW_FLOOR {
+        Some(Confidence::Low)
     } else {
         None
     }
@@ -654,22 +686,22 @@ mod tests {
         assert_eq!(m, DELETION_BASE);
     }
 
-    // ---- tier_for --------------------------------------------------------
+    // ---- confidence_for --------------------------------------------------
 
     #[test]
-    fn tier_for_progresses_through_thresholds() {
-        assert_eq!(tier_for(0.0), None);
-        assert_eq!(tier_for(0.10), None);
-        assert_eq!(tier_for(0.30), Some(ConfidenceTier::Gentle));
-        assert_eq!(tier_for(0.55), Some(ConfidenceTier::Balanced));
-        assert_eq!(tier_for(0.80), Some(ConfidenceTier::Bold));
-        assert_eq!(tier_for(1.0), Some(ConfidenceTier::Bold));
+    fn confidence_for_progresses_through_thresholds() {
+        assert_eq!(confidence_for(0.0), None);
+        assert_eq!(confidence_for(0.10), None);
+        assert_eq!(confidence_for(0.30), Some(Confidence::Low));
+        assert_eq!(confidence_for(0.55), Some(Confidence::Medium));
+        assert_eq!(confidence_for(0.80), Some(Confidence::High));
+        assert_eq!(confidence_for(1.0), Some(Confidence::High));
     }
 
     #[test]
-    fn tier_thresholds_are_strictly_ordered() {
-        assert!(TIER_GENTLE_FLOOR < TIER_BALANCED_FLOOR);
-        assert!(TIER_BALANCED_FLOOR < TIER_BOLD_FLOOR);
+    fn confidence_thresholds_are_strictly_ordered() {
+        assert!(CONFIDENCE_LOW_FLOOR < CONFIDENCE_MEDIUM_FLOOR);
+        assert!(CONFIDENCE_MEDIUM_FLOOR < CONFIDENCE_HIGH_FLOOR);
     }
 
     // ---- score_candidates end-to-end ------------------------------------
@@ -685,13 +717,13 @@ mod tests {
     fn teh_to_the_scores_high() {
         // "teh" → "the": transposition. lex_ev for "the" is ~1.0,
         // motor_ev for transposition is TRANSPOSITION_BASE (0.7).
-        // Expected score ≈ 0.7.
+        // Expected score ≈ 0.7 → Medium confidence (clears 0.50, not 0.75).
         let report = score_candidates("teh", &[cand("the", 23_135_851_162)], &empty_map());
         assert_eq!(report.scored.len(), 1);
         let s = &report.scored[0];
         assert_eq!(s.edit_type, EditType::Transposition);
         assert!(s.score > 0.6 && s.score < 0.8, "score={}", s.score);
-        assert_eq!(report.top_tier, Some(ConfidenceTier::Balanced));
+        assert_eq!(report.top_confidence, Some(Confidence::Medium));
     }
 
     #[test]
@@ -708,11 +740,11 @@ mod tests {
     #[test]
     fn far_substitution_scores_low() {
         // "lold" → "sold": l → s, far apart. Even with high lex_ev,
-        // motor ~ 0.15 caps the score below the Gentle floor.
+        // motor ~ 0.15 caps the score below the lowest confidence floor.
         let report = score_candidates("lold", &[cand("sold", 100_000_000)], &empty_map());
         let s = &report.scored[0];
-        assert!(s.score < TIER_GENTLE_FLOOR, "score={}", s.score);
-        assert_eq!(report.top_tier, None);
+        assert!(s.score < CONFIDENCE_LOW_FLOOR, "score={}", s.score);
+        assert_eq!(report.top_confidence, None);
     }
 
     #[test]
@@ -720,7 +752,7 @@ mod tests {
         let report = score_candidates("asdf", &[], &empty_map());
         assert!(report.scored.is_empty());
         assert_eq!(report.top_score, None);
-        assert_eq!(report.top_tier, None);
+        assert_eq!(report.top_confidence, None);
     }
 
     #[test]

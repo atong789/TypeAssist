@@ -24,20 +24,34 @@ pub mod tokenizer;
 pub use anchor::{AnchorState, AnchorTracker, AnchorsSnapshot, SpanAnchor, VoidReason};
 pub use candidates::{ranked_known_candidates, KnownCandidate, CANDIDATES_VERSION};
 pub use decision::{
-    decide, DecisionOutcome, LeaveAloneReason, ACTIVE_TIER, DECISION_VERSION, SEPARATION_MARGIN,
+    decide, mode_min_confidence, DecisionOutcome, LeaveAloneReason, ACTIVE_TIER,
+    DECISION_VERSION, SEPARATION_MARGIN,
 };
 pub use lexicon::{Lexicon, LEXICON_VERSION};
 pub use score::{
-    score_candidates, tier_for, ConfidenceReport, EditType, ScoredCandidate, SCORE_VERSION,
+    confidence_for, score_candidates, Confidence, ConfidenceReport, EditType, ScoredCandidate,
+    CONFIDENCE_HIGH_FLOOR, CONFIDENCE_LOW_FLOOR, CONFIDENCE_MEDIUM_FLOOR, SCORE_VERSION,
 };
 pub use tokenizer::{Token, TokenKind, Tokenizer, TOKENIZER_VERSION};
 
+/// **Engine MODE.** Names how aggressive the user wants the engine to be.
+/// The mode gates whether a candidate's confidence is high enough to fire
+/// a correction — **not** a label for any specific candidate.
+///
+/// * `Cautious` — strictest threshold. Engine acts only on High-confidence
+///   candidates. Quiet-by-default.
+/// * `Balanced` — middle threshold. Acts on Medium-or-higher confidence.
+/// * `Eager` — laxest threshold. Acts on Low-or-higher confidence; most
+///   frequent corrections.
+///
+/// Modes and candidate-confidences use **separate vocabularies** — see
+/// [`crate::score::Confidence`] for the per-candidate label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfidenceTier {
-    Gentle,
+    Cautious,
     Balanced,
-    Bold,
+    Eager,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,7 +160,7 @@ mod tests {
 
     #[test]
     fn engine_propose_leaves_known_word_alone() {
-        let engine = CorrectionEngine::new(ConfidenceTier::Gentle);
+        let engine = CorrectionEngine::new(ConfidenceTier::Eager);
         let out = engine.propose("the", &empty_map());
         match out {
             DecisionOutcome::LeaveAlone { reason, .. } => {
@@ -158,7 +172,7 @@ mod tests {
 
     #[test]
     fn engine_propose_returns_no_candidates_for_nonsense() {
-        let engine = CorrectionEngine::new(ConfidenceTier::Gentle);
+        let engine = CorrectionEngine::new(ConfidenceTier::Eager);
         let out = engine.propose("qzxjvk", &empty_map());
         match out {
             DecisionOutcome::LeaveAlone { reason, .. } => {
@@ -173,7 +187,7 @@ mod tests {
         // `recieve` → `receive` (transposition, ~10M Norvig count) clearly
         // beats `relieve` (replace c→l, far-apart sub, ~few M). Top score
         // ~0.47, runner-up ~0.09 — well above SEPARATION_MARGIN.
-        let engine = CorrectionEngine::new(ConfidenceTier::Gentle);
+        let engine = CorrectionEngine::new(ConfidenceTier::Eager);
         let out = engine.propose("recieve", &empty_map());
         match out {
             DecisionOutcome::WouldCorrect { suggested, .. } => {
@@ -192,7 +206,7 @@ mod tests {
         // behaviour the brief asked for ("don't confidently pick a
         // near-tie"). Pinned so a scorer tuning change can't silently
         // start picking a confident loser.
-        let engine = CorrectionEngine::new(ConfidenceTier::Gentle);
+        let engine = CorrectionEngine::new(ConfidenceTier::Eager);
         let out = engine.propose("teh", &empty_map());
         match out {
             DecisionOutcome::LeaveAlone { reason, .. } => {
@@ -203,13 +217,13 @@ mod tests {
     }
 
     #[test]
-    fn engine_propose_at_bold_active_leaves_unambiguous_winner_alone_too() {
-        // `recieve` → `receive` score ~0.47 — clears Gentle (0.25) and
-        // would fire at Gentle, but below Balanced (0.50) and Bold
-        // (0.75). At Bold the decision is BelowActiveTier — flipping
-        // the active tier is the verification surface this commit
-        // exposes via ACTIVE_TIER.
-        let engine = CorrectionEngine::new(ConfidenceTier::Bold);
+    fn engine_propose_at_cautious_active_leaves_unambiguous_winner_alone_too() {
+        // `recieve` → `receive` score ~0.47 — clears the Low floor (0.25)
+        // and would fire under Eager mode, but below the Medium (0.50)
+        // and High (0.75) floors. At Cautious mode (strictest) the
+        // decision is BelowActiveTier. Flipping `ACTIVE_TIER` is the
+        // verification surface exposed by Component 3c-3.
+        let engine = CorrectionEngine::new(ConfidenceTier::Cautious);
         let out = engine.propose("recieve", &empty_map());
         match out {
             DecisionOutcome::LeaveAlone { reason, .. } => {

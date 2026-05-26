@@ -40,13 +40,14 @@
     | "below_active_tier"
     | "ambiguous";
   /// Mirrors `correction_engine::DecisionOutcome`. Tag-internal `kind`
-  /// matches the serde tag on the Rust enum.
+  /// matches the serde tag on the Rust enum. 3c-3: `WouldCorrect` carries
+  /// the candidate's `confidence`, not a mode name.
   type DecisionOutcome =
     | {
         kind: "would_correct";
         original: string;
         suggested: string;
-        tier: ConfidenceTier;
+        confidence: Confidence;
         score: number;
         runner_up_score: number | null;
       }
@@ -55,8 +56,9 @@
         original: string;
         reason: LeaveAloneReason;
       };
-  /// Mirrors `DecisionPayload` in engine.rs (Component 3c-2). Observe-
-  /// only — `would_correct` is a proposal, not an injection.
+  /// Mirrors `DecisionPayload` in engine.rs (Components 3c-2 + 3c-3).
+  /// Observe-only — `would_correct` is a proposal, not an injection.
+  /// `active_tier` is the engine's mode (Cautious / Balanced / Eager).
   type DecisionPayload = {
     outcome: DecisionOutcome;
     active_tier: ConfidenceTier;
@@ -199,8 +201,14 @@
   /// Mirrors `correction_engine::score::EditType`. Slip-perspective:
   /// the user added an extra key (insertion) or missed one (deletion).
   type EditType = "substitution" | "transposition" | "insertion" | "deletion";
-  /// Mirrors `correction_engine::ConfidenceTier`.
-  type ConfidenceTier = "gentle" | "balanced" | "bold";
+  /// Mirrors `correction_engine::ConfidenceTier` — the engine **mode**.
+  /// Names how aggressive the engine should be; never used as a per-
+  /// candidate label.
+  type ConfidenceTier = "cautious" | "balanced" | "eager";
+  /// Mirrors `correction_engine::Confidence` — the per-candidate
+  /// **confidence label** the badge renders. Separate vocabulary from
+  /// the mode (3c-3 contract).
+  type Confidence = "high" | "medium" | "low";
   /// Mirrors `correction_engine::ScoredCandidate` — one row in the
   /// CANDIDATES panel under 3c-1 scoring.
   type ScoredCandidate = {
@@ -211,15 +219,14 @@
     motor_evidence: number;
     score: number;
   };
-  /// Mirrors `CandidatesPayload` in engine.rs. Components 3b + 3c-1 —
-  /// emitted once per UNKNOWN Word token. Empty `scored` is a real
-  /// outcome ("no known candidates within edit-1"), not a missing event.
-  /// `top_tier` is display-only this pass; the decision path is untouched.
+  /// Mirrors `CandidatesPayload` in engine.rs (Components 3b + 3c-1 +
+  /// 3c-3). Empty `scored` is a real outcome ("no known candidates
+  /// within edit-1"). `top_confidence` is what the badge renders.
   type CandidatesPayload = {
     word: string;
     scored: ScoredCandidate[];
     top_score: number | null;
-    top_tier: ConfidenceTier | null;
+    top_confidence: Confidence | null;
     candidates_version: number;
     score_version: number;
   };
@@ -268,6 +275,9 @@
   let decideMax = 0;
   let decideCount = 0;
   $: decideAvg = decideCount === 0 ? 0 : decideSum / decideCount;
+  /// Active engine mode, latched from the most recent DECISION payload.
+  /// `null` until the first decision arrives (no decisions yet).
+  let activeMode: ConfidenceTier | null = null;
 
   // Latest L2 snapshot. Replaced wholesale on every model-snapshot event.
   let modelRows: KeyTimingRow[] = [];
@@ -401,6 +411,7 @@
         if (e.payload.outcome.kind === "would_correct") {
           wouldCorrectCount += 1;
         }
+        activeMode = e.payload.active_tier;
         push({
           id: nextId++,
           kind: "decision",
@@ -515,7 +526,8 @@
     return n.toFixed(2);
   }
   /// Human-readable label for the LeaveAlone reason in DECISION rows.
-  /// Maps the serde snake_case wire value to the panel's preferred phrasing.
+  /// Maps the serde snake_case wire value to the panel's preferred
+  /// phrasing. Uses mode/confidence vocabulary per the 3c-3 split.
   function fmtLeaveAloneReason(r: LeaveAloneReason): string {
     switch (r) {
       case "known":
@@ -523,11 +535,23 @@
       case "no_candidates":
         return "no known candidates";
       case "below_floor":
-        return "below tier floor";
+        return "below confidence floor";
       case "below_active_tier":
-        return "below active tier";
+        return "below active mode";
       case "ambiguous":
         return "ambiguous — top two too close";
+    }
+  }
+  /// Human-readable confidence label for the candidate badge — never a
+  /// mode name. `null` is rendered separately ("below floor").
+  function fmtConfidence(c: Confidence): string {
+    switch (c) {
+      case "high":
+        return "HIGH";
+      case "medium":
+        return "MED";
+      case "low":
+        return "LOW";
     }
   }
   function fmtAnchorState(state: AnchorState): string {
@@ -577,6 +601,15 @@
 
   <header class="strip">
     <div class="stat"><span class="stat-label">KEYS</span><span class="stat-val">{keystrokeCount}</span></div>
+    <!-- MODE = active engine setting (Cautious / Balanced / Eager). Per
+         3c-3, modes and per-candidate confidences use SEPARATE vocabularies
+         — the badge in CANDIDATES is HIGH/MED/LOW, never a mode name. -->
+    <div class="stat">
+      <span class="stat-label">MODE</span>
+      <span class="stat-val mode-pill mode-pill-{activeMode ?? 'none'}"
+        >{activeMode ?? '—'}</span
+      >
+    </div>
     <div class="stat"><span class="stat-label">WOULD-CORR</span><span class="stat-val">{wouldCorrectCount}</span></div>
     <div class="stat"><span class="stat-label">DECIDE AVG</span><span class="stat-val">{fmtMs(decideAvg)} ms</span></div>
     <div class="stat"><span class="stat-label">DECIDE MAX</span><span class="stat-val">{fmtMs(decideMax)} ms</span></div>
@@ -603,7 +636,9 @@
                 <span class="tag">DECISION</span>
                 <span class="badge badge-corrected">WOULD CORRECT</span>
                 <span class="col-word"
-                  >{row.outcome.original} → {row.outcome.suggested} ({row.outcome.tier},
+                  >{row.outcome.original} → {row.outcome.suggested} ({fmtConfidence(
+                    row.outcome.confidence,
+                  )},
                   {fmtScore(row.outcome.score)})</span
                 >
                 <span class="col-lat">decide {fmtMs(row.decide_time_ms)} ms</span>
@@ -765,11 +800,16 @@
                   <span class="cand-arrow">→</span>
                   {#if c.scored.length === 0}
                     <span class="cand-empty">(no known candidates within edit-1)</span>
-                  {:else if c.top_tier !== null}
-                    <span class="cand-tier cand-tier-{c.top_tier}">{c.top_tier}</span>
+                  {:else if c.top_confidence !== null}
+                    <!-- 3c-3: badge shows the candidate's CONFIDENCE
+                         (High/Medium/Low) — never a mode name. The active
+                         mode lives in the strip. -->
+                    <span class="cand-conf cand-conf-{c.top_confidence}"
+                      >{fmtConfidence(c.top_confidence)}</span
+                    >
                     <span class="cand-top-score">top {fmtScore(c.top_score)}</span>
                   {:else}
-                    <span class="cand-tier cand-tier-none">below tier floor</span>
+                    <span class="cand-conf cand-conf-none">below floor</span>
                     <span class="cand-top-score">top {fmtScore(c.top_score)}</span>
                   {/if}
                 </div>
@@ -1401,34 +1441,67 @@
     margin-left: auto;
     font-variant-numeric: tabular-nums;
   }
-  /* Tier badges — colour-coded but the text label carries the meaning. */
-  .cand-tier {
+  /* Confidence badges (3c-3) — colour-coded by candidate strength.
+     High = green (strong), Medium = blue, Low = amber, none = grey.
+     Text label carries the meaning; color is supplementary. */
+  .cand-conf {
     padding: 0 0.45rem;
     border-radius: 3px;
     letter-spacing: 0.07em;
     font-weight: 600;
-    text-transform: uppercase;
     font-size: 11px;
   }
-  .cand-tier-gentle {
-    background: #1f2a3a;
-    color: #9bb4d6;
-    border: 1px solid #2e4a6a;
-  }
-  .cand-tier-balanced {
+  .cand-conf-high {
     background: #1f3a1f;
     color: #b6e3b6;
     border: 1px solid #2e5a2e;
   }
-  .cand-tier-bold {
+  .cand-conf-medium {
+    background: #1f2a3a;
+    color: #9bb4d6;
+    border: 1px solid #2e4a6a;
+  }
+  .cand-conf-low {
     background: #3a2a1f;
     color: #e6c98a;
     border: 1px solid #6a5320;
   }
-  .cand-tier-none {
+  .cand-conf-none {
     background: #1f1f1f;
     color: #7f8a96;
     border: 1px solid #3a3a3a;
+    font-style: italic;
+  }
+  /* Mode pill in the strip — uses muted, "setting"-feeling colors that
+     intentionally don't match the confidence palette. Modes and
+     confidence are separate vocabularies (3c-3 contract). */
+  .mode-pill {
+    padding: 0 0.5rem;
+    border-radius: 3px;
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+  }
+  .mode-pill-cautious {
+    background: #2a2230;
+    color: #c8b6e3;
+    border: 1px solid #4a3e5a;
+  }
+  .mode-pill-balanced {
+    background: #1f2a2f;
+    color: #9bd6c9;
+    border: 1px solid #2e4f4a;
+  }
+  .mode-pill-eager {
+    background: #2f261f;
+    color: #d6b69b;
+    border: 1px solid #5a432e;
+  }
+  .mode-pill-none {
+    background: #2a2f36;
+    color: #7f8a96;
+    border: 1px solid #3a414a;
     font-style: italic;
   }
   /* Per-candidate score table — fixed columns, tabular numerals so the

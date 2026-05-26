@@ -28,7 +28,7 @@ use std::time::Instant;
 
 use behavioural_model::{BehaviouralModel, InputEvent};
 use correction_engine::{
-    decide, ranked_known_candidates, score_candidates, AnchorTracker, ConfidenceTier,
+    decide, ranked_known_candidates, score_candidates, AnchorTracker, Confidence, ConfidenceTier,
     DecisionOutcome, Lexicon, ScoredCandidate, Token, TokenKind, Tokenizer, ACTIVE_TIER,
     CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION, SCORE_VERSION,
 };
@@ -269,7 +269,7 @@ fn emit_sealed_token<R: Runtime>(
                     word: tok.core.clone(),
                     scored: report.scored,
                     top_score: report.top_score,
-                    top_tier: report.top_tier,
+                    top_confidence: report.top_confidence,
                     candidates_version: CANDIDATES_VERSION,
                     score_version: SCORE_VERSION,
                 },
@@ -322,18 +322,21 @@ struct LexiconPayload {
 
 /// Per-unknown-Word-token candidate set with confidence scoring
 /// Per-unknown-Word-token candidate set with confidence scoring
-/// (Components 3b + 3c-1). Empty `scored` is emitted when the word has no
-/// known edit-1 neighbour — the debug panel renders that as "(no known
+/// (Components 3b + 3c-1 + 3c-3). Empty `scored` is emitted when the word
+/// has no known edit-1 neighbour — the panel renders that as "(no known
 /// candidates within edit-1)", a real outcome the brief wants visible.
-/// `top_tier` here is the *score tier* (what the top score reached); the
-/// active-tier gate that drives the actual decision lives in
-/// [`DecisionPayload`].
+///
+/// `top_confidence` is the per-candidate label (`Low` / `Medium` / `High`)
+/// — **the panel's badge**. The active-mode gate that drives the actual
+/// decision lives in [`DecisionPayload`]. Modes and corrections use
+/// separate vocabularies (3c-3): a candidate has confidence, a mode
+/// chooses what confidence to act on.
 #[derive(Serialize, Clone)]
 struct CandidatesPayload {
     word: String,
     scored: Vec<ScoredCandidate>,
     top_score: Option<f64>,
-    top_tier: Option<ConfidenceTier>,
+    top_confidence: Option<Confidence>,
     candidates_version: u32,
     score_version: u32,
 }
