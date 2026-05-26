@@ -347,10 +347,11 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
         .sidecar("typeassist-input-macos")?
         .env("TYPEASSIST_AX_PROMPT", "1");
 
-    // `_child` is retained so the sidecar process stays alive while we
-    // pull events off `rx`. We no longer write to it (injection is
-    // Component 3c-3 — the engine is observe-only this pass).
-    let (mut rx, _child) = sidecar.spawn()?;
+    // `sidecar_child` owns the parent-side write-end of the sidecar's
+    // stdin pipe. It is **moved into the async task below** and dropped
+    // when that task ends — see the load-bearing comment at the bottom
+    // of the closure for the lifetime contract.
+    let (mut rx, sidecar_child) = sidecar.spawn()?;
     let app_handle = app.clone();
 
     tauri::async_runtime::spawn(async move {
@@ -691,6 +692,37 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                 _ => {}
             }
         }
+
+        // ---- Sidecar lifetime guard — DO NOT REMOVE ---------------------
+        //
+        // Keep this drop here, at the END of the event loop. It is the
+        // mechanism that ties the Swift sidecar's lifetime to this async
+        // task's lifetime.
+        //
+        // `sidecar_child` owns the parent-side write-end of the sidecar's
+        // stdin pipe. When it drops, that pipe closes; the sidecar's
+        // input thread (`adapters/macos/.../Bridge.swift::runInputLoop`)
+        // reads EOF on `stdin.availableData`, dispatches `.shutdown`,
+        // and the sidecar exits cleanly via `EventTap::handleCommand`
+        // → `exit(0)`. That EOF-as-shutdown path IS the intended
+        // graceful teardown — firing it here when the loop ends (Tauri
+        // quitting, `CommandEvent::Terminated`, panic unwind) means the
+        // sidecar dies with us instead of leaking.
+        //
+        // Why this can't move earlier or disappear:
+        //   * Drop it before the loop runs (e.g. let it fall out of the
+        //     outer `spawn()` function) → sidecar sees EOF instantly,
+        //     `exit(0)` before any keystroke arrives, KEYS stays at 0
+        //     forever. This was the 3c-2 regression — the binding
+        //     looked unused, so it died with the outer function.
+        //   * Replace with `let _ = sidecar_child;` or rename to
+        //     `_sidecar_child` → same problem the moment a future
+        //     refactor removes the "unused" line.
+        //
+        // If you're here to retire this drop, FIRST check that the
+        // sidecar has another mechanism for staying alive — and read
+        // `Bridge.swift` to understand the EOF=shutdown contract.
+        drop(sidecar_child);
     });
 
     Ok(())
