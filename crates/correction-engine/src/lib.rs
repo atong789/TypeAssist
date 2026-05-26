@@ -20,6 +20,7 @@ pub mod decision;
 pub mod keyboard;
 pub mod lexicon;
 pub mod log;
+pub mod resolver;
 pub mod score;
 pub mod tokenizer;
 pub use anchor::{AnchorState, AnchorTracker, AnchorsSnapshot, SpanAnchor, VoidReason};
@@ -33,6 +34,7 @@ pub use log::{
     has_motor_evidence, should_log, DecisionLedger, LogConfidence, LogRecord, Outcome,
     DEFAULT_LEDGER_CAPACITY, LOG_VERSION,
 };
+pub use resolver::{OutcomeResolver, DEFAULT_DEBOUNCE_MS, RESOLVER_VERSION};
 pub use score::{
     confidence_for, score_candidates, Confidence, ConfidenceReport, EditType, ScoredCandidate,
     CONFIDENCE_HIGH_FLOOR, CONFIDENCE_LOW_FLOOR, CONFIDENCE_MEDIUM_FLOOR, SCORE_VERSION,

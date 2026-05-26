@@ -14,15 +14,18 @@
 //!   - `decide_time_ms`      — scoring + decision cost on a sealed token
 //!
 //! Events emitted to the debug panel:
-//!   `engine://keystroke`       — every key (or backspace) + dwell + ingest cost
-//!   `engine://decision`        — per sealed Word token, with would-correct / leave-alone outcome
-//!   `engine://model-snapshot`  — L2 state after each ingested event
-//!   `engine://slip`            — one event per confirmed slip (L3 learning loop)
-//!   `engine://token`           — one event per sealed L4 token (Observing brief Component 1)
-//!   `engine://line-reset`      — fired when the tokenizer line resets (newline / backspace rebuild / special key)
-//!   `engine://anchor-snapshot` — full `AnchorsSnapshot` after every anchor change (Observing brief Component 2)
-//!   `engine://lexicon`         — per Word token: known? + frequency (Component 3a)
-//!   `engine://candidates`      — per UNKNOWN Word token: scored edit-1 candidates + tier (Components 3b + 3c-1)
+//!   `engine://keystroke`           — every key (or backspace) + dwell + ingest cost
+//!   `engine://decision`            — per sealed Word token, with would-correct / leave-alone outcome
+//!   `engine://model-snapshot`      — L2 state after each ingested event
+//!   `engine://slip`                — one event per confirmed slip (L3 learning loop)
+//!   `engine://token`               — one event per sealed L4 token (Observing brief Component 1)
+//!   `engine://line-reset`          — fired when the tokenizer line resets (newline / backspace rebuild / special key)
+//!   `engine://anchor-snapshot`     — full `AnchorsSnapshot` after every anchor change (Observing brief Component 2)
+//!   `engine://lexicon`             — per Word token: known? + frequency (Component 3a)
+//!   `engine://candidates`          — per UNKNOWN Word token: scored edit-1 candidates + tier (Components 3b + 3c-1)
+//!   `engine://log-record`          — per appended decision-ledger record (Component 4)
+//!   `engine://log-record-updated`  — outcome transition for a ledger record (Component 5a). Revisable —
+//!                                    the same record id may receive several updates as the user revisits the span.
 
 use std::time::Instant;
 
@@ -32,8 +35,8 @@ use behavioural_model::{BehaviouralModel, InputEvent};
 use correction_engine::{
     decide, has_motor_evidence, ranked_known_candidates, score_candidates, should_log,
     AnchorTracker, Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome, Lexicon,
-    ScoredCandidate, Token, TokenKind, Tokenizer, ACTIVE_TIER, CANDIDATES_VERSION,
-    DECISION_VERSION, LEXICON_VERSION, SCORE_VERSION,
+    OutcomeResolver, ScoredCandidate, Token, TokenKind, Tokenizer, ACTIVE_TIER,
+    CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION, SCORE_VERSION,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
@@ -74,6 +77,12 @@ pub const EVT_CANDIDATES: &str = "engine://candidates";
 /// in-memory and bounded — the panel keeps its own view, the engine is
 /// the source of truth.
 pub const EVT_LOG_RECORD: &str = "engine://log-record";
+/// Fired by the Component 5a [`OutcomeResolver`] each time a record's
+/// outcome transitions (Pending → Kept, Kept → CorrectedToOther, …).
+/// Payload is the full updated `LogRecord`. **Revisable**: the same
+/// record id may receive multiple updates as the user revisits the
+/// span, and the panel must update in place (look up by `id`).
+pub const EVT_LOG_RECORD_UPDATED: &str = "engine://log-record-updated";
 
 /// Top-N candidates the engine surfaces per unknown word. Keep small so the
 /// debug panel and any future spatial-scorer aren't paying for a long tail.
@@ -234,6 +243,39 @@ fn anchor_emit_payload<'a>(
     }
 }
 
+/// Current wall-clock in ms since the Unix epoch. Saturating to 0 keeps
+/// the resolver's debounce arithmetic well-defined if the clock query
+/// ever fails (it shouldn't, but the engine is long-lived).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Run one [`OutcomeResolver`] pass and surface every transition. The
+/// resolver itself is a pure observer — this helper applies the
+/// transitions to the ledger and broadcasts the updated record on
+/// [`EVT_LOG_RECORD_UPDATED`]. Called from every anchor-affecting site:
+/// once a fresh anchor lands (so the debounce timer starts ticking),
+/// and once after each edit that might move a record's outcome.
+fn tick_resolver<R: Runtime>(
+    app: &AppHandle<R>,
+    resolver: &mut OutcomeResolver,
+    anchors: &AnchorTracker,
+    line_buf: &[char],
+    ledger: &mut DecisionLedger,
+) {
+    let changes = resolver.tick(now_ms(), anchors.anchors(), line_buf, ledger);
+    for (record_id, outcome) in changes {
+        if ledger.resolve_outcome(record_id, outcome) {
+            if let Some(rec) = ledger.get(record_id).cloned() {
+                let _ = app.emit(EVT_LOG_RECORD_UPDATED, rec);
+            }
+        }
+    }
+}
+
 /// Handle one sealed token: register an anchor if it's a Word, run the
 /// full L4 pipeline (lexicon → candidates → score → decide), emit the
 /// per-stage panel events. Centralised so every emission site (end-of-line,
@@ -327,10 +369,7 @@ fn emit_sealed_token<R: Runtime>(
         let has_motor = has_motor_evidence(line_dwells, tok.start, tok.end);
         if should_log(&outcome, has_motor) {
             if let Some(anchor_id) = anchor_id {
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                let ts = now_ms();
                 let new_id = ledger.append(
                     ts,
                     outcome,
@@ -458,6 +497,17 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
         // resolution is C5. Lives for the life of the engine; no disk
         // writes by design.
         let mut ledger = DecisionLedger::new();
+        // L4 Observing brief, Component 5a: outcome resolver. Watches
+        // each anchor's state + content, debounces, and transitions
+        // ledger records through their final outcome. Ticked once per
+        // edit alongside the anchor snapshot emit — the user typing
+        // the next word's first letter is also what surfaces the
+        // PREVIOUS word's resolution. No background timer in 5a:
+        // resolutions land on the next keystroke after the debounce
+        // window. Idle gaps with no further input leave the record
+        // Pending until the next key arrives — fine for the debug
+        // panel; revisit if real users notice.
+        let mut resolver = OutcomeResolver::new();
         // L4 lexicon (Component 3a). Process-wide singleton — first touch
         // parses the ~50k-entry bundled list; subsequent reads are HashMap
         // lookups. Read-only this slice: scoring/correction come later.
@@ -568,6 +618,18 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                     );
                                 }
                             }
+                            // C5a outcome resolver tick. Backspaces are
+                            // the canonical "user is correcting" signal;
+                            // we must run the resolver immediately so
+                            // Pending records flip the moment the user
+                            // arrives at their final content.
+                            tick_resolver(
+                                &app_handle,
+                                &mut resolver,
+                                &anchors,
+                                &line_buf,
+                                &mut ledger,
+                            );
                             let snap = anchors.snapshot();
                             let _ = app_handle.emit(
                                 EVT_ANCHOR_SNAPSHOT,
@@ -750,6 +812,21 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                                 }
                                             }
 
+                                            // C5a resolver tick. Covers
+                                            // both the fresh-anchor case
+                                            // (a newly-sealed token's
+                                            // debounce timer starts now)
+                                            // and the revisit case (a
+                                            // mid-line edit may have
+                                            // flipped a previously-resolved
+                                            // record).
+                                            tick_resolver(
+                                                &app_handle,
+                                                &mut resolver,
+                                                &anchors,
+                                                &line_buf,
+                                                &mut ledger,
+                                            );
                                             let snap = anchors.snapshot();
                                             let _ = app_handle.emit(
                                                 EVT_ANCHOR_SNAPSHOT,

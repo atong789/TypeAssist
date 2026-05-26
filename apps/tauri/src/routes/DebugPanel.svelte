@@ -16,6 +16,7 @@
     engine://lexicon         — per Word token: known? + frequency (Component 3a)
     engine://candidates      — per unknown Word token: scored edit-1 candidates (3b + 3c-1)
     engine://log-record      — per appended decision-ledger record (Component 4)
+    engine://log-record-updated — per outcome transition on an existing record (Component 5a, revisable)
 
   Layout:
     [resize handle — drag to resize, height persisted in sessionStorage]
@@ -235,13 +236,15 @@
   /// recorded on each ledger entry. `below_floor` covers both "top
   /// candidate below floor" and "no candidates at all".
   type LogConfidence = "high" | "medium" | "low" | "below_floor";
-  /// Mirrors `correction_engine::log::Outcome` — populated by C5; in
-  /// C4-only builds every record arrives as `pending`.
+  /// Mirrors `correction_engine::log::Outcome`. Component 5a resolves
+  /// records from `pending` to one of the four terminal states; further
+  /// edits on the same span can re-resolve (revisable).
   type Outcome =
     | { kind: "pending" }
     | { kind: "kept" }
     | { kind: "corrected_to_suggestion" }
-    | { kind: "corrected_to_other" };
+    | { kind: "corrected_to_other" }
+    | { kind: "abandoned" };
   /// Mirrors `correction_engine::log::LogRecord` — one decision ledger
   /// row. The full `decision` is the canonical outcome; `top_candidate`
   /// / `top_score` are convenience projections for cheap rendering.
@@ -522,6 +525,24 @@
         });
       }),
     );
+    unlistens.push(
+      // Component 5a — outcome transition for an existing record.
+      // **Revisable**: the same id may receive several updates as the
+      // user revisits the word's span. Update in place by id; the
+      // engine is the source of truth (we never re-derive outcomes
+      // panel-side, only mirror what the resolver reports). If the
+      // updated record was evicted from our local window (rare —
+      // requires >200 records since first emit), drop the update.
+      await listen<LogRecord>("engine://log-record-updated", (e) => {
+        const updated = e.payload;
+        const i = logRows.findIndex((r) => r.id === updated.id);
+        if (i < 0) return;
+        // New array reference so Svelte picks up the change.
+        const next = logRows.slice();
+        next[i] = updated;
+        logRows = next;
+      }),
+    );
   });
 
   onDestroy(() => {
@@ -631,8 +652,8 @@
     }
     return `leave alone · ${fmtLeaveAloneReason(d.reason)}`;
   }
-  /// Outcome slot label. Pending dominates in C4-only builds; C5 will
-  /// flip records to one of the three terminal states.
+  /// Outcome slot label. Component 5a flips records out of `pending`
+  /// once the user moves on; revisits flip them again.
   function fmtOutcome(o: Outcome): string {
     switch (o.kind) {
       case "pending":
@@ -643,6 +664,8 @@
         return "→ suggestion";
       case "corrected_to_other":
         return "→ other";
+      case "abandoned":
+        return "abandoned";
     }
   }
   function fmtRatio(r: number): string {
@@ -964,7 +987,7 @@
             <div class="empty">no decisions logged yet…</div>
           {:else}
             <div class="log-status">
-              <span class="num">{logRows.length}</span> shown · all pending until C5
+              <span class="num">{logRows.length}</span> shown · outcomes resolve when the user moves on
             </div>
             <div class="log-table">
               <div class="log-row log-head">

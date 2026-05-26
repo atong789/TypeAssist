@@ -3,13 +3,14 @@
 //! An **in-memory, observe-only** rolling log of every L4 decision made on
 //! an UNKNOWN Word token. Each record carries enough context for Component
 //! 5 (outcome resolution) to come back later and tell the difference
-//! between four states:
+//! between five states:
+//!   * `Pending` — outcome not yet observed; the initial state.
 //!   * `Kept` — the engine left the word alone and the user kept it.
 //!   * `CorrectedToSuggestion` — the user backspaced and arrived at the
 //!     engine's `top_candidate`.
 //!   * `CorrectedToOther` — the user backspaced and arrived at something
 //!     else (engine was wrong about both *whether* and *what* to suggest).
-//!   * `Pending` — outcome not yet observed; the initial state.
+//!   * `Abandoned` — the user deleted the whole word.
 //!
 //! **Privacy and scope.** Process-memory only; capped at
 //! [`DEFAULT_LEDGER_CAPACITY`] most-recent records; cleared on restart.
@@ -51,7 +52,13 @@ use crate::ConfidenceTier;
 
 /// Version of the log record shape. Bump on any change to [`LogRecord`]
 /// or the [`Outcome`] / [`LogConfidence`] enums.
-pub const LOG_VERSION: u32 = 1;
+///
+/// v2 — Component 5a adds [`Outcome::Abandoned`] for the whole-word-delete
+/// terminal state. C4 builds wrote `outcome = Pending` everywhere and never
+/// emitted the new variant; v2 is forward-compatible read-only (older
+/// readers parsing v2 wire records would fail on `abandoned`, but the
+/// ledger is process-memory only — there is no on-disk corpus to migrate).
+pub const LOG_VERSION: u32 = 2;
 
 /// **PLACEHOLDER capacity.** A few hundred records — enough to span a
 /// typical writing session without growing unbounded. Tune from real
@@ -88,10 +95,15 @@ impl LogConfidence {
     }
 }
 
-/// Per-decision outcome slot. All four states are load-bearing — C5 will
-/// distinguish them when it watches the [`SpanAnchor`] for the user's
-/// subsequent edits. **C4 only ever writes [`Outcome::Pending`];**
-/// transitions are Component 5's job.
+/// Per-decision outcome slot. All five states are load-bearing — Component
+/// 5's [`crate::resolver::OutcomeResolver`] watches the [`SpanAnchor`] for
+/// the user's subsequent edits and transitions through these. **C4 only
+/// ever writes [`Outcome::Pending`];** transitions are Component 5's job.
+///
+/// Resolution is **revisable**: a record may flip back and forth (e.g.
+/// `Kept` → `CorrectedToOther` if the user later edits the span) until the
+/// anchor is retired by a line reset, at which point the last resolution
+/// stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Outcome {
@@ -105,8 +117,16 @@ pub enum Outcome {
     /// possible positive learning signal.
     CorrectedToSuggestion,
     /// User self-corrected, but to something other than the suggestion.
-    /// Engine was wrong about *what* to suggest.
+    /// Engine was wrong about *what* to suggest. Also catches the
+    /// `Void(Split)` / `Void(Merge)` cases where the original word
+    /// boundary is gone and there's no reliable single-word read-back —
+    /// the user clearly didn't keep it as-is, but the post-edit text
+    /// can't be matched against the suggestion.
     CorrectedToOther,
+    /// User deleted the whole word (anchor voided with `Deleted`). No
+    /// content remains at the original span. The engine learns nothing
+    /// about *what* to suggest, only that the user walked away.
+    Abandoned,
 }
 
 /// One row in the ledger — the full structured record of a single
@@ -262,15 +282,16 @@ impl DecisionLedger {
         id
     }
 
-    /// Transition the outcome slot of record `id`. **Defined for C5;
-    /// C4 never calls this.** Returns `true` if the record was found
-    /// (and updated), `false` if `id` has already been evicted or
-    /// never existed.
+    /// Transition the outcome slot of record `id`. Called by Component 5
+    /// ([`crate::resolver::OutcomeResolver::tick`]) as the user's edits
+    /// reveal the outcome; **revisable** — may fire more than once on
+    /// the same record, latest write wins. Returns `true` if the record
+    /// was found (and updated), `false` if `id` has already been evicted
+    /// or never existed.
     ///
     /// O(n) scan — the ledger is small and resolution events are
     /// infrequent (one per real user correction). If the ledger ever
     /// outgrows that, switch to a (id → index) sidecar map.
-    #[allow(dead_code)]
     pub fn resolve_outcome(&mut self, id: u64, outcome: Outcome) -> bool {
         for r in self.records.iter_mut() {
             if r.id == id {
