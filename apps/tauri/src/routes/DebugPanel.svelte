@@ -171,18 +171,32 @@
     frequency: number;
     lexicon_version: number;
   };
-  /// Mirrors `correction_engine::KnownCandidate`.
-  type KnownCandidate = {
+  /// Mirrors `correction_engine::score::EditType`. Slip-perspective:
+  /// the user added an extra key (insertion) or missed one (deletion).
+  type EditType = "substitution" | "transposition" | "insertion" | "deletion";
+  /// Mirrors `correction_engine::ConfidenceTier`.
+  type ConfidenceTier = "gentle" | "balanced" | "bold";
+  /// Mirrors `correction_engine::ScoredCandidate` — one row in the
+  /// CANDIDATES panel under 3c-1 scoring.
+  type ScoredCandidate = {
     word: string;
     frequency: number;
+    edit_type: EditType;
+    lexicon_evidence: number;
+    motor_evidence: number;
+    score: number;
   };
-  /// Mirrors `CandidatesPayload` in engine.rs. Component 3b — emitted once
-  /// per UNKNOWN Word token. Empty `candidates` is a real outcome ("no
-  /// known candidates within edit-1"), not a missing event.
+  /// Mirrors `CandidatesPayload` in engine.rs. Components 3b + 3c-1 —
+  /// emitted once per UNKNOWN Word token. Empty `scored` is a real
+  /// outcome ("no known candidates within edit-1"), not a missing event.
+  /// `top_tier` is display-only this pass; the decision path is untouched.
   type CandidatesPayload = {
     word: string;
-    candidates: KnownCandidate[];
+    scored: ScoredCandidate[];
+    top_score: number | null;
+    top_tier: ConfidenceTier | null;
     candidates_version: number;
+    score_version: number;
   };
   type ModelSnapshot = {
     timing: { per_key: KeyTimingRow[]; per_finger: FingerTimingRow[] };
@@ -483,6 +497,11 @@
     if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
     return String(n);
   }
+  /// Two-decimal score formatter for the CANDIDATES table.
+  function fmtScore(n: number | null): string {
+    if (n === null) return "—";
+    return n.toFixed(2);
+  }
   function fmtAnchorState(state: AnchorState): string {
     if (state.kind === "tracking") return "Tracking";
     return `Void:${state.reason}`;
@@ -707,26 +726,47 @@
           {/if}
         </div>
 
-        <div class="model-sub model-sub-sticky">CANDIDATES · unknown words · L4 edit-1 (read-only)</div>
+        <div class="model-sub model-sub-sticky">CANDIDATES · unknown words · L4 score (display-only)</div>
         <div class="cand-block">
           {#if lineCandidates.length === 0}
             <div class="empty">no unknown words on this line yet…</div>
           {:else}
             {#each lineCandidates as c, i (`${i}-${c.word}`)}
-              <div class="cand-row">
-                <span class="cand-src">{c.word}</span>
-                <span class="cand-arrow">→</span>
-                {#if c.candidates.length === 0}
-                  <span class="cand-empty">(no known candidates within edit-1)</span>
-                {:else}
-                  <span class="cand-list">
-                    {#each c.candidates as k, j (k.word)}
-                      {#if j > 0}<span class="cand-sep">, </span>{/if}
-                      <span class="cand-word">{k.word}</span><span
-                        class="cand-freq"
-                      > ({fmtFreqCompact(k.frequency)})</span>
+              <div class="cand-group">
+                <div class="cand-header">
+                  <span class="cand-src">{c.word}</span>
+                  <span class="cand-arrow">→</span>
+                  {#if c.scored.length === 0}
+                    <span class="cand-empty">(no known candidates within edit-1)</span>
+                  {:else if c.top_tier !== null}
+                    <span class="cand-tier cand-tier-{c.top_tier}">{c.top_tier}</span>
+                    <span class="cand-top-score">top {fmtScore(c.top_score)}</span>
+                  {:else}
+                    <span class="cand-tier cand-tier-none">below tier floor</span>
+                    <span class="cand-top-score">top {fmtScore(c.top_score)}</span>
+                  {/if}
+                </div>
+                {#if c.scored.length > 0}
+                  <div class="score-table">
+                    <div class="score-row score-head">
+                      <span class="col-sw">candidate</span>
+                      <span class="col-se">edit</span>
+                      <span class="col-sx num">freq</span>
+                      <span class="col-sl num">lex_ev</span>
+                      <span class="col-sm num">motor_ev</span>
+                      <span class="col-ss num">score</span>
+                    </div>
+                    {#each c.scored as s, j (s.word)}
+                      <div class="score-row" class:score-top={j === 0}>
+                        <span class="col-sw">{s.word}</span>
+                        <span class="col-se">{s.edit_type}</span>
+                        <span class="col-sx num">{fmtFreqCompact(s.frequency)}</span>
+                        <span class="col-sl num">{fmtScore(s.lexicon_evidence)}</span>
+                        <span class="col-sm num">{fmtScore(s.motor_evidence)}</span>
+                        <span class="col-ss num">{fmtScore(s.score)}</span>
+                      </div>
                     {/each}
-                  </span>
+                  </div>
                 {/if}
               </div>
             {/each}
@@ -1299,51 +1339,106 @@
   .col-lk { color: #d5d5d5; }
   .col-lf { color: #8aa1b8; }
 
-  /* CANDIDATES — L4 Component 3b. One row per unknown Word token: the
-     source word, an arrow, then either the top-N known edit-1 candidates
-     with compact frequencies, or the honest "(no known candidates within
-     edit-1)" line. No score, no tier, no correction — purely the ranked
-     dictionary hit-list. */
+  /* CANDIDATES — L4 Components 3b + 3c-1. Per unknown word: a header
+     line (typed word + tier badge + top score) and a small table with
+     per-candidate edit type, frequency, lexicon evidence, motor evidence,
+     and score. Tier badge is display-only this pass; the decision path
+     is unchanged. */
   .cand-block {
     padding: 0.25rem 0 0.5rem;
     border-bottom: 1px solid #2a2f36;
   }
-  .cand-row {
-    padding: 0.22rem 0.75rem;
-    color: #d5d5d5;
-    white-space: normal;
-    word-break: break-word;
+  .cand-group {
+    padding: 0.3rem 0.75rem 0.45rem;
   }
-  .cand-row:nth-child(even) {
+  .cand-group:nth-child(even) {
     background: rgba(255, 255, 255, 0.025);
+  }
+  .cand-header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.45rem;
+    margin-bottom: 0.2rem;
   }
   .cand-src {
     color: #e6c98a;
     font-weight: 600;
-    margin-right: 0.35rem;
   }
   .cand-arrow {
     color: #7f8a96;
-    margin-right: 0.4rem;
   }
   .cand-empty {
     color: #7f8a96;
     font-style: italic;
   }
-  .cand-list {
-    color: #d5d5d5;
-  }
-  .cand-word {
-    color: #b6e3b6;
-    font-weight: 600;
-  }
-  .cand-freq {
+  .cand-top-score {
     color: #8aa1b8;
+    margin-left: auto;
     font-variant-numeric: tabular-nums;
   }
-  .cand-sep {
-    color: #5a6470;
+  /* Tier badges — colour-coded but the text label carries the meaning. */
+  .cand-tier {
+    padding: 0 0.45rem;
+    border-radius: 3px;
+    letter-spacing: 0.07em;
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 11px;
   }
+  .cand-tier-gentle {
+    background: #1f2a3a;
+    color: #9bb4d6;
+    border: 1px solid #2e4a6a;
+  }
+  .cand-tier-balanced {
+    background: #1f3a1f;
+    color: #b6e3b6;
+    border: 1px solid #2e5a2e;
+  }
+  .cand-tier-bold {
+    background: #3a2a1f;
+    color: #e6c98a;
+    border: 1px solid #6a5320;
+  }
+  .cand-tier-none {
+    background: #1f1f1f;
+    color: #7f8a96;
+    border: 1px solid #3a3a3a;
+    font-style: italic;
+  }
+  /* Per-candidate score table — fixed columns, tabular numerals so the
+     numeric stacks line up. */
+  .score-table {
+    margin-top: 0.15rem;
+  }
+  .score-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) 88px 56px 56px 60px 56px;
+    column-gap: 0.4rem;
+    align-items: baseline;
+    padding: 0.18rem 0.3rem;
+    white-space: nowrap;
+  }
+  .score-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.2rem;
+    margin-bottom: 0.1rem;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+  }
+  /* Top candidate gets a subtle green rail — supplementary; the row
+     position (first) and the tier badge above carry the meaning. */
+  .score-top {
+    border-left: 2px solid #2e5a2e;
+    padding-left: calc(0.3rem - 2px);
+    background: rgba(46, 90, 46, 0.08);
+  }
+  .col-sw { color: #b6e3b6; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+  .col-se { color: #8aa1b8; }
+  .col-sx { color: #8aa1b8; }
+  .col-sl, .col-sm { color: #d5d5d5; }
+  .col-ss { color: #e6e6e6; font-weight: 600; }
 
   /* ANCHORS — L4 Observing, Component 2. Sibling of TOKENS; one row per
      live anchor on the current line. Voided rows get a faded look but

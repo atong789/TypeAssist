@@ -25,13 +25,15 @@ use std::time::Instant;
 
 use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
 use correction_engine::{
-    boundary_char, is_word_char, ranked_known_candidates, skeleton_lookup, AnchorTracker,
-    KnownCandidate, Lexicon, Token, TokenKind, Tokenizer, CANDIDATES_VERSION, LEXICON_VERSION,
+    boundary_char, is_word_char, ranked_known_candidates, score_candidates, skeleton_lookup,
+    AnchorTracker, ConfidenceTier, Lexicon, ScoredCandidate, Token, TokenKind, Tokenizer,
+    CANDIDATES_VERSION, LEXICON_VERSION, SCORE_VERSION,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
+use volatility_map::VolatilityMap;
 
 pub const EVT_KEYSTROKE: &str = "engine://keystroke";
 pub const EVT_DECISION: &str = "engine://decision";
@@ -227,25 +229,32 @@ fn emit_sealed_token<R: Runtime>(
     tok: Token,
     anchors: &mut AnchorTracker,
     lexicon: &Lexicon,
+    map: &VolatilityMap,
 ) {
     if matches!(tok.kind, TokenKind::Word) {
         anchors.try_register(tok.start, tok.end, &tok.core);
         let row = lexicon_row_for(&tok.core, lexicon);
         let known = row.known;
         let _ = app.emit(EVT_LEXICON, row);
-        // Component 3b: only unknown Word tokens get a candidate set.
-        // Known words are protected — see candidates.rs module docs.
+        // Component 3b + 3c-1: only unknown Word tokens get a candidate
+        // set. Known words are protected — see candidates.rs module docs.
         // Empty candidate list IS emitted so the panel can render the
-        // honest "(no known candidates within edit-1)" outcome.
+        // honest "(no known candidates within edit-1)" outcome. The
+        // confidence report is **display-only** this pass — see
+        // crate::score module docs; the decision path is untouched.
         if !known {
             let candidates =
                 ranked_known_candidates(&tok.core, lexicon, CANDIDATES_TOP_N);
+            let report = score_candidates(&tok.core, &candidates, map);
             let _ = app.emit(
                 EVT_CANDIDATES,
                 CandidatesPayload {
                     word: tok.core.clone(),
-                    candidates,
+                    scored: report.scored,
+                    top_score: report.top_score,
+                    top_tier: report.top_tier,
                     candidates_version: CANDIDATES_VERSION,
+                    score_version: SCORE_VERSION,
                 },
             );
         }
@@ -281,15 +290,20 @@ struct LexiconPayload {
     lexicon_version: u32,
 }
 
-/// Per-unknown-Word-token candidate set. Empty `candidates` is emitted
-/// when the word has no known edit-1 neighbour — the debug panel renders
-/// that as "(no known candidates within edit-1)", which is a real outcome
-/// the brief wants visible (we never force a guess).
+/// Per-unknown-Word-token candidate set with confidence scoring
+/// (Component 3c-1). Empty `scored` is emitted when the word has no known
+/// edit-1 neighbour — the debug panel renders that as "(no known
+/// candidates within edit-1)", which is a real outcome the brief wants
+/// visible (we never force a guess). `top_tier` is **display-only** this
+/// pass; the decision path still uses the walking-skeleton lookup.
 #[derive(Serialize, Clone)]
 struct CandidatesPayload {
     word: String,
-    candidates: Vec<KnownCandidate>,
+    scored: Vec<ScoredCandidate>,
+    top_score: Option<f64>,
+    top_tier: Option<ConfidenceTier>,
     candidates_version: u32,
+    score_version: u32,
 }
 
 #[derive(Serialize, Clone)]
@@ -432,7 +446,13 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                             let replay: Vec<char> = line_buf.clone();
                             for c in replay {
                                 if let Some(tok) = tokenizer.observe_char(c) {
-                                    emit_sealed_token(&app_handle, tok, &mut anchors, lexicon);
+                                    emit_sealed_token(
+                                        &app_handle,
+                                        tok,
+                                        &mut anchors,
+                                        lexicon,
+                                        model.slip_detector.map(),
+                                    );
                                 }
                             }
                             let snap = anchors.snapshot();
@@ -534,6 +554,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                                     tok,
                                                     &mut anchors,
                                                     lexicon,
+                                                    model.slip_detector.map(),
                                                 );
                                             }
                                             line_buf.clear();
@@ -568,6 +589,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                                         tok,
                                                         &mut anchors,
                                                         lexicon,
+                                                        model.slip_detector.map(),
                                                     );
                                                 }
                                             } else {
@@ -589,6 +611,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                                             tok,
                                                             &mut anchors,
                                                             lexicon,
+                                                            model.slip_detector.map(),
                                                         );
                                                     }
                                                 }
