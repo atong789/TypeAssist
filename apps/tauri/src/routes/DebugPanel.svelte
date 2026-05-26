@@ -7,9 +7,14 @@
 
   Listens to engine events emitted from `apps/tauri/src-tauri/src/engine.rs`:
     engine://keystroke       — every key (or backspace) + dwell + ingest cost
-    engine://decision        — at a word boundary
-    engine://injection       — when a correction fired
+    engine://decision        — per sealed Word token: would-correct OR leave-alone (reason)
     engine://model-snapshot  — L2 BehaviouralModel state (per-key + per-finger)
+    engine://slip            — confirmed L2 slip
+    engine://token           — per L4 token (Observing Component 1)
+    engine://line-reset      — tokenizer line reset (newline / backspace rebuild)
+    engine://anchor-snapshot — per L4 anchor change (Observing Component 2)
+    engine://lexicon         — per Word token: known? + frequency (Component 3a)
+    engine://candidates      — per unknown Word token: scored edit-1 candidates (3b + 3c-1)
 
   Layout:
     [resize handle — drag to resize, height persisted in sessionStorage]
@@ -27,16 +32,36 @@
     dwell_ms: number;
     ingest_latency_ms: number;
   };
+  /// Mirrors `correction_engine::decision::LeaveAloneReason`.
+  type LeaveAloneReason =
+    | "known"
+    | "no_candidates"
+    | "below_floor"
+    | "below_active_tier"
+    | "ambiguous";
+  /// Mirrors `correction_engine::DecisionOutcome`. Tag-internal `kind`
+  /// matches the serde tag on the Rust enum.
+  type DecisionOutcome =
+    | {
+        kind: "would_correct";
+        original: string;
+        suggested: string;
+        tier: ConfidenceTier;
+        score: number;
+        runner_up_score: number | null;
+      }
+    | {
+        kind: "leave_alone";
+        original: string;
+        reason: LeaveAloneReason;
+      };
+  /// Mirrors `DecisionPayload` in engine.rs (Component 3c-2). Observe-
+  /// only — `would_correct` is a proposal, not an injection.
   type DecisionPayload = {
-    word: string;
-    matched: boolean;
-    replacement: string | null;
-    decision_latency_ms: number;
-  };
-  type InjectionPayload = {
-    delete_count: number;
-    replacement: string;
-    injection_latency_ms: number;
+    outcome: DecisionOutcome;
+    active_tier: ConfidenceTier;
+    decide_time_ms: number;
+    decision_version: number;
   };
 
   // Mirrors `behavioural_model::ModelSnapshot`.
@@ -214,17 +239,9 @@
     | {
         id: number;
         kind: "decision";
-        word: string;
-        matched: boolean;
-        replacement: string | null;
-        decision_latency_ms: number;
-      }
-    | {
-        id: number;
-        kind: "injection";
-        delete_count: number;
-        replacement: string;
-        injection_latency_ms: number;
+        outcome: DecisionOutcome;
+        active_tier: ConfidenceTier;
+        decide_time_ms: number;
       }
     | {
         id: number;
@@ -242,12 +259,15 @@
   let nextId = 0;
 
   // Running totals — kept separate from `rows` so the strip stays accurate
-  // even after old rows are evicted from the visible feed.
+  // even after old rows are evicted from the visible feed. Under 3c-2 the
+  // engine is observe-only, so we count "would-correct" decisions and
+  // average their per-token decide time (scoring + decision policy cost).
   let keystrokeCount = 0;
-  let correctionCount = 0;
-  let latencySum = 0;
-  let latencyMax = 0;
-  $: latencyAvg = correctionCount === 0 ? 0 : latencySum / correctionCount;
+  let wouldCorrectCount = 0;
+  let decideSum = 0;
+  let decideMax = 0;
+  let decideCount = 0;
+  $: decideAvg = decideCount === 0 ? 0 : decideSum / decideCount;
 
   // Latest L2 snapshot. Replaced wholesale on every model-snapshot event.
   let modelRows: KeyTimingRow[] = [];
@@ -337,9 +357,10 @@
   function clear() {
     rows = [];
     keystrokeCount = 0;
-    correctionCount = 0;
-    latencySum = 0;
-    latencyMax = 0;
+    wouldCorrectCount = 0;
+    decideSum = 0;
+    decideMax = 0;
+    decideCount = 0;
     // Note: Clear only resets the *view*. The L2 model in the backend keeps
     // its own counts — modelRows/fingerRows will repopulate on the next keystroke.
   }
@@ -372,29 +393,20 @@
     );
     unlistens.push(
       await listen<DecisionPayload>("engine://decision", (e) => {
-        push({
-          id: nextId++,
-          kind: "decision",
-          word: e.payload.word,
-          matched: e.payload.matched,
-          replacement: e.payload.replacement,
-          decision_latency_ms: e.payload.decision_latency_ms,
-        });
-      }),
-    );
-    unlistens.push(
-      await listen<InjectionPayload>("engine://injection", (e) => {
-        correctionCount += 1;
-        latencySum += e.payload.injection_latency_ms;
-        if (e.payload.injection_latency_ms > latencyMax) {
-          latencyMax = e.payload.injection_latency_ms;
+        decideCount += 1;
+        decideSum += e.payload.decide_time_ms;
+        if (e.payload.decide_time_ms > decideMax) {
+          decideMax = e.payload.decide_time_ms;
+        }
+        if (e.payload.outcome.kind === "would_correct") {
+          wouldCorrectCount += 1;
         }
         push({
           id: nextId++,
-          kind: "injection",
-          delete_count: e.payload.delete_count,
-          replacement: e.payload.replacement,
-          injection_latency_ms: e.payload.injection_latency_ms,
+          kind: "decision",
+          outcome: e.payload.outcome,
+          active_tier: e.payload.active_tier,
+          decide_time_ms: e.payload.decide_time_ms,
         });
       }),
     );
@@ -502,6 +514,22 @@
     if (n === null) return "—";
     return n.toFixed(2);
   }
+  /// Human-readable label for the LeaveAlone reason in DECISION rows.
+  /// Maps the serde snake_case wire value to the panel's preferred phrasing.
+  function fmtLeaveAloneReason(r: LeaveAloneReason): string {
+    switch (r) {
+      case "known":
+        return "known word";
+      case "no_candidates":
+        return "no known candidates";
+      case "below_floor":
+        return "below tier floor";
+      case "below_active_tier":
+        return "below active tier";
+      case "ambiguous":
+        return "ambiguous — top two too close";
+    }
+  }
   function fmtAnchorState(state: AnchorState): string {
     if (state.kind === "tracking") return "Tracking";
     return `Void:${state.reason}`;
@@ -549,9 +577,9 @@
 
   <header class="strip">
     <div class="stat"><span class="stat-label">KEYS</span><span class="stat-val">{keystrokeCount}</span></div>
-    <div class="stat"><span class="stat-label">CORR</span><span class="stat-val">{correctionCount}</span></div>
-    <div class="stat"><span class="stat-label">AVG</span><span class="stat-val">{fmtMs(latencyAvg)} ms</span></div>
-    <div class="stat"><span class="stat-label">MAX</span><span class="stat-val">{fmtMs(latencyMax)} ms</span></div>
+    <div class="stat"><span class="stat-label">WOULD-CORR</span><span class="stat-val">{wouldCorrectCount}</span></div>
+    <div class="stat"><span class="stat-label">DECIDE AVG</span><span class="stat-val">{fmtMs(decideAvg)} ms</span></div>
+    <div class="stat"><span class="stat-label">DECIDE MAX</span><span class="stat-val">{fmtMs(decideMax)} ms</span></div>
     <div class="spacer" />
     <button type="button" class="clear" on:click={clear}>Clear</button>
   </header>
@@ -570,27 +598,26 @@
               <span class="col-lat">ingest {fmtMs(row.ingest_latency_ms)} ms</span>
             </div>
           {:else if row.kind === "decision"}
-            {#if row.matched}
+            {#if row.outcome.kind === "would_correct"}
               <div class="row row-decision row-matched">
                 <span class="tag">DECISION</span>
-                <span class="badge badge-corrected">CORRECTED</span>
-                <span class="col-word">{row.word} → {row.replacement}</span>
-                <span class="col-lat">decided in {fmtMs(row.decision_latency_ms)} ms</span>
+                <span class="badge badge-corrected">WOULD CORRECT</span>
+                <span class="col-word"
+                  >{row.outcome.original} → {row.outcome.suggested} ({row.outcome.tier},
+                  {fmtScore(row.outcome.score)})</span
+                >
+                <span class="col-lat">decide {fmtMs(row.decide_time_ms)} ms</span>
               </div>
             {:else}
               <div class="row row-decision">
                 <span class="tag">DECISION</span>
-                <span class="badge badge-left">LEFT ALONE</span>
-                <span class="col-word">{row.word} — no match</span>
-                <span class="col-lat">decided in {fmtMs(row.decision_latency_ms)} ms</span>
+                <span class="badge badge-left">LEAVE ALONE</span>
+                <span class="col-word"
+                  >{row.outcome.original} — {fmtLeaveAloneReason(row.outcome.reason)}</span
+                >
+                <span class="col-lat">decide {fmtMs(row.decide_time_ms)} ms</span>
               </div>
             {/if}
-          {:else if row.kind === "injection"}
-            <div class="row row-injection">
-              <span class="tag">INJECT</span>
-              <span class="col-word">deleted {row.delete_count}, typed "{row.replacement}"</span>
-              <span class="col-lat">e2e {fmtMs(row.injection_latency_ms)} ms</span>
-            </div>
           {:else if row.kind === "slip"}
             <div class="row row-slip">
               <span class="tag">SLIP</span>
@@ -1092,7 +1119,6 @@
     white-space: nowrap;
   }
   .row-key { grid-template-columns: 70px auto minmax(0, 1fr) auto; }
-  .row-injection { grid-template-columns: 70px minmax(0, 1fr) auto; }
   .row:nth-child(even) { background: rgba(255, 255, 255, 0.025); }
 
   .tag {
@@ -1128,9 +1154,8 @@
   .col-dwell, .col-lat { color: #8aa1b8; }
   .col-word { color: #d5d5d5; overflow: hidden; text-overflow: ellipsis; }
 
-  /* Subtle left border on injection rows so the eye can scan correction events
-     without relying on the green badge. */
-  .row-injection,
+  /* Subtle left border on would-correct rows so the eye can scan correction
+     events without relying on the green badge. */
   .row-matched {
     border-left: 2px solid #2e5a2e;
     padding-left: 0.6rem;

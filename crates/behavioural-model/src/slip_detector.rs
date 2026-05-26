@@ -17,9 +17,9 @@
 //!     contiguous word characters; any space/punctuation/control key in
 //!     between resets the state.
 //!
-//! Observe-and-learn only for this round. The L4 correction decision still
-//! lives in `correction_engine::skeleton_lookup`; this detector does not
-//! influence it. See CLAUDE.md "Ghost-key signals" for the broader
+//! Observe-and-learn only for this round. The L4 correction decision
+//! lives in `correction_engine::decision`; this detector does not
+//! influence it directly. See CLAUDE.md "Ghost-key signals" for the broader
 //! principle that motor-pattern detections stay low-confidence until they
 //! can be cross-checked against labeled corrections — which is exactly
 //! what this loop is starting to produce.
@@ -173,9 +173,9 @@ impl SlipDetector {
         }
     }
 
-    /// Read-only access to the live volatility map. The engine doesn't read
-    /// from it yet (L4 is still the walking skeleton), but exposing it makes
-    /// the "we're writing to L3" contract explicit.
+    /// Read-only access to the live volatility map. The engine's L4
+    /// confidence scorer reads from it via `correction_engine::score`
+    /// (swap-pair counts blend into per-candidate motor evidence).
     pub fn map(&self) -> &VolatilityMap {
         &self.map
     }

@@ -1,33 +1,36 @@
-//! Engine host — spawns the Swift sidecar (L1) and runs the walking-skeleton
-//! capture → decide → inject loop in-process.
+//! Engine host — spawns the Swift sidecar (L1) and runs the L4 capture →
+//! tokenize → score → decide loop in-process. **Observe-only**: the engine
+//! computes a real decision per sealed Word token but does not inject
+//! anything (injection is Component 3c-3).
 //!
-//! L2 (`BehaviouralModel`) observes every keystroke; its `timing` aggregator is
-//! the only one with real logic for now, the rest are safe no-ops. The
-//! correction *decision* is still the walking-skeleton `skeleton_lookup` — L2
-//! is observe-only and doesn't influence behaviour.
+//! L2 (`BehaviouralModel`) observes every keystroke; its `timing` aggregator
+//! is the only one with real logic for now, the rest are safe no-ops. The
+//! correction *decision* now runs the real L4 pipeline (lexicon → candidates
+//! → score → decide). The tokenizer is the **single source of word-boundary
+//! truth** — there is no parallel skeleton word-buffer.
 //!
-//! Three measurements per keystroke, so the debug view can attribute time:
-//!   - `ingest_latency_ms`    — just the L2 dispatch (on the keystroke event)
-//!   - `decision_latency_ms`  — keystroke arrival → decision made (includes ingest)
-//!   - `injection_latency_ms` — keystroke arrival → sidecar.stdin write returned
+//! Two measurements per keystroke, so the debug view can attribute time:
+//!   - `ingest_latency_ms`   — just the L2 dispatch (on the keystroke event)
+//!   - `decide_time_ms`      — scoring + decision cost on a sealed token
 //!
 //! Events emitted to the debug panel:
 //!   `engine://keystroke`       — every key (or backspace) + dwell + ingest cost
-//!   `engine://decision`        — at a word boundary, with decision latency
-//!   `engine://injection`       — when a correction fired, with end-to-end latency
+//!   `engine://decision`        — per sealed Word token, with would-correct / leave-alone outcome
 //!   `engine://model-snapshot`  — L2 state after each ingested event
 //!   `engine://slip`            — one event per confirmed slip (L3 learning loop)
 //!   `engine://token`           — one event per sealed L4 token (Observing brief Component 1)
 //!   `engine://line-reset`      — fired when the tokenizer line resets (newline / backspace rebuild / special key)
 //!   `engine://anchor-snapshot` — full `AnchorsSnapshot` after every anchor change (Observing brief Component 2)
+//!   `engine://lexicon`         — per Word token: known? + frequency (Component 3a)
+//!   `engine://candidates`      — per UNKNOWN Word token: scored edit-1 candidates + tier (Components 3b + 3c-1)
 
 use std::time::Instant;
 
-use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
+use behavioural_model::{BehaviouralModel, InputEvent};
 use correction_engine::{
-    boundary_char, is_word_char, ranked_known_candidates, score_candidates, skeleton_lookup,
-    AnchorTracker, ConfidenceTier, Lexicon, ScoredCandidate, Token, TokenKind, Tokenizer,
-    CANDIDATES_VERSION, LEXICON_VERSION, SCORE_VERSION,
+    decide, ranked_known_candidates, score_candidates, AnchorTracker, ConfidenceTier,
+    DecisionOutcome, Lexicon, ScoredCandidate, Token, TokenKind, Tokenizer, ACTIVE_TIER,
+    CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION, SCORE_VERSION,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
@@ -37,7 +40,6 @@ use volatility_map::VolatilityMap;
 
 pub const EVT_KEYSTROKE: &str = "engine://keystroke";
 pub const EVT_DECISION: &str = "engine://decision";
-pub const EVT_INJECTION: &str = "engine://injection";
 pub const EVT_MODEL_SNAPSHOT: &str = "engine://model-snapshot";
 /// Fired once per confirmed slip detected by L2's `SlipDetector` during
 /// ingest. The debug panel marks these in the feed.
@@ -77,10 +79,10 @@ const CANDIDATES_TOP_N: usize = 3;
 //   * AppKit NSEvent function-key constants (private-use, with Fn on or
 //     other layouts): U+F700..=U+F8FF — Left U+F702, Home U+F729, etc.
 //
-// Neither form is text. They must never reach line_buf, the tokenizer
-// core, or the skeleton word buffer (otherwise they render as box glyphs
-// inside tokens). Both forms are filtered out by `is_non_text_key`; the
-// known-nav codepoints below are mapped to caret moves.
+// Neither form is text. They must never reach line_buf or the tokenizer
+// core (otherwise they render as box glyphs inside tokens). Both forms
+// are filtered out by `is_non_text_key`; the known-nav codepoints below
+// are mapped to caret moves.
 const KEY_C0_LEFT: char = '\u{001C}';
 const KEY_C0_RIGHT: char = '\u{001D}';
 // Up/Down kept here for documentation and tests — they're filtered out
@@ -187,14 +189,18 @@ struct KeystrokePayload {
     ingest_latency_ms: f64,
 }
 
+/// Per-Word-token decision (Component 3c-2). Observe-only — `would-correct`
+/// is a *proposal*, not an injection. `outcome` is the full
+/// [`DecisionOutcome`] tagged enum (`would_correct` / `leave_alone` with
+/// reason). `decide_time_ms` is the scoring + decision cost; latency from
+/// the triggering keystroke is no longer single-valued under the new
+/// per-token-seal model (replays can re-fire).
 #[derive(Serialize, Clone)]
 struct DecisionPayload {
-    word: String,
-    matched: bool,
-    replacement: Option<String>,
-    /// Time from receiving the boundary keystroke to the decision being made.
-    /// Includes the ingest cost above — measured from key arrival.
-    decision_latency_ms: f64,
+    outcome: DecisionOutcome,
+    active_tier: ConfidenceTier,
+    decide_time_ms: f64,
+    decision_version: u32,
 }
 
 /// Emission wrapper for an anchor snapshot. The pure
@@ -219,11 +225,14 @@ fn anchor_emit_payload<'a>(
     }
 }
 
-/// Handle one sealed token: register an anchor if it's a Word, look it up in
-/// the lexicon (Word only), surface candidates if it's an unknown Word
-/// (Component 3b), and emit the token event. Centralised so the four
-/// emission sites (end-of-line, mid-line replay, backspace replay, newline
-/// final seal) can't drift on which side-effects fire in which order.
+/// Handle one sealed token: register an anchor if it's a Word, run the
+/// full L4 pipeline (lexicon → candidates → score → decide), emit the
+/// per-stage panel events. Centralised so every emission site (end-of-line,
+/// mid-line replay, backspace replay, newline final seal) gets the same
+/// side-effects in the same order.
+///
+/// **Observe-only** (Component 3c-2): the decision is computed and
+/// emitted but the engine does NOT inject anything. Injection is 3c-3.
 fn emit_sealed_token<R: Runtime>(
     app: &AppHandle<R>,
     tok: Token,
@@ -236,16 +245,24 @@ fn emit_sealed_token<R: Runtime>(
         let row = lexicon_row_for(&tok.core, lexicon);
         let known = row.known;
         let _ = app.emit(EVT_LEXICON, row);
-        // Component 3b + 3c-1: only unknown Word tokens get a candidate
-        // set. Known words are protected — see candidates.rs module docs.
-        // Empty candidate list IS emitted so the panel can render the
-        // honest "(no known candidates within edit-1)" outcome. The
-        // confidence report is **display-only** this pass — see
-        // crate::score module docs; the decision path is untouched.
+
+        // Compute the score report once, used for both CANDIDATES (display)
+        // and DECISION (policy). Known words produce no candidates and the
+        // decision short-circuits to LeaveAlone(Known) — but we still emit a
+        // DECISION row so the FEED has one entry per Word token.
+        let t_decide_start = Instant::now();
+        let candidates = if known {
+            Vec::new()
+        } else {
+            ranked_known_candidates(&tok.core, lexicon, CANDIDATES_TOP_N)
+        };
+        let report = score_candidates(&tok.core, &candidates, map);
+        let outcome = decide(&tok.core, known, &report, ACTIVE_TIER);
+        let decide_time_ms = t_decide_start.elapsed().as_secs_f64() * 1000.0;
+
+        // CANDIDATES only when there's something to show — known words
+        // get no candidate set.
         if !known {
-            let candidates =
-                ranked_known_candidates(&tok.core, lexicon, CANDIDATES_TOP_N);
-            let report = score_candidates(&tok.core, &candidates, map);
             let _ = app.emit(
                 EVT_CANDIDATES,
                 CandidatesPayload {
@@ -258,6 +275,19 @@ fn emit_sealed_token<R: Runtime>(
                 },
             );
         }
+
+        // DECISION fires for every Word token (known included — its reason
+        // is `known`). The FEED needs one row per word so the builder can
+        // see why each token did or didn't fire.
+        let _ = app.emit(
+            EVT_DECISION,
+            DecisionPayload {
+                outcome,
+                active_tier: ACTIVE_TIER,
+                decide_time_ms,
+                decision_version: DECISION_VERSION,
+            },
+        );
     }
     let _ = app.emit(EVT_TOKEN, tok);
 }
@@ -291,11 +321,13 @@ struct LexiconPayload {
 }
 
 /// Per-unknown-Word-token candidate set with confidence scoring
-/// (Component 3c-1). Empty `scored` is emitted when the word has no known
-/// edit-1 neighbour — the debug panel renders that as "(no known
-/// candidates within edit-1)", which is a real outcome the brief wants
-/// visible (we never force a guess). `top_tier` is **display-only** this
-/// pass; the decision path still uses the walking-skeleton lookup.
+/// Per-unknown-Word-token candidate set with confidence scoring
+/// (Components 3b + 3c-1). Empty `scored` is emitted when the word has no
+/// known edit-1 neighbour — the debug panel renders that as "(no known
+/// candidates within edit-1)", a real outcome the brief wants visible.
+/// `top_tier` here is the *score tier* (what the top score reached); the
+/// active-tier gate that drives the actual decision lives in
+/// [`DecisionPayload`].
 #[derive(Serialize, Clone)]
 struct CandidatesPayload {
     word: String,
@@ -304,15 +336,6 @@ struct CandidatesPayload {
     top_tier: Option<ConfidenceTier>,
     candidates_version: u32,
     score_version: u32,
-}
-
-#[derive(Serialize, Clone)]
-struct InjectionPayload {
-    delete_count: u32,
-    /// Full string sent to the sidecar (includes the trailing boundary char).
-    replacement: String,
-    /// End-to-end: keystroke received → sidecar.stdin write returned.
-    injection_latency_ms: f64,
 }
 
 pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::Error>> {
@@ -324,19 +347,20 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
         .sidecar("typeassist-input-macos")?
         .env("TYPEASSIST_AX_PROMPT", "1");
 
-    let (mut rx, mut child) = sidecar.spawn()?;
+    // `_child` is retained so the sidecar process stays alive while we
+    // pull events off `rx`. We no longer write to it (injection is
+    // Component 3c-3 — the engine is observe-only this pass).
+    let (mut rx, _child) = sidecar.spawn()?;
     let app_handle = app.clone();
 
     tauri::async_runtime::spawn(async move {
-        // Word currently being typed, assembled from key events — same state
-        // shape the skeleton binary uses.
-        let mut word = String::new();
         // L2 lives here for the life of the engine. Single owner, single async
         // task — no sync needed.
         let mut model = BehaviouralModel::new();
-        // L4 streaming tokenizer (Component 1 of the Observing brief).
-        // Observe-only: it produces Tokens for the debug view; it does NOT
-        // influence the correction decision yet. We also keep a tiny char
+        // L4 streaming tokenizer (Component 1 of the Observing brief) —
+        // the SINGLE source of word-boundary truth. The lexicon / candidate
+        // / score / decision pipeline all consume sealed Word tokens from
+        // here; no parallel word-buffer exists. We do keep a tiny char
         // buffer for the current line so backspaces can rebuild cheaply
         // (the tokenizer itself is forward-only).
         let mut tokenizer = Tokenizer::new();
@@ -370,11 +394,6 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                     let Ok(parsed) = serde_json::from_str::<InputEvent>(line) else {
                         continue;
                     };
-
-                    // t0 for the existing decision/injection latencies. Captured
-                    // BEFORE ingest so those numbers continue to mean
-                    // "key arrival → X" (i.e. include the ingest cost).
-                    let t_received = Instant::now();
 
                     // Observe-only L2 dispatch. Only Key/Backspace flow into
                     // the model — sidecar lifecycle events (Ready/Shutdown/…)
@@ -423,7 +442,6 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                     ingest_latency_ms,
                                 },
                             );
-                            word.pop();
 
                             // Anchor delta — apply BEFORE mutating line_buf
                             // so we can read the deleted char (needed for
@@ -515,8 +533,8 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                 // map to caret moves; Up/Down and every
                                 // other non-text codepoint are intentional
                                 // no-ops for the single-line model. No
-                                // edit, no token feed, no skeleton-word
-                                // touch — and the buffer is never written.
+                                // edit, no token feed — and the buffer is
+                                // never written.
                                 let c = single_char.unwrap();
                                 tracing::info!(
                                     "non-text key U+{:04X} — caret-only handling",
@@ -641,80 +659,13 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                 }
                             }
 
-                            // PU function keys also bypass the L4
-                            // walking-skeleton word buffer below — they
-                            // aren't word chars (and `is_word_char` would
-                            // wrongly accept C0 controls + PU codes because
-                            // they're not whitespace). Skip the skeleton
-                            // path entirely for them.
-                            if is_non_text {
-                                continue;
-                            }
-
-                            if let Some(boundary) = boundary_char(&key) {
-                                let lookup_result = skeleton_lookup(&word);
-                                let decision_latency_ms =
-                                    t_received.elapsed().as_secs_f64() * 1000.0;
-
-                                // Skip empty-word boundaries (e.g. typing two
-                                // spaces in a row): no decision was made, so
-                                // emitting a row would just be noise.
-                                if !word.is_empty() {
-                                    let _ = app_handle.emit(
-                                        EVT_DECISION,
-                                        DecisionPayload {
-                                            word: word.clone(),
-                                            matched: lookup_result.is_some(),
-                                            replacement: lookup_result.map(String::from),
-                                            decision_latency_ms,
-                                        },
-                                    );
-                                }
-
-                                if let Some(replacement) = lookup_result {
-                                    let delete_count = word.chars().count() as u32 + 1;
-                                    let full_replacement = format!("{replacement}{boundary}");
-                                    let cmd = OutboundCommand::InjectCorrection {
-                                        delete_count,
-                                        replacement: full_replacement.clone(),
-                                    };
-                                    if let Ok(mut json) = serde_json::to_string(&cmd) {
-                                        json.push('\n');
-                                        match child.write(json.as_bytes()) {
-                                            Ok(()) => {
-                                                let injection_latency_ms =
-                                                    t_received.elapsed().as_secs_f64() * 1000.0;
-                                                let _ = app_handle.emit(
-                                                    EVT_INJECTION,
-                                                    InjectionPayload {
-                                                        delete_count,
-                                                        replacement: full_replacement,
-                                                        injection_latency_ms,
-                                                    },
-                                                );
-                                                tracing::info!(
-                                                    "corrected {:?} → {:?} (decision {:.2}ms, e2e {:.2}ms)",
-                                                    word,
-                                                    replacement,
-                                                    decision_latency_ms,
-                                                    injection_latency_ms,
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    "sidecar stdin write failed: {e}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                word.clear();
-                            } else if is_word_char(&key) {
-                                word.push_str(&key);
-                            } else {
-                                // Unmodeled key (arrow, escape, …) ends the word.
-                                word.clear();
-                            }
+                            // No parallel word-buffer / boundary detection:
+                            // the tokenizer above already sealed any token
+                            // that this keystroke triggered, and
+                            // `emit_sealed_token` ran the full L4 pipeline
+                            // (lexicon → candidates → score → decide)
+                            // emitting per-stage panel events. The skeleton
+                            // tge→the lookup is retired.
                         }
                     }
                 }
