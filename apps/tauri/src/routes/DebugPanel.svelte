@@ -171,6 +171,19 @@
     frequency: number;
     lexicon_version: number;
   };
+  /// Mirrors `correction_engine::KnownCandidate`.
+  type KnownCandidate = {
+    word: string;
+    frequency: number;
+  };
+  /// Mirrors `CandidatesPayload` in engine.rs. Component 3b — emitted once
+  /// per UNKNOWN Word token. Empty `candidates` is a real outcome ("no
+  /// known candidates within edit-1"), not a missing event.
+  type CandidatesPayload = {
+    word: string;
+    candidates: KnownCandidate[];
+    candidates_version: number;
+  };
   type ModelSnapshot = {
     timing: { per_key: KeyTimingRow[]; per_finger: FingerTimingRow[] };
     asymmetry: AsymmetrySnapshot;
@@ -238,6 +251,10 @@
   /// Lexicon lookups for words sealed on the CURRENT line. One row per
   /// Word token, appended in order. Cleared by `engine://line-reset`.
   let lineLexicon: LexiconPayload[] = [];
+  /// Candidate sets for UNKNOWN Word tokens on the CURRENT line. One row
+  /// per unknown word (known words never emit). Cleared by
+  /// `engine://line-reset` alongside the other line-scoped state.
+  let lineCandidates: CandidatesPayload[] = [];
 
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
@@ -397,6 +414,7 @@
       await listen("engine://line-reset", () => {
         lineTokens = [];
         lineLexicon = [];
+        lineCandidates = [];
       }),
     );
     unlistens.push(
@@ -407,6 +425,11 @@
     unlistens.push(
       await listen<LexiconPayload>("engine://lexicon", (e) => {
         lineLexicon = [...lineLexicon, e.payload];
+      }),
+    );
+    unlistens.push(
+      await listen<CandidatesPayload>("engine://candidates", (e) => {
+        lineCandidates = [...lineCandidates, e.payload];
       }),
     );
   });
@@ -449,6 +472,16 @@
   function fmtFreq(n: number): string {
     if (n === 0) return "—";
     return n.toLocaleString("en-US");
+  }
+  /// Compact "23.1B" style for the CANDIDATES inline list — same numbers,
+  /// just shorter so the per-word row fits e.g. `thge → the (23.1B), thee
+  /// (8.6M), tage (695K)`.
+  function fmtFreqCompact(n: number): string {
+    if (n === 0) return "—";
+    if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+    return String(n);
   }
   function fmtAnchorState(state: AnchorState): string {
     if (state.kind === "tracking") return "Tracking";
@@ -662,10 +695,41 @@
                 <div class="lex-row" class:lex-known={l.known} class:lex-unknown={!l.known}>
                   <span class="col-lw">{l.word}</span>
                   <span class="col-lk">{l.known ? "yes" : "no"}</span>
-                  <span class="col-lf num">{fmtFreq(l.frequency)}</span>
+                  <!-- Frequency is a ranking-only signal under lexicon v2:
+                       it's meaningless for unknown words (a Norvig typo
+                       like `teh` has 1.7M occurrences but isn't a real
+                       word). Suppress to "—" when known=NO so the panel
+                       doesn't suggest the count is load-bearing. -->
+                  <span class="col-lf num">{l.known ? fmtFreq(l.frequency) : "—"}</span>
                 </div>
               {/each}
             </div>
+          {/if}
+        </div>
+
+        <div class="model-sub model-sub-sticky">CANDIDATES · unknown words · L4 edit-1 (read-only)</div>
+        <div class="cand-block">
+          {#if lineCandidates.length === 0}
+            <div class="empty">no unknown words on this line yet…</div>
+          {:else}
+            {#each lineCandidates as c, i (`${i}-${c.word}`)}
+              <div class="cand-row">
+                <span class="cand-src">{c.word}</span>
+                <span class="cand-arrow">→</span>
+                {#if c.candidates.length === 0}
+                  <span class="cand-empty">(no known candidates within edit-1)</span>
+                {:else}
+                  <span class="cand-list">
+                    {#each c.candidates as k, j (k.word)}
+                      {#if j > 0}<span class="cand-sep">, </span>{/if}
+                      <span class="cand-word">{k.word}</span><span
+                        class="cand-freq"
+                      > ({fmtFreqCompact(k.frequency)})</span>
+                    {/each}
+                  </span>
+                {/if}
+              </div>
+            {/each}
           {/if}
         </div>
 
@@ -1234,6 +1298,52 @@
   }
   .col-lk { color: #d5d5d5; }
   .col-lf { color: #8aa1b8; }
+
+  /* CANDIDATES — L4 Component 3b. One row per unknown Word token: the
+     source word, an arrow, then either the top-N known edit-1 candidates
+     with compact frequencies, or the honest "(no known candidates within
+     edit-1)" line. No score, no tier, no correction — purely the ranked
+     dictionary hit-list. */
+  .cand-block {
+    padding: 0.25rem 0 0.5rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .cand-row {
+    padding: 0.22rem 0.75rem;
+    color: #d5d5d5;
+    white-space: normal;
+    word-break: break-word;
+  }
+  .cand-row:nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
+  }
+  .cand-src {
+    color: #e6c98a;
+    font-weight: 600;
+    margin-right: 0.35rem;
+  }
+  .cand-arrow {
+    color: #7f8a96;
+    margin-right: 0.4rem;
+  }
+  .cand-empty {
+    color: #7f8a96;
+    font-style: italic;
+  }
+  .cand-list {
+    color: #d5d5d5;
+  }
+  .cand-word {
+    color: #b6e3b6;
+    font-weight: 600;
+  }
+  .cand-freq {
+    color: #8aa1b8;
+    font-variant-numeric: tabular-nums;
+  }
+  .cand-sep {
+    color: #5a6470;
+  }
 
   /* ANCHORS — L4 Observing, Component 2. Sibling of TOKENS; one row per
      live anchor on the current line. Voided rows get a faded look but

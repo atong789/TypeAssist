@@ -25,8 +25,8 @@ use std::time::Instant;
 
 use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
 use correction_engine::{
-    boundary_char, is_word_char, skeleton_lookup, AnchorTracker, Lexicon, Token, TokenKind,
-    Tokenizer, LEXICON_VERSION,
+    boundary_char, is_word_char, ranked_known_candidates, skeleton_lookup, AnchorTracker,
+    KnownCandidate, Lexicon, Token, TokenKind, Tokenizer, CANDIDATES_VERSION, LEXICON_VERSION,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
@@ -54,6 +54,17 @@ pub const EVT_ANCHOR_SNAPSHOT: &str = "engine://anchor-snapshot";
 /// lookup result. Read-only — Component 3a is a word source only; scoring
 /// and correction come later. The debug-view LEXICON section listens.
 pub const EVT_LEXICON: &str = "engine://lexicon";
+/// Fired once per sealed UNKNOWN Word token with the top-N ranked known
+/// edit-1 neighbours (Component 3b). Read-only — no score, no tier, no
+/// correction. Known words don't emit this event (they're protected).
+/// Empty `candidates` is a legitimate outcome and IS emitted, so the panel
+/// can render "(no known candidates within edit-1)". The debug-view
+/// CANDIDATES section listens.
+pub const EVT_CANDIDATES: &str = "engine://candidates";
+
+/// Top-N candidates the engine surfaces per unknown word. Keep small so the
+/// debug panel and any future spatial-scorer aren't paying for a long tail.
+const CANDIDATES_TOP_N: usize = 3;
 
 // macOS's `CGEvent.keyboardGetUnicodeString` translates navigation /
 // function keys differently depending on the layout and the Fn modifier
@@ -207,9 +218,10 @@ fn anchor_emit_payload<'a>(
 }
 
 /// Handle one sealed token: register an anchor if it's a Word, look it up in
-/// the lexicon (Word only), and emit the token event. Centralised so the
-/// three emission sites (end-of-line, mid-line replay, backspace replay)
-/// can't drift on which side-effects fire in which order.
+/// the lexicon (Word only), surface candidates if it's an unknown Word
+/// (Component 3b), and emit the token event. Centralised so the four
+/// emission sites (end-of-line, mid-line replay, backspace replay, newline
+/// final seal) can't drift on which side-effects fire in which order.
 fn emit_sealed_token<R: Runtime>(
     app: &AppHandle<R>,
     tok: Token,
@@ -218,17 +230,43 @@ fn emit_sealed_token<R: Runtime>(
 ) {
     if matches!(tok.kind, TokenKind::Word) {
         anchors.try_register(tok.start, tok.end, &tok.core);
-        let _ = app.emit(
-            EVT_LEXICON,
-            LexiconPayload {
-                word: tok.core.clone(),
-                known: lexicon.is_known(&tok.core),
-                frequency: lexicon.frequency(&tok.core),
-                lexicon_version: LEXICON_VERSION,
-            },
-        );
+        let row = lexicon_row_for(&tok.core, lexicon);
+        let known = row.known;
+        let _ = app.emit(EVT_LEXICON, row);
+        // Component 3b: only unknown Word tokens get a candidate set.
+        // Known words are protected — see candidates.rs module docs.
+        // Empty candidate list IS emitted so the panel can render the
+        // honest "(no known candidates within edit-1)" outcome.
+        if !known {
+            let candidates =
+                ranked_known_candidates(&tok.core, lexicon, CANDIDATES_TOP_N);
+            let _ = app.emit(
+                EVT_CANDIDATES,
+                CandidatesPayload {
+                    word: tok.core.clone(),
+                    candidates,
+                    candidates_version: CANDIDATES_VERSION,
+                },
+            );
+        }
     }
     let _ = app.emit(EVT_TOKEN, tok);
+}
+
+/// Build the lexicon-row payload for a Word token. Pure function — pulled
+/// out so the v2 "membership vs frequency" invariant can be pinned by
+/// tests. **Membership MUST come from [`Lexicon::is_known`], not from
+/// `frequency > 0`** — the Norvig freq table contains web typos with real
+/// counts that are not real words, and we must never let those pass as
+/// known. This was a real regression (engine reported `teh known=yes,
+/// freq 1.7M` even after the lexicon module was correctly split).
+fn lexicon_row_for(core: &str, lexicon: &Lexicon) -> LexiconPayload {
+    LexiconPayload {
+        word: core.to_string(),
+        known: lexicon.is_known(core),
+        frequency: lexicon.frequency(core),
+        lexicon_version: LEXICON_VERSION,
+    }
 }
 
 /// Per-Word-token lexicon lookup. Emitted alongside `EVT_TOKEN` so the
@@ -241,6 +279,17 @@ struct LexiconPayload {
     known: bool,
     frequency: u64,
     lexicon_version: u32,
+}
+
+/// Per-unknown-Word-token candidate set. Empty `candidates` is emitted
+/// when the word has no known edit-1 neighbour — the debug panel renders
+/// that as "(no known candidates within edit-1)", which is a real outcome
+/// the brief wants visible (we never force a guess).
+#[derive(Serialize, Clone)]
+struct CandidatesPayload {
+    word: String,
+    candidates: Vec<KnownCandidate>,
+    candidates_version: u32,
 }
 
 #[derive(Serialize, Clone)]
@@ -826,5 +875,79 @@ mod tests {
         // Plain text still works.
         assert_eq!(insert_text_char(&mut line, 1, 'X'), Some(2));
         assert_eq!(line, vec!['a', 'X', 'b', 'c']);
+    }
+
+    // ---- Lexicon row payload — v2 membership/frequency split -----------
+
+    #[test]
+    fn lexicon_row_known_comes_from_is_known_not_frequency() {
+        // Regression: emit_sealed_token once computed `known = frequency
+        // > 0`, which under lexicon v2 admits Norvig web typos. The
+        // following must hold:
+        //   - `teh`: in Norvig (count > 0) but NOT in SCOWL → known=false
+        //   - `recieve`: same shape — Norvig has it, SCOWL doesn't
+        //   - the freq field still carries the honest count (the engine
+        //     reports the data; the panel suppresses display)
+        let lex = correction_engine::Lexicon::shared();
+
+        let row = lexicon_row_for("teh", lex);
+        assert!(
+            !row.known,
+            "teh must be known=false even though Norvig has a count"
+        );
+        assert!(
+            row.frequency > 0,
+            "test premise: teh has a Norvig count — pin so this regression test isn't toothless"
+        );
+
+        let row = lexicon_row_for("recieve", lex);
+        assert!(!row.known, "recieve must be known=false");
+    }
+
+    #[test]
+    fn lexicon_row_known_words_keep_their_freq() {
+        let lex = correction_engine::Lexicon::shared();
+        for w in &["the", "because", "it", "should"] {
+            let row = lexicon_row_for(w, lex);
+            assert!(row.known, "{w} should be known");
+            assert!(row.frequency > 0, "{w} should have a Norvig frequency");
+        }
+    }
+
+    #[test]
+    fn lexicon_row_contractions_are_known() {
+        // The other v2 fix — SCOWL contractions list includes these, so
+        // the engine never flags them as needing correction.
+        let lex = correction_engine::Lexicon::shared();
+        for w in &["didn't", "can't", "should've", "they're"] {
+            let row = lexicon_row_for(w, lex);
+            assert!(row.known, "contraction {w:?} should be known");
+        }
+    }
+
+    #[test]
+    fn lexicon_row_seed_proper_nouns_are_known() {
+        let lex = correction_engine::Lexicon::shared();
+        for w in &["Krutrim", "ZAMS", "ONDC"] {
+            let row = lexicon_row_for(w, lex);
+            assert!(row.known, "seed {w} should be known (case-insensitive)");
+        }
+    }
+
+    #[test]
+    fn lexicon_row_nonsense_is_unknown_with_zero_freq() {
+        let lex = correction_engine::Lexicon::shared();
+        for w in &["asdfqwerty", "qzxjvk"] {
+            let row = lexicon_row_for(w, lex);
+            assert!(!row.known);
+            assert_eq!(row.frequency, 0);
+        }
+    }
+
+    #[test]
+    fn lexicon_row_carries_current_version() {
+        let lex = correction_engine::Lexicon::shared();
+        let row = lexicon_row_for("the", lex);
+        assert_eq!(row.lexicon_version, correction_engine::LEXICON_VERSION);
     }
 }
