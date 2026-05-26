@@ -130,6 +130,35 @@ impl AnchorTracker {
         Some(id)
     }
 
+    /// Look up the id of the live `Tracking` anchor at exactly this
+    /// span and core, if one exists. Returns `None` when there is no
+    /// matching anchor or when the only match has transitioned to
+    /// `Void(_)`.
+    ///
+    /// Use when a caller has just offered an anchor via [`try_register`]
+    /// and needs the id whether the call freshly created it (`Some(id)`)
+    /// or it was deduplicated as a replay (`None`). Pair them:
+    ///
+    /// ```ignore
+    /// let id = anchors.try_register(start, end, core)
+    ///     .or_else(|| anchors.find_tracking_id(start, end, core));
+    /// ```
+    ///
+    /// Component 4's decision ledger uses this to attach `anchor_id` to
+    /// every record (the bridge C5 uses to resolve outcomes), so the
+    /// link survives mid-line replays after backspaces or inserts.
+    pub fn find_tracking_id(&self, start: usize, end: usize, core: &str) -> Option<u32> {
+        self.anchors
+            .iter()
+            .find(|a| {
+                matches!(a.state, AnchorState::Tracking)
+                    && a.start == start
+                    && a.end == end
+                    && a.original_core == core
+            })
+            .map(|a| a.id)
+    }
+
     /// Convenience wrapper: register only if the token is a Word.
     pub fn try_register_from(
         &mut self,
@@ -346,6 +375,36 @@ mod tests {
         assert_eq!(id2, None);
         assert_eq!(tr.anchors()[0].id, id1);
         assert_eq!(tr.anchors().len(), 1);
+    }
+
+    #[test]
+    fn find_tracking_id_returns_id_for_live_anchor() {
+        let mut tr = t();
+        let id = tr.try_register(0, 5, "hello").unwrap();
+        // Same span/core after the fact → returns the live id.
+        assert_eq!(tr.find_tracking_id(0, 5, "hello"), Some(id));
+    }
+
+    #[test]
+    fn find_tracking_id_misses_on_voided_anchor() {
+        // An anchor that's been voided is no longer a valid C4 attribution
+        // target — find_tracking_id refuses to surface its id.
+        let mut tr = t();
+        tr.try_register(0, 5, "hello").unwrap();
+        tr.apply_insert(2, ' '); // → Void(Split)
+        assert_eq!(tr.find_tracking_id(0, 5, "hello"), None);
+    }
+
+    #[test]
+    fn find_tracking_id_misses_on_unknown_span() {
+        let mut tr = t();
+        tr.try_register(0, 5, "hello").unwrap();
+        // Different start.
+        assert_eq!(tr.find_tracking_id(1, 5, "hello"), None);
+        // Different end.
+        assert_eq!(tr.find_tracking_id(0, 6, "hello"), None);
+        // Different core.
+        assert_eq!(tr.find_tracking_id(0, 5, "hallo"), None);
     }
 
     #[test]

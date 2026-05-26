@@ -15,6 +15,7 @@
     engine://anchor-snapshot — per L4 anchor change (Observing Component 2)
     engine://lexicon         — per Word token: known? + frequency (Component 3a)
     engine://candidates      — per unknown Word token: scored edit-1 candidates (3b + 3c-1)
+    engine://log-record      — per appended decision-ledger record (Component 4)
 
   Layout:
     [resize handle — drag to resize, height persisted in sessionStorage]
@@ -230,6 +231,33 @@
     candidates_version: number;
     score_version: number;
   };
+  /// Mirrors `correction_engine::log::LogConfidence` — the 4-state band
+  /// recorded on each ledger entry. `below_floor` covers both "top
+  /// candidate below floor" and "no candidates at all".
+  type LogConfidence = "high" | "medium" | "low" | "below_floor";
+  /// Mirrors `correction_engine::log::Outcome` — populated by C5; in
+  /// C4-only builds every record arrives as `pending`.
+  type Outcome =
+    | { kind: "pending" }
+    | { kind: "kept" }
+    | { kind: "corrected_to_suggestion" }
+    | { kind: "corrected_to_other" };
+  /// Mirrors `correction_engine::log::LogRecord` — one decision ledger
+  /// row. The full `decision` is the canonical outcome; `top_candidate`
+  /// / `top_score` are convenience projections for cheap rendering.
+  type LogRecord = {
+    id: number;
+    timestamp_ms: number;
+    original_text: string;
+    decision: DecisionOutcome;
+    top_candidate: string | null;
+    top_score: number | null;
+    confidence: LogConfidence;
+    anchor_id: number;
+    active_tier: ConfidenceTier;
+    outcome: Outcome;
+    log_version: number;
+  };
   type ModelSnapshot = {
     timing: { per_key: KeyTimingRow[]; per_finger: FingerTimingRow[] };
     asymmetry: AsymmetrySnapshot;
@@ -299,6 +327,13 @@
   /// per unknown word (known words never emit). Cleared by
   /// `engine://line-reset` alongside the other line-scoped state.
   let lineCandidates: CandidatesPayload[] = [];
+  /// Decision-ledger records from Component 4. Session-spanning by
+  /// design (NOT cleared on line-reset) — this is the structured
+  /// history of every decision the engine made, with outcome slots C5
+  /// will resolve later. Capped here to bound DOM cost; the engine's
+  /// own ledger has its own cap (the source of truth).
+  const MAX_LOG_ROWS = 200;
+  let logRows: LogRecord[] = [];
 
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
@@ -371,6 +406,9 @@
     decideSum = 0;
     decideMax = 0;
     decideCount = 0;
+    // LOG is session-spanning, but Clear should reset the panel view —
+    // the engine's ledger keeps its own copy as the source of truth.
+    logRows = [];
     // Note: Clear only resets the *view*. The L2 model in the backend keeps
     // its own counts — modelRows/fingerRows will repopulate on the next keystroke.
   }
@@ -469,6 +507,21 @@
         lineCandidates = [...lineCandidates, e.payload];
       }),
     );
+    unlistens.push(
+      await listen<LogRecord>("engine://log-record", (e) => {
+        const next = [...logRows, e.payload];
+        if (next.length > MAX_LOG_ROWS) next.splice(0, next.length - MAX_LOG_ROWS);
+        logRows = next;
+        // Auto-scroll within the LOG section. The whole right column
+        // scrolls together, so the user controls position there — but
+        // when LOG is in view we want newest visible. Defer to Svelte
+        // flushing the DOM.
+        queueMicrotask(() => {
+          const el = document.getElementById("debug-log-tail");
+          if (el) el.scrollIntoView({ block: "nearest" });
+        });
+      }),
+    );
   });
 
   onDestroy(() => {
@@ -557,6 +610,40 @@
   function fmtAnchorState(state: AnchorState): string {
     if (state.kind === "tracking") return "Tracking";
     return `Void:${state.reason}`;
+  }
+  /// LogConfidence band → short uppercase label for the LOG table.
+  function fmtLogConfidence(c: LogConfidence): string {
+    switch (c) {
+      case "high":
+        return "HIGH";
+      case "medium":
+        return "MED";
+      case "low":
+        return "LOW";
+      case "below_floor":
+        return "—";
+    }
+  }
+  /// Decision arm → terse "would correct / leave-alone" label for LOG.
+  function fmtDecisionShort(d: DecisionOutcome): string {
+    if (d.kind === "would_correct") {
+      return `would correct → ${d.suggested}`;
+    }
+    return `leave alone · ${fmtLeaveAloneReason(d.reason)}`;
+  }
+  /// Outcome slot label. Pending dominates in C4-only builds; C5 will
+  /// flip records to one of the three terminal states.
+  function fmtOutcome(o: Outcome): string {
+    switch (o.kind) {
+      case "pending":
+        return "pending";
+      case "kept":
+        return "kept";
+      case "corrected_to_suggestion":
+        return "→ suggestion";
+      case "corrected_to_other":
+        return "→ other";
+    }
   }
   function fmtRatio(r: number): string {
     return `${r.toFixed(2)}×`;
@@ -867,6 +954,45 @@
                   <span class="col-ast">{fmtAnchorState(a.state)}</span>
                 </div>
               {/each}
+            </div>
+          {/if}
+        </div>
+
+        <div class="model-sub model-sub-sticky">LOG · decision ledger · session-spanning · newest at bottom</div>
+        <div class="log-block">
+          {#if logRows.length === 0}
+            <div class="empty">no decisions logged yet…</div>
+          {:else}
+            <div class="log-status">
+              <span class="num">{logRows.length}</span> shown · all pending until C5
+            </div>
+            <div class="log-table">
+              <div class="log-row log-head">
+                <span class="col-lo">original</span>
+                <span class="col-ld">decision</span>
+                <span class="col-lc num">score</span>
+                <span class="col-lb">conf</span>
+                <span class="col-la num">anchor</span>
+                <span class="col-lx">outcome</span>
+              </div>
+              {#each logRows as r (r.id)}
+                <div
+                  class="log-row"
+                  class:log-would={r.decision.kind === "would_correct"}
+                  class:log-leave={r.decision.kind === "leave_alone"}
+                >
+                  <span class="col-lo">{r.original_text}</span>
+                  <span class="col-ld">{fmtDecisionShort(r.decision)}</span>
+                  <span class="col-lc num">{fmtScore(r.top_score)}</span>
+                  <span class="col-lb cand-conf cand-conf-{r.confidence === 'below_floor' ? 'none' : r.confidence}"
+                    >{fmtLogConfidence(r.confidence)}</span
+                  >
+                  <span class="col-la num">#{r.anchor_id}</span>
+                  <span class="col-lx">{fmtOutcome(r.outcome)}</span>
+                </div>
+              {/each}
+              <!-- Tail anchor so the listener can scrollIntoView on append. -->
+              <div id="debug-log-tail" />
             </div>
           {/if}
         </div>
@@ -1537,6 +1663,68 @@
   .col-sx { color: #8aa1b8; }
   .col-sl, .col-sm { color: #d5d5d5; }
   .col-ss { color: #e6e6e6; font-weight: 600; }
+
+  /* LOG — L4 Observing, Component 4. Structured decision history with
+     outcome slots. Session-spanning; not cleared on line-reset. Reuses
+     the confidence-badge palette from CANDIDATES so the conf cells read
+     identically across sections. */
+  .log-block {
+    padding: 0.25rem 0 0.5rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .log-status {
+    color: #8893a0;
+    padding: 0.15rem 0.75rem 0.3rem;
+    font-size: 11px;
+  }
+  .log-table {
+    padding: 0 0 0.2rem;
+  }
+  .log-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr) 56px 52px 56px minmax(0, 1fr);
+    column-gap: 0.5rem;
+    align-items: baseline;
+    padding: 0.2rem 0.75rem;
+    white-space: nowrap;
+  }
+  .log-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.25rem;
+    margin-bottom: 0.1rem;
+  }
+  .log-row:not(.log-head):nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
+  }
+  /* Visual rails mirror the FEED's would-correct (green) / leave-alone
+     (grey) treatment so the eye can scan decision shape without parsing
+     each cell. Text in the "decision" column still carries the meaning. */
+  .log-would {
+    border-left: 2px solid #2e5a2e;
+    padding-left: calc(0.75rem - 2px);
+  }
+  .log-leave {
+    border-left: 2px solid #3a3a3a;
+    padding-left: calc(0.75rem - 2px);
+  }
+  .col-lo {
+    color: #e6e6e6;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .col-ld {
+    color: #d5d5d5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .col-lc { color: #8aa1b8; }
+  .col-lb { /* shares cand-conf-* badge styling */
+    text-align: center;
+  }
+  .col-la { color: #8aa1b8; }
+  .col-lx { color: #d5d5d5; }
 
   /* ANCHORS — L4 Observing, Component 2. Sibling of TOKENS; one row per
      live anchor on the current line. Voided rows get a faded look but

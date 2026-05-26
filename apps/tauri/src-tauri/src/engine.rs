@@ -26,11 +26,14 @@
 
 use std::time::Instant;
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use behavioural_model::{BehaviouralModel, InputEvent};
 use correction_engine::{
-    decide, ranked_known_candidates, score_candidates, AnchorTracker, Confidence, ConfidenceTier,
-    DecisionOutcome, Lexicon, ScoredCandidate, Token, TokenKind, Tokenizer, ACTIVE_TIER,
-    CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION, SCORE_VERSION,
+    decide, has_motor_evidence, ranked_known_candidates, score_candidates, should_log,
+    AnchorTracker, Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome, Lexicon,
+    ScoredCandidate, Token, TokenKind, Tokenizer, ACTIVE_TIER, CANDIDATES_VERSION,
+    DECISION_VERSION, LEXICON_VERSION, SCORE_VERSION,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
@@ -65,6 +68,12 @@ pub const EVT_LEXICON: &str = "engine://lexicon";
 /// can render "(no known candidates within edit-1)". The debug-view
 /// CANDIDATES section listens.
 pub const EVT_CANDIDATES: &str = "engine://candidates";
+/// Fired once per appended decision-ledger record (Component 4). Payload
+/// is the full `LogRecord` with `outcome = Pending`. The debug-view LOG
+/// section listens and renders newest-at-bottom; the ledger itself is
+/// in-memory and bounded — the panel keeps its own view, the engine is
+/// the source of truth.
+pub const EVT_LOG_RECORD: &str = "engine://log-record";
 
 /// Top-N candidates the engine surfaces per unknown word. Keep small so the
 /// debug panel and any future spatial-scorer aren't paying for a long tail.
@@ -233,15 +242,34 @@ fn anchor_emit_payload<'a>(
 ///
 /// **Observe-only** (Component 3c-2): the decision is computed and
 /// emitted but the engine does NOT inject anything. Injection is 3c-3.
+///
+/// **Component 4 — decision ledger.** When the token is a Word and the
+/// upstream gates pass (see [`should_log`] + [`has_motor_evidence`]), a
+/// `Pending` [`LogRecord`] is appended to `ledger` and emitted on
+/// [`EVT_LOG_RECORD`]. The `anchor_id` carried on the record is the
+/// bridge C5 will use to resolve the outcome; here it must be cleanly
+/// available — see the resolution dance below (`try_register` for fresh
+/// anchors, `find_tracking_id` for replays).
+#[allow(clippy::too_many_arguments)]
 fn emit_sealed_token<R: Runtime>(
     app: &AppHandle<R>,
     tok: Token,
     anchors: &mut AnchorTracker,
     lexicon: &Lexicon,
     map: &VolatilityMap,
+    ledger: &mut DecisionLedger,
+    line_dwells: &[u32],
 ) {
     if matches!(tok.kind, TokenKind::Word) {
-        anchors.try_register(tok.start, tok.end, &tok.core);
+        // Resolve the anchor id BEFORE running the pipeline so a missing
+        // id (a real bug, not a normal outcome) shows up next to the
+        // decision in the log. Fresh registrations return Some(id);
+        // replays of the same span/core return None from try_register
+        // and we follow up with find_tracking_id.
+        let fresh_id = anchors.try_register(tok.start, tok.end, &tok.core);
+        let anchor_id = fresh_id
+            .or_else(|| anchors.find_tracking_id(tok.start, tok.end, &tok.core));
+
         let row = lexicon_row_for(&tok.core, lexicon);
         let known = row.known;
         let _ = app.emit(EVT_LEXICON, row);
@@ -282,15 +310,58 @@ fn emit_sealed_token<R: Runtime>(
         let _ = app.emit(
             EVT_DECISION,
             DecisionPayload {
-                outcome,
+                outcome: outcome.clone(),
                 active_tier: ACTIVE_TIER,
                 decide_time_ms,
                 decision_version: DECISION_VERSION,
             },
         );
+
+        // Component 4 — append to the decision ledger if the gates pass.
+        // Two gates: (a) UNKNOWN-word filter via `should_log`; (b) motor
+        // evidence via per-char dwells in this token's span. The anchor
+        // id is required — if we couldn't resolve it (shouldn't happen
+        // for Word tokens that just registered), we skip the append
+        // rather than fabricate a link. The privacy guarantee is
+        // structural: no motor evidence → no ledger entry.
+        let has_motor = has_motor_evidence(line_dwells, tok.start, tok.end);
+        if should_log(&outcome, has_motor) {
+            if let Some(anchor_id) = anchor_id {
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let new_id = ledger.append(
+                    ts,
+                    outcome,
+                    anchor_id,
+                    ACTIVE_TIER,
+                    report.top_confidence,
+                );
+                // Emit the just-appended record. The ledger owns it and
+                // may evict later, but the panel keeps its own copy in
+                // its own bounded list.
+                if let Some(rec) = ledger.get(new_id).cloned() {
+                    let _ = app.emit(EVT_LOG_RECORD, rec);
+                }
+            } else {
+                // Decision passed the gates but the anchor id wasn't
+                // resolvable. Surface the bug rather than silently
+                // dropping the record; C5 needs the anchor link to
+                // attribute outcomes at all.
+                tracing::warn!(
+                    "C4 ledger skipped a loggable decision: anchor id unresolved \
+                     for word {:?} at [{}, {})",
+                    tok.core,
+                    tok.start,
+                    tok.end
+                );
+            }
+        }
     }
     let _ = app.emit(EVT_TOKEN, tok);
 }
+
 
 /// Build the lexicon-row payload for a Word token. Pure function — pulled
 /// out so the v2 "membership vs frequency" invariant can be pinned by
@@ -369,11 +440,24 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
         // (the tokenizer itself is forward-only).
         let mut tokenizer = Tokenizer::new();
         let mut line_buf: Vec<char> = Vec::new();
+        // Component 4 motor-evidence proxy. Parallel to `line_buf`: one
+        // entry per char carrying that key's `dwell_ms`. Pasted /
+        // auto-filled / synthetic chars arrive with no press/release
+        // timing (dwell == 0) and fail [`has_motor_evidence`] by
+        // construction, so the decision ledger never captures them.
+        // Stays in lock-step with `line_buf` across inserts, backspaces,
+        // and line resets; replays read it as the source of truth.
+        let mut line_dwells: Vec<u32> = Vec::new();
         // L4 Observing brief, Component 2: span anchor tracker. The tracker
         // is engine-owned (not panel-side) so its edit-delta logic is pure
         // Rust and the panel just renders snapshots. Each sealed Word token
         // is offered to `try_register` (it dedupes replay).
         let mut anchors = AnchorTracker::new();
+        // L4 Observing brief, Component 4: bounded in-memory decision
+        // ledger. Owns Pending records keyed by anchor id; outcome
+        // resolution is C5. Lives for the life of the engine; no disk
+        // writes by design.
+        let mut ledger = DecisionLedger::new();
         // L4 lexicon (Component 3a). Process-wide singleton — first touch
         // parses the ~50k-entry bundled list; subsequent reads are HashMap
         // lookups. Read-only this slice: scoring/correction come later.
@@ -455,6 +539,11 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                 let deleted = line_buf[p];
                                 anchors.apply_delete(p, deleted);
                                 line_buf.remove(p);
+                                // Keep dwell buffer in lock-step with line_buf so
+                                // the C4 motor-evidence gate stays accurate.
+                                if p < line_dwells.len() {
+                                    line_dwells.remove(p);
+                                }
                                 caret -= 1;
                             }
 
@@ -474,6 +563,8 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                         &mut anchors,
                                         lexicon,
                                         model.slip_detector.map(),
+                                        &mut ledger,
+                                        &line_dwells,
                                     );
                                 }
                             }
@@ -570,6 +661,9 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                             // newline sealed goes through the same
                                             // helper as every other emission so the
                                             // lexicon panel sees that final word.
+                                            // Note: we emit BEFORE clearing line_dwells
+                                            // so the motor-evidence gate sees the
+                                            // pre-newline char dwells.
                                             if let Some(tok) = tokenizer.observe_char(c) {
                                                 emit_sealed_token(
                                                     &app_handle,
@@ -577,9 +671,12 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                                     &mut anchors,
                                                     lexicon,
                                                     model.slip_detector.map(),
+                                                    &mut ledger,
+                                                    &line_dwells,
                                                 );
                                             }
                                             line_buf.clear();
+                                            line_dwells.clear();
                                             caret = 0;
                                             anchors.clear();
                                             let _ = app_handle.emit(EVT_LINE_RESET, ());
@@ -596,11 +693,21 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                             // tokenizer feed only run if the
                                             // char was actually accepted.
                                             let was_end_of_line = caret == line_buf.len();
+                                            // Mirror the insert position used inside
+                                            // insert_text_char so line_dwells stays
+                                            // in lock-step with line_buf.
+                                            let insert_pos = caret.min(line_buf.len());
                                             let Some(new_caret) =
                                                 insert_text_char(&mut line_buf, caret, c)
                                             else {
                                                 continue;
                                             };
+                                            // C4 motor-evidence proxy: store this
+                                            // char's dwell at the same index. A real
+                                            // keystroke carries a non-zero dwell;
+                                            // pasted / synthetic chars come through
+                                            // with dwell == 0 and fail the gate.
+                                            line_dwells.insert(insert_pos, dwell_ms);
                                             anchors.apply_insert(caret, c);
                                             caret = new_caret;
 
@@ -612,6 +719,8 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                                         &mut anchors,
                                                         lexicon,
                                                         model.slip_detector.map(),
+                                                        &mut ledger,
+                                                        &line_dwells,
                                                     );
                                                 }
                                             } else {
@@ -634,6 +743,8 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                                             &mut anchors,
                                                             lexicon,
                                                             model.slip_detector.map(),
+                                                            &mut ledger,
+                                                            &line_dwells,
                                                         );
                                                     }
                                                 }
@@ -649,8 +760,14 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                     _ => {
                                         // Multi-char / unknown special key —
                                         // abandon current line context entirely.
+                                        // This is also the engine-level paste
+                                        // arm (e.g. a Cmd+V that arrives as a
+                                        // single Key with the full pasted
+                                        // string): nothing reaches the ledger
+                                        // because no token is sealed here.
                                         tokenizer.reset_line();
                                         line_buf.clear();
+                                        line_dwells.clear();
                                         caret = 0;
                                         anchors.clear();
                                         let _ = app_handle.emit(EVT_LINE_RESET, ());
