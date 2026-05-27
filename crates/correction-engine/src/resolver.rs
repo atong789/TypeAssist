@@ -38,14 +38,27 @@
 //!
 //! ## Classification
 //!
-//! Given the post-edit text computed from the successor lookup:
+//! Given the post-edit observation:
 //!
-//! | post-edit text                                 | Outcome                 |
+//! | post-edit observation                          | Outcome                 |
 //! |------------------------------------------------|-------------------------|
-//! | empty (no successor + original Void)           | `Abandoned`             |
-//! | == `record.original_text`                       | `Kept`                  |
-//! | == `record.top_candidate`                       | `CorrectedToSuggestion` |
-//! | any other non-empty word                        | `CorrectedToOther`      |
+//! | `Resolved(empty)`                              | `Abandoned`             |
+//! | `Resolved(text) == record.original_text`        | `Kept`                  |
+//! | `Resolved(text) == record.top_candidate`        | `CorrectedToSuggestion` |
+//! | `Resolved(other non-empty word)`                | `CorrectedToOther`      |
+//! | `Incomplete(_)` (mid-edit truncation)           | no transition           |
+//!
+//! `Incomplete` is the load-bearing addition for transpositions and
+//! similar shrink-then-retype corrections (e.g. `wordl → world`). The
+//! user's anchor shrinks via inside-deletes to a proper prefix of
+//! `original_text` while they prepare to retype past the truncation —
+//! during that window there's no successor yet, but the truncated
+//! prefix isn't a committed outcome either. Treating it as committed
+//! produced a premature `CorrectedToOther` that wouldn't recover when
+//! the eventual seal landed (ticks are keystroke-gated; a pause after
+//! the seal leaves the wrong classification in place). `Incomplete`
+//! keeps the record at its previous outcome until either a successor
+//! seals or the user reverts.
 //!
 //! `CorrectedToSuggestion` is **independent of the decision arm** —
 //! the candidate is stored on every loggable record regardless of
@@ -85,16 +98,49 @@ pub const DEFAULT_DEBOUNCE_MS: u64 = 600;
 
 /// Resolver version. Bump on any change to the resolution policy that
 /// downstream Components or the debug panel could observe.
-pub const RESOLVER_VERSION: u32 = 2;
+pub const RESOLVER_VERSION: u32 = 3;
+
+/// Output of [`compute_post_edit_text`]. Captures whether the user has
+/// reached a state the resolver can classify, or is **mid-edit** —
+/// specifically the truncated-Tracking case where the anchor's content
+/// is a proper prefix of `original_text` and no successor has sealed
+/// yet (a transposition fix like `wordl → world` walks through this
+/// state: A shrinks to `"wor"` while the user types the replacement
+/// `"ld"` that the seal will lift into a successor anchor).
+///
+/// Mid-edit observations are still cached so subsequent edits within
+/// the truncation keep resetting the debounce — but the resolver does
+/// NOT emit a transition on a mid-edit observation. The record stays
+/// at its previous outcome until either:
+///   * the user commits (a successor seals → `Resolved`), or
+///   * the original's content matches `original_text` again (`Resolved` → Kept).
+///
+/// Without this gate, a pause inside a correction (e.g. user
+/// backspaces past mid-word and looks at the screen for > debounce)
+/// triggers a premature CorrectedToOther on the truncated prefix, and
+/// the subsequent successor seal doesn't reliably re-tick because
+/// ticks are keystroke-gated. See the module doc-comment for the
+/// full trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PostEdit {
+    /// User has reached a committable state — classify it.
+    Resolved(Vec<char>),
+    /// Mid-edit: anchor is Tracking with content that is a proper
+    /// prefix of `original_text` AND no successor anchor exists at the
+    /// same start. Content is captured so two different truncations
+    /// (e.g. `"wor"` vs `"wo"`) compare as different observations and
+    /// reset the debounce timer.
+    Incomplete(Vec<char>),
+}
 
 /// What the resolver remembers about an anchor at last observation.
-/// Deliberately keyed on `(state, post_edit_text)` — position is NOT
-/// part of the stability tuple, so a pure shift (insert/delete
-/// elsewhere on the line) doesn't reset the debounce.
+/// Deliberately keyed on `(state, post_edit)` — position is NOT part
+/// of the stability tuple, so a pure shift (insert/delete elsewhere on
+/// the line) doesn't reset the debounce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Observation {
     state: AnchorState,
-    post_edit_text: Vec<char>,
+    post_edit: PostEdit,
 }
 
 #[derive(Debug, Clone)]
@@ -180,10 +226,10 @@ impl OutcomeResolver {
                 continue;
             };
 
-            let post_edit_text = compute_post_edit_text(record, original, anchors, line_buf);
+            let post_edit = compute_post_edit_text(record, original, anchors, line_buf);
             let obs = Observation {
                 state: original.state.clone(),
-                post_edit_text,
+                post_edit,
             };
 
             match self.last_seen.get_mut(&original.id) {
@@ -213,11 +259,16 @@ impl OutcomeResolver {
             if elapsed < self.debounce_ms {
                 continue;
             }
-            let computed = classify(
-                &obs.post_edit_text,
+            let Some(computed) = classify(
+                &obs.post_edit,
                 &record.original_text,
                 record.top_candidate.as_deref(),
-            );
+            ) else {
+                // Mid-edit — record stays at its previous outcome until
+                // the user commits (or the observation resolves back to
+                // the original content for Kept).
+                continue;
+            };
             if record.outcome != computed {
                 changes.push((record.id, computed));
             }
@@ -226,47 +277,67 @@ impl OutcomeResolver {
     }
 }
 
-/// Compute the text the user has left at this record's position.
+/// Compute the post-edit observation for this record.
 ///
 /// Algorithm:
 ///   1. If the original anchor is `Tracking` AND its content slice
-///      equals `record.original_text` → return that content (Kept happy
-///      path; short-circuits before any successor lookup).
+///      equals `record.original_text` → `Resolved(content)` (Kept happy
+///      path).
 ///   2. Otherwise look for a **successor** — a `Tracking` anchor whose
 ///      `start` equals the original's `start`, with the largest `end`
 ///      (most recent / longest seal at this position), excluding the
-///      original itself by id. If found, return that anchor's content
-///      slice.
-///   3. Otherwise, if the original is still `Tracking` (so it has a
-///      live span), fall back to its content slice — captures the
-///      partial-shrink-no-replacement case where the user mid-edited
-///      and walked away with a truncated prefix.
-///   4. Otherwise (original is `Void`, no successor at its frozen
-///      position) → empty, which maps to `Abandoned`.
+///      original itself by id. If found, `Resolved(successor)`.
+///   3. Otherwise, if the original is still `Tracking` and its content
+///      is a *proper prefix* of `original_text` (`len < original` AND
+///      the content matches the original's leading chars), the user is
+///      mid-edit through inside-deletes and hasn't committed yet →
+///      `Incomplete(content)`. Resolver skips classification.
+///   4. Otherwise (Tracking with content that's not a prefix — e.g. an
+///      in-place mutation that grew or substituted) → `Resolved(content)`,
+///      treated as a committed change.
+///   5. Otherwise (`Void`, no successor at frozen `start`) →
+///      `Resolved(empty)`, which classifies as `Abandoned`.
 fn compute_post_edit_text(
     record: &crate::log::LogRecord,
     original: &SpanAnchor,
     anchors: &[SpanAnchor],
     line_buf: &[char],
-) -> Vec<char> {
+) -> PostEdit {
     if matches!(original.state, AnchorState::Tracking) {
         let content = slice_chars(line_buf, original.start, original.end);
         let orig_chars: Vec<char> = record.original_text.chars().collect();
         if content == orig_chars {
-            return content;
+            return PostEdit::Resolved(content);
         }
-        // Content drifted on a Tracking anchor — try a successor first,
-        // fall back to the (possibly truncated) live content if there
-        // isn't one.
+        // Content drifted on a Tracking anchor — try a successor first.
         if let Some(succ) = find_successor(original.id, original.start, anchors, line_buf) {
-            return succ;
+            return PostEdit::Resolved(succ);
         }
-        return content;
+        // No successor. Distinguish mid-edit truncation (the user has
+        // shrunk the word via inside-deletes and may still type more)
+        // from a committed in-place edit (substitution, grow, etc.).
+        // Proper prefix = the only shape inside-deletes can produce.
+        if is_proper_prefix(&content, &orig_chars) {
+            return PostEdit::Incomplete(content);
+        }
+        return PostEdit::Resolved(content);
     }
 
     // Void path: anchor.start is frozen at the void position. An
-    // immediate retype seals a new token at this position.
-    find_successor(original.id, original.start, anchors, line_buf).unwrap_or_default()
+    // immediate retype seals a new token at this position. No incomplete
+    // state for Void anchors — deletion is unambiguous.
+    PostEdit::Resolved(
+        find_successor(original.id, original.start, anchors, line_buf).unwrap_or_default(),
+    )
+}
+
+/// Slice-level proper-prefix check: `content` is strictly shorter than
+/// `original` AND `original` starts with `content`. The exact shape an
+/// inside-delete sequence on a `Tracking` anchor produces — and the
+/// shape that distinguishes mid-truncation from a committed in-place
+/// edit.
+fn is_proper_prefix(content: &[char], original: &[char]) -> bool {
+    content.len() < original.len() && original.starts_with(content)
 }
 
 /// Find the largest-end `Tracking` anchor whose `start == pos`,
@@ -298,21 +369,26 @@ fn slice_chars(line_buf: &[char], start: usize, end: usize) -> Vec<char> {
     }
 }
 
-/// Pure classifier. See the table in the module doc-comment.
-fn classify(post_edit_text: &[char], original: &str, top_candidate: Option<&str>) -> Outcome {
-    if post_edit_text.is_empty() {
-        return Outcome::Abandoned;
+/// Pure classifier. `None` ⇒ mid-edit, don't emit a transition.
+/// `Some(outcome)` ⇒ the committed outcome for the post-edit text.
+fn classify(post_edit: &PostEdit, original: &str, top_candidate: Option<&str>) -> Option<Outcome> {
+    let text = match post_edit {
+        PostEdit::Incomplete(_) => return None,
+        PostEdit::Resolved(t) => t,
+    };
+    if text.is_empty() {
+        return Some(Outcome::Abandoned);
     }
-    let now: String = post_edit_text.iter().collect();
+    let now: String = text.iter().collect();
     if now == original {
-        return Outcome::Kept;
+        return Some(Outcome::Kept);
     }
     if let Some(cand) = top_candidate {
         if now == cand {
-            return Outcome::CorrectedToSuggestion;
+            return Some(Outcome::CorrectedToSuggestion);
         }
     }
-    Outcome::CorrectedToOther
+    Some(Outcome::CorrectedToOther)
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -632,6 +708,173 @@ mod tests {
         assert_eq!(changes, vec![(rid, Outcome::Abandoned)]);
     }
 
+    // ---- Mid-edit incomplete state (wordl → world fix) -----------------
+
+    #[test]
+    fn wordl_to_world_via_transposition_resolves_to_corrected_to_suggestion() {
+        // The reported real-world failure. User types "wordl ", record
+        // logged with top_candidate="world" (LeaveAlone(BelowActiveTier)
+        // under Cautious). Then corrects the transposition by
+        // backspacing 'l' and 'd' (anchor shrinks via inside-deletes
+        // to [0,3) "wor") and retyping 'l', 'd', ' ' (each insert is
+        // "after-ignore" so the original anchor stays at [0,3); the
+        // trailing space seals "world" as a separate anchor B at
+        // [0,5)). The successor lookup at A.start=0 must find B and
+        // classify CorrectedToSuggestion.
+        let mut line: Vec<char> = "wordl ".chars().collect();
+        let mut anchors = AnchorTracker::new();
+        let aid = anchors.try_register(0, 5, "wordl").unwrap();
+        let mut ledger = DecisionLedger::new();
+        let rid = log_with_candidate(
+            &mut ledger,
+            leave_alone("wordl", LeaveAloneReason::BelowActiveTier),
+            aid,
+            Some("world"),
+            Some(0.50),
+        );
+
+        // Backspace ' ' (after-ignore), 'l' (inside), 'd' (inside).
+        anchors.apply_delete(5, ' ');
+        line.remove(5);
+        anchors.apply_delete(4, 'l');
+        line.remove(4);
+        anchors.apply_delete(3, 'd');
+        line.remove(3);
+        let original = anchors.anchors().iter().find(|a| a.id == aid).unwrap();
+        assert_eq!(
+            (original.start, original.end),
+            (0, 3),
+            "anchor shrinks to [0,3) 'wor'"
+        );
+
+        // Type 'l', 'd', ' '. Each insert is "after-ignore" for A — A
+        // stays [0,3); the trailing space seals "world" as a new anchor.
+        anchors.apply_insert(3, 'l');
+        line.insert(3, 'l');
+        anchors.apply_insert(4, 'd');
+        line.insert(4, 'd');
+        anchors.apply_insert(5, ' ');
+        line.insert(5, ' ');
+        let new_aid = anchors.try_register(0, 5, "world").unwrap();
+        assert_ne!(new_aid, aid, "new anchor for 'world' is a separate id");
+
+        // Confirm the engine-observable state matches the panel
+        // description: TWO Tracking anchors at start=0.
+        let at_start_0: Vec<&SpanAnchor> = anchors
+            .anchors()
+            .iter()
+            .filter(|a| matches!(a.state, AnchorState::Tracking) && a.start == 0)
+            .collect();
+        assert_eq!(at_start_0.len(), 2);
+
+        let mut r = OutcomeResolver::with_debounce_ms(100);
+        r.tick(0, anchors.anchors(), &line, &ledger);
+        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        assert_eq!(
+            changes,
+            vec![(rid, Outcome::CorrectedToSuggestion)],
+            "successor lookup must pick B (largest end at start=0) and \
+             classify against the stored candidate"
+        );
+    }
+
+    #[test]
+    fn truncated_mid_edit_does_not_prematurely_resolve_to_other() {
+        // The pause-during-correction case from the wordl trace: user
+        // shrinks the anchor to a proper prefix, pauses past debounce,
+        // and never commits. The resolver must NOT fire ToOther on the
+        // truncated stub — record stays at its previous outcome.
+        let mut line: Vec<char> = "wordl ".chars().collect();
+        let mut anchors = AnchorTracker::new();
+        let aid = anchors.try_register(0, 5, "wordl").unwrap();
+        let mut ledger = DecisionLedger::new();
+        let rid = log_with_candidate(
+            &mut ledger,
+            leave_alone("wordl", LeaveAloneReason::BelowActiveTier),
+            aid,
+            Some("world"),
+            Some(0.50),
+        );
+
+        let mut r = OutcomeResolver::with_debounce_ms(100);
+        // Phase 1: resolve Kept on the untouched word.
+        r.tick(0, anchors.anchors(), &line, &ledger);
+        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        assert_eq!(changes, vec![(rid, Outcome::Kept)]);
+        assert!(ledger.resolve_outcome(rid, Outcome::Kept));
+
+        // Phase 2: backspace ' ', 'l', 'd' — anchor truncates to "wor".
+        anchors.apply_delete(5, ' ');
+        line.remove(5);
+        anchors.apply_delete(4, 'l');
+        line.remove(4);
+        anchors.apply_delete(3, 'd');
+        line.remove(3);
+
+        // Pause past debounce — observation is Incomplete("wor"), so
+        // no transition fires. Record stays Kept (its prior outcome).
+        r.tick(200, anchors.anchors(), &line, &ledger);
+        let changes = r.tick(500, anchors.anchors(), &line, &ledger);
+        assert!(
+            changes.is_empty(),
+            "Incomplete mid-edit must not flip Kept → ToOther"
+        );
+        assert_eq!(ledger.get(rid).unwrap().outcome, Outcome::Kept);
+    }
+
+    #[test]
+    fn truncated_mid_edit_resolves_when_successor_seals() {
+        // Continuation of the previous case: after the truncation, the
+        // user retypes and seals a successor. Past the next debounce
+        // the resolver fires the correct transition (Kept → ToSuggestion
+        // here).
+        let mut line: Vec<char> = "wordl ".chars().collect();
+        let mut anchors = AnchorTracker::new();
+        let aid = anchors.try_register(0, 5, "wordl").unwrap();
+        let mut ledger = DecisionLedger::new();
+        let rid = log_with_candidate(
+            &mut ledger,
+            leave_alone("wordl", LeaveAloneReason::BelowActiveTier),
+            aid,
+            Some("world"),
+            Some(0.50),
+        );
+
+        let mut r = OutcomeResolver::with_debounce_ms(100);
+        r.tick(0, anchors.anchors(), &line, &ledger);
+        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        assert_eq!(changes, vec![(rid, Outcome::Kept)]);
+        assert!(ledger.resolve_outcome(rid, Outcome::Kept));
+
+        // Truncate to "wor" — Incomplete observation, no transition.
+        anchors.apply_delete(5, ' ');
+        line.remove(5);
+        anchors.apply_delete(4, 'l');
+        line.remove(4);
+        anchors.apply_delete(3, 'd');
+        line.remove(3);
+        r.tick(200, anchors.anchors(), &line, &ledger);
+        let changes = r.tick(400, anchors.anchors(), &line, &ledger);
+        assert!(changes.is_empty(), "Incomplete should hold the resolution");
+
+        // Commit: type 'l', 'd', ' ' — trailing space seals "world".
+        anchors.apply_insert(3, 'l');
+        line.insert(3, 'l');
+        anchors.apply_insert(4, 'd');
+        line.insert(4, 'd');
+        anchors.apply_insert(5, ' ');
+        line.insert(5, ' ');
+        anchors.try_register(0, 5, "world").unwrap();
+
+        // First tick after the seal — observation changed from
+        // Incomplete("wor") to Resolved("world") via successor lookup.
+        // stable_since resets to this tick.
+        r.tick(500, anchors.anchors(), &line, &ledger);
+        // Past the post-commit debounce: flip Kept → ToSuggestion.
+        let changes = r.tick(650, anchors.anchors(), &line, &ledger);
+        assert_eq!(changes, vec![(rid, Outcome::CorrectedToSuggestion)]);
+    }
+
     // ---- Revisable transitions (Component 5a's "latest write wins") ----
     //
     // These pin the two transitions that scrambled in manual debug-panel
@@ -880,9 +1123,14 @@ mod tests {
     }
 
     #[test]
-    fn debounce_resets_on_content_edit() {
-        // Two sequential deletes — each one changes the observation
-        // (different post_edit_text), each one must reset the timer.
+    fn debounce_resets_on_content_edit_then_commit_seals_resolves_to_other() {
+        // Two sequential inside-deletes shrink "teh" → "te" → "t". Each
+        // observation changes (`Incomplete("te")` ≠ `Incomplete("t")`)
+        // so each delete resets the debounce timer. Past the debounce,
+        // the record DOES NOT resolve while truncated (the mid-edit
+        // gate from the wordl→world fix). Only once the user commits
+        // by typing a boundary — sealing "t" as a successor anchor —
+        // does the resolver classify CorrectedToOther.
         let mut line: Vec<char> = "teh ".chars().collect();
         let mut anchors = AnchorTracker::new();
         let aid = anchors.try_register(0, 3, "teh").unwrap();
@@ -899,13 +1147,16 @@ mod tests {
         r.tick(0, anchors.anchors(), &line, &ledger);
         assert_eq!(r.stable_since_ms(aid), Some(0));
 
-        // t=50: delete 'h' at p=2 → anchor [0,2), content "te".
+        // t=50: delete 'h' at p=2 → anchor [0,2), content "te" (prefix
+        // of "teh"). Observation transitions from Resolved("teh") to
+        // Incomplete("te") — different observation, timer resets.
         anchors.apply_delete(2, 'h');
         line.remove(2);
         r.tick(50, anchors.anchors(), &line, &ledger);
         assert_eq!(r.stable_since_ms(aid), Some(50));
 
-        // t=80: delete 'e' at p=1 → anchor [0,1), content "t".
+        // t=80: delete 'e' at p=1 → anchor [0,1), content "t" (also a
+        // prefix). Incomplete("te") ≠ Incomplete("t") → timer resets.
         anchors.apply_delete(1, 'e');
         line.remove(1);
         r.tick(80, anchors.anchors(), &line, &ledger);
@@ -915,10 +1166,26 @@ mod tests {
         let changes = r.tick(130, anchors.anchors(), &line, &ledger);
         assert!(changes.is_empty());
 
-        // t=200 — past debounce. "t" ≠ original "teh", ≠ candidate
-        // "the". No other anchor at start=0 → fallback to truncated
-        // original content "t" → ToOther.
+        // t=200 — past debounce, but observation is still Incomplete →
+        // no transition. The record stays Pending.
         let changes = r.tick(200, anchors.anchors(), &line, &ledger);
+        assert!(
+            changes.is_empty(),
+            "Incomplete must not fire ToOther on a truncated mid-edit"
+        );
+        assert_eq!(ledger.get(rid).unwrap().outcome, Outcome::Pending);
+
+        // Commit: user types ' ' which seals "t" as a successor anchor
+        // at [0,1). Now there's a Tracking neighbour at the original
+        // start — observation flips Incomplete → Resolved("t") via the
+        // successor lookup. Timer resets to t=210, then we wait again.
+        anchors.apply_insert(1, ' ');
+        line.insert(1, ' ');
+        let _new_aid = anchors.try_register(0, 1, "t").unwrap();
+        r.tick(210, anchors.anchors(), &line, &ledger);
+
+        // Past the post-commit debounce: classify "t" → ToOther.
+        let changes = r.tick(320, anchors.anchors(), &line, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::CorrectedToOther)]);
     }
 
@@ -974,41 +1241,81 @@ mod tests {
 
     // ---- Pure classifier ------------------------------------------------
 
+    fn resolved(s: &str) -> PostEdit {
+        PostEdit::Resolved(s.chars().collect())
+    }
+
+    fn incomplete(s: &str) -> PostEdit {
+        PostEdit::Incomplete(s.chars().collect())
+    }
+
     #[test]
     fn classify_kept_path() {
-        let text: Vec<char> = "teh".chars().collect();
-        assert_eq!(classify(&text, "teh", Some("the")), Outcome::Kept);
+        assert_eq!(
+            classify(&resolved("teh"), "teh", Some("the")),
+            Some(Outcome::Kept)
+        );
     }
 
     #[test]
     fn classify_corrected_to_suggestion_path() {
-        let text: Vec<char> = "the".chars().collect();
         assert_eq!(
-            classify(&text, "teh", Some("the")),
-            Outcome::CorrectedToSuggestion
+            classify(&resolved("the"), "teh", Some("the")),
+            Some(Outcome::CorrectedToSuggestion)
         );
     }
 
     #[test]
     fn classify_corrected_to_other_path() {
-        let text: Vec<char> = "tax".chars().collect();
         assert_eq!(
-            classify(&text, "teh", Some("the")),
-            Outcome::CorrectedToOther
+            classify(&resolved("tax"), "teh", Some("the")),
+            Some(Outcome::CorrectedToOther)
         );
     }
 
     #[test]
     fn classify_abandoned_on_empty() {
-        let text: Vec<char> = Vec::new();
-        assert_eq!(classify(&text, "teh", Some("the")), Outcome::Abandoned);
+        assert_eq!(
+            classify(&resolved(""), "teh", Some("the")),
+            Some(Outcome::Abandoned)
+        );
     }
 
     #[test]
     fn classify_corrected_to_other_when_no_candidate_present() {
         // top_candidate=None: anything non-empty that doesn't match the
         // original is ToOther — ToSuggestion is unreachable by design.
-        let text: Vec<char> = "tax".chars().collect();
-        assert_eq!(classify(&text, "teh", None), Outcome::CorrectedToOther);
+        assert_eq!(
+            classify(&resolved("tax"), "teh", None),
+            Some(Outcome::CorrectedToOther)
+        );
+    }
+
+    #[test]
+    fn classify_incomplete_returns_none() {
+        // Incomplete state never emits a transition — record stays at
+        // its prior outcome until the user commits.
+        assert_eq!(classify(&incomplete("wor"), "wordl", Some("world")), None);
+        // Even when the truncated prefix matches a suggestion-like
+        // shape, Incomplete dominates — we don't classify mid-edit.
+        assert_eq!(classify(&incomplete("the"), "the", Some("the")), None);
+    }
+
+    // ---- is_proper_prefix ----------------------------------------------
+
+    #[test]
+    fn proper_prefix_detection() {
+        let chars = |s: &str| s.chars().collect::<Vec<_>>();
+        // True prefixes — what inside-deletes produce.
+        assert!(is_proper_prefix(&chars("wor"), &chars("wordl")));
+        assert!(is_proper_prefix(&chars(""), &chars("wordl")));
+        assert!(is_proper_prefix(&chars("w"), &chars("wordl")));
+        // Equal length — not a *proper* prefix.
+        assert!(!is_proper_prefix(&chars("wordl"), &chars("wordl")));
+        // Same start but diverges — not a prefix.
+        assert!(!is_proper_prefix(&chars("wol"), &chars("wordl")));
+        // Longer than original (e.g. mid-line insert grew the anchor) —
+        // can't be a prefix of original.
+        assert!(!is_proper_prefix(&chars("bullion"), &chars("bullon")));
     }
 }
