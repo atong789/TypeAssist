@@ -308,9 +308,10 @@
     | { kind: "provisional" }
     | { kind: "confirmed" };
   /// Mirrors `correction_engine::lexicon_proposal::LexiconProposal`.
-  /// v3 adds `plausibility` (bigram log10-prob mean) and `proximity`
-  /// (verdict from the linguistic gate). Panel renders both so the
-  /// builder can see why each word holds or promotes.
+  /// v4 adds `norvig_freq` — the typed word's web-corpus frequency
+  /// (NOT through is_known). Combined with near-known proximity,
+  /// `norvig_freq === 0` is what catches `aduluts`-class typos while
+  /// letting `lol`-class informal real words through.
   type LexiconProposal = {
     word: string;
     lane: Lane;
@@ -322,6 +323,7 @@
     last_seen_ms: number;
     plausibility: number;
     proximity: ProximityVerdict;
+    norvig_freq: number;
     version: number;
   };
   /// Mirrors the `LexiconProposalEvent` engine payload — proposal=null
@@ -815,6 +817,13 @@
   function fmtPlausibility(p: number): string {
     return p.toFixed(2);
   }
+  /// Norvig web-corpus frequency, compact format. `—` when zero
+  /// (never seen on the web) — this is the signal the proposer
+  /// combines with near-known proximity to veto typos like `aduluts`.
+  function fmtNorvig(n: number): string {
+    if (n === 0) return "—";
+    return fmtFreqCompact(n);
+  }
   function fmtProposalTier(t: ProposalTier): string {
     switch (t.kind) {
       case "held":
@@ -1200,8 +1209,9 @@
                 <span class="col-lxl">lane</span>
                 <span class="col-lxm">motor</span>
                 <span class="col-lxs num" title="slip_score from the per-token motor signal: fraction of chars in span whose dwell ≤ graze threshold (≤30ms). 0.00 = all clean. 1.00 = all graze.">slip</span>
-                <span class="col-lxp num" title="Mean log10-probability of the word's character bigrams against the SCOWL distribution. Negative; higher = more well-formed. Below PLAUSIBILITY_FLOOR → Held(ill-formed).">plaus</span>
-                <span class="col-lxx" title="Proximity verdict: far / near-edit2 / segment / prefix. Any non-far value holds the proposal.">prox</span>
+                <span class="col-lxp num" title="Mean log10-probability of the word's character bigrams against the SCOWL distribution. Negative; higher = more well-formed.">plaus</span>
+                <span class="col-lxx" title="Proximity verdict: far / near-edit2 / segment / prefix.">prox</span>
+                <span class="col-lxn num" title="Norvig web-corpus frequency for the typed word. '—' = never seen on the web. Combined with near-known proximity, zero web freq vetoes the proposal as a typo (catches aduluts; lets lol-class informal words through).">web</span>
                 <span class="col-lxt">tier</span>
                 <span class="col-lxo num">×</span>
               </div>
@@ -1217,6 +1227,7 @@
                   <span class="col-lxs num">{fmtMotorEvidence(p.last_motor_evidence)}</span>
                   <span class="col-lxp num">{fmtPlausibility(p.plausibility)}</span>
                   <span class="col-lxx lex-prox-{p.proximity}">{fmtProximity(p.proximity)}</span>
+                  <span class="col-lxn num" class:lex-no-web={p.norvig_freq === 0}>{fmtNorvig(p.norvig_freq)}</span>
                   <span class="col-lxt">{fmtProposalTier(p.tier)}</span>
                   <span class="col-lxo num">{p.occasions}</span>
                 </div>
@@ -1982,12 +1993,13 @@
     display: grid;
     grid-template-columns:
       minmax(0, 1.2fr) /* word */
-      minmax(0, 1.2fr) /* lane */
+      minmax(0, 1.1fr) /* lane */
       52px            /* motor */
-      48px            /* slip */
-      52px            /* plaus */
-      80px            /* prox */
-      minmax(0, 1.4fr) /* tier */
+      44px            /* slip */
+      48px            /* plaus */
+      72px            /* prox */
+      48px            /* web */
+      minmax(0, 1.3fr) /* tier */
       32px;           /* × */
     column-gap: 0.5rem;
     align-items: baseline;
@@ -2043,6 +2055,10 @@
   .lex-prox-near_known_edit2 { color: #d2885d; font-weight: 600; }
   .lex-prox-segmentable      { color: #d2885d; font-weight: 600; }
   .lex-prox-prefix_merge     { color: #d2c87b; font-weight: 600; }
+  /* Norvig column — '—' (no web presence) renders in the same warning
+     shade as near-known proximity so the eye reads the combo at a glance. */
+  .col-lxn { color: #8aa1b8; }
+  .lex-no-web { color: #d2885d; font-weight: 600; }
 
   /* SLIPS section header annotation for the C5b L3-map kill-switch.
      Bright when live, dim/warning when off. */

@@ -431,6 +431,8 @@ mod tests {
             "hello",
             "machine",
             "compiler",
+            "lol",
+            "youbd",
             // Must fail.
             "imapc",
             "potentjual",
@@ -439,6 +441,9 @@ mod tests {
             "si",
             "ima",
             "qzqz",
+            "aduluts",
+            "un",
+            "ubbncudebce",
         ];
         eprintln!("plausibility scores (placeholder floor {PLAUSIBILITY_FLOOR}):");
         for w in &words {

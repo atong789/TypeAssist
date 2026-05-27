@@ -87,28 +87,38 @@ use crate::motor_signal::TokenMotorVerdict;
 /// Version of the proposal wire shape. Bump on any change to
 /// [`LexiconProposal`] / [`Lane`] / [`MotorVerdict`] / [`ProposalTier`].
 ///
-/// v2 — C5b motor-signal fix: gate reads `token_motor` (candidate
-/// independent) instead of `top_motor_evidence`; dropped the
-/// `HighConfidenceRejection` hold reason.
-///
-/// v3 — C5b linguistic stack: per-word plausibility + proximity
-/// computed at credit time; three new hold reasons (`IllFormed`,
-/// `NearKnownWord`, `SegmentableMerge`). Net fast-lane promotion now
-/// requires motor-clean AND well-formed AND not-near-known AND
-/// not-segmentable AND not-prefix-merge.
-pub const LEXICON_PROPOSAL_VERSION: u32 = 3;
+/// v2 — C5b motor-signal fix.
+/// v3 — C5b linguistic stack (plausibility / proximity / hold reasons).
+/// v4 — Eligibility/Promotion split. Restructured `recompute_tier`
+/// into two stages: an eligibility veto (lane- and count-independent;
+/// recurrence can never bypass) and a promotion stage (lane sets the
+/// occasion bar). Added `norvig_freq` so the eligibility veto can
+/// detect near-known + no-web-presence (catches `aduluts`-class
+/// typos that the bigram model can't distinguish from real words by
+/// shape alone). Near-known gates BOTH lanes now (was fast-only).
+pub const LEXICON_PROPOSAL_VERSION: u32 = 4;
 
 // ---- Tunable PLACEHOLDERS — replace with values from real Observing data --
 
-/// Minimum word length to be eligible for promotion. Single-letter
-/// tokens are routinely premature-space boundary fragments (the
-/// `Soum`/`yo` case the C5b brief flagged for C5c) and shouldn't
-/// learn. Strictly less than this → `Held(ObviousFragment)`.
-const MIN_PROMOTABLE_WORD_LEN: usize = 2;
+/// Minimum word length to be eligible for promotion. Two-char unknown
+/// tokens (`un`, `iv`, `qz`) are overwhelmingly typos / fragments of
+/// real words; legitimate 2-char words (`of`, `to`, `is`) are all in
+/// SCOWL and never reach the proposer. Strictly less than this →
+/// `Held(ObviousFragment)`. Bumped from 2 to 3 after slow-lane
+/// leaks (`un` was reaching Confirmed).
+const MIN_PROMOTABLE_WORD_LEN: usize = 3;
 
-/// Occasions at which a `Provisional` proposal upgrades to `Confirmed`.
-/// Placeholder — real corroboration wants distinct time-bins (5d).
-const CONFIRMED_OCCASIONS_THRESHOLD: u32 = 3;
+/// Occasions at which a `Provisional` proposal upgrades to `Confirmed`
+/// on the **fast lane** (no candidate exists — engine has no theory
+/// of what the user might have meant). Placeholder — real
+/// corroboration wants distinct time-bins (5d).
+const CONFIRMED_OCCASIONS_THRESHOLD_FAST: u32 = 3;
+
+/// Higher bar for the **slow lane** — the engine already found and
+/// suggested a candidate, and the user kept the near-miss anyway.
+/// That's more slip-evidence per occasion than the fast lane, not
+/// less; we want more independent occasions before confirming.
+const CONFIRMED_OCCASIONS_THRESHOLD_SLOW: u32 = 5;
 
 // ---- Public types ---------------------------------------------------------
 
@@ -224,6 +234,15 @@ pub struct LexiconProposal {
     /// and is surfaced in the panel so the builder can see WHY each
     /// non-FarFromKnown verdict fired.
     pub proximity: ProximityVerdict,
+    /// Norvig web-corpus frequency for the typed word, looked up
+    /// directly (NOT through `is_known`). Zero means "this string
+    /// has never been seen on the web" — a strong signal that the
+    /// token is a pure typo, not a novel word. Combined with
+    /// near-known proximity this is the eligibility-veto signal
+    /// that separates `aduluts` (0 web freq → held) from `lol`
+    /// (16M web freq → promotable) — neither of which the bigram
+    /// plausibility could distinguish.
+    pub norvig_freq: u64,
     /// Wire shape version. See [`LEXICON_PROPOSAL_VERSION`].
     pub version: u32,
 }
@@ -400,14 +419,17 @@ impl LexiconProposer {
         let last_motor_evidence = slip_score_for(record);
         let last_record_id = record.id;
         let last_seen_ms = record.timestamp_ms;
-        // Compute the linguistic signal once per credited record
-        // against the proposer's stored lexicon. Cached on the
-        // proposal so subsequent ticks don't recompute.
+        // Linguistic signal — plausibility + proximity, computed once
+        // per credited record. The Norvig-frequency lookup is a
+        // separate signal (not derived from the bigram model) — it's
+        // what tells `aduluts`-class typos apart from `lol`-class
+        // informal real words.
         let LinguisticSignal {
             plausibility,
             well_formed: _,
             proximity,
         } = linguistic_signal(&word, self.lex);
+        let norvig_freq = self.lex.frequency(&word);
 
         let entry = self.proposals.entry(word.clone()).or_insert_with(|| {
             LexiconProposal {
@@ -421,6 +443,7 @@ impl LexiconProposer {
                 last_seen_ms,
                 plausibility,
                 proximity,
+                norvig_freq,
                 version: LEXICON_PROPOSAL_VERSION,
             }
         });
@@ -433,12 +456,14 @@ impl LexiconProposer {
         entry.last_seen_ms = last_seen_ms;
         entry.plausibility = plausibility;
         entry.proximity = proximity;
+        entry.norvig_freq = norvig_freq;
         entry.tier = recompute_tier(
             &entry.word,
             &entry.lane,
             entry.motor_verdict,
             entry.plausibility,
             entry.proximity,
+            entry.norvig_freq,
             entry.occasions,
         );
     }
@@ -459,6 +484,7 @@ impl LexiconProposer {
                     p.motor_verdict,
                     p.plausibility,
                     p.proximity,
+                    p.norvig_freq,
                     p.occasions,
                 );
             }
@@ -525,6 +551,32 @@ fn slip_score_for(record: &LogRecord) -> Option<f64> {
 /// both lanes; slow-lane proximity is implicit (it has a candidate
 /// by definition), but a Slow-lane Kept on an ill-formed token
 /// still holds.
+/// Two-stage tier decision:
+///
+/// **Stage 1 — Eligibility (veto).** Lane-independent and
+/// count-independent. A failing word is `Held` no matter how many
+/// times it recurs — recurrence does NOT bypass the eligibility veto.
+/// Vetoes:
+///   * `ObviousFragment` — length below the minimum.
+///   * `SlipSignature` — motor verdict says slip.
+///   * `IllFormed` — plausibility below the floor (a backstop for
+///     `qzqz`-class anomalies; mean bigram doesn't separate spatial
+///     mangles from real words by shape alone).
+///   * `SegmentableMerge` / `PrefixMerge` — strictly splits into
+///     known parts.
+///   * `NearKnownWord` — the **combined** signal "near a known word
+///     AND not seen on the web" (`norvig_freq == 0`). Catches
+///     `aduluts` / `imapc` / `youbd` while letting `lol`-class
+///     informal real words (Norvig-attested) through. The slow lane
+///     gets this gate too — the user keeping a near-miss after the
+///     engine suggested the correct word is MORE slip-evidence than
+///     fast lane, not less.
+///
+/// **Stage 2 — Promotion.** Only runs if eligibility passed. Lane
+/// sets the occasion bar: fast lane confirms at
+/// [`CONFIRMED_OCCASIONS_THRESHOLD_FAST`], slow lane at
+/// [`CONFIRMED_OCCASIONS_THRESHOLD_SLOW`] (higher — slow lane
+/// carries inherent slip-signal). Below the bar → `Provisional`.
 #[allow(clippy::too_many_arguments)]
 fn recompute_tier(
     word: &str,
@@ -532,8 +584,11 @@ fn recompute_tier(
     motor_verdict: MotorVerdict,
     plausibility: f64,
     proximity: ProximityVerdict,
+    norvig_freq: u64,
     occasions: u32,
 ) -> ProposalTier {
+    // ---- Stage 1: Eligibility (veto) ----
+
     if word.chars().count() < MIN_PROMOTABLE_WORD_LEN {
         return ProposalTier::Held {
             reason: HoldReason::ObviousFragment,
@@ -549,9 +604,6 @@ fn recompute_tier(
             reason: HoldReason::IllFormed,
         };
     }
-    // Segmentation and prefix-merge fire on BOTH lanes — a slow-lane
-    // Kept that happens to be a dropped-space merge is just as much a
-    // mangling as a fast-lane one.
     match proximity {
         ProximityVerdict::Segmentable => {
             return ProposalTier::Held {
@@ -564,11 +616,13 @@ fn recompute_tier(
             };
         }
         ProximityVerdict::NearKnownEdit2 => {
-            // Slow lane already has a candidate at edit-1; the proximity
-            // gate would double-fire on it. Only hold on fast lane,
-            // where NearKnownEdit2 means "the engine had no theory of
-            // what you meant, but a high-freq word sits 2 edits away."
-            if matches!(lane, Lane::Fast) {
+            // Near-known alone doesn't veto: informal real words
+            // (`lol`, `meh`, etc.) sit near a known word AND have
+            // genuine web usage. The combined signal "near-known AND
+            // no Norvig presence" is what flags a typo. Both lanes
+            // get this gate — the slow lane's existing candidate is
+            // additional slip evidence, not a free pass.
+            if norvig_freq == 0 {
                 return ProposalTier::Held {
                     reason: HoldReason::NearKnownWord,
                 };
@@ -576,7 +630,14 @@ fn recompute_tier(
         }
         ProximityVerdict::FarFromKnown => {}
     }
-    if occasions >= CONFIRMED_OCCASIONS_THRESHOLD {
+
+    // ---- Stage 2: Promotion (eligible) ----
+
+    let threshold = match lane {
+        Lane::Fast => CONFIRMED_OCCASIONS_THRESHOLD_FAST,
+        Lane::Slow { .. } => CONFIRMED_OCCASIONS_THRESHOLD_SLOW,
+    };
+    if occasions >= threshold {
         ProposalTier::Confirmed
     } else {
         ProposalTier::Provisional
@@ -785,7 +846,7 @@ mod tests {
         // change behaviour.
         let mut ledger = DecisionLedger::new();
         let mut p = LexiconProposer::new();
-        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD {
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
             let id = append_fast(&mut ledger, "Krutrim", clean_motor("Krutrim"));
             let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
             p.note_record(&kept);
@@ -1031,7 +1092,7 @@ mod tests {
         // alone does NOT bypass the linguistic gate.
         let mut ledger = DecisionLedger::new();
         let mut p = LexiconProposer::new();
-        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD + 2 {
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST + 2 {
             let id = append_fast(&mut ledger, "imapc", clean_motor("imapc"));
             let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
             p.note_record(&kept);
@@ -1044,6 +1105,137 @@ mod tests {
             },
             "5 occasions of imapc must still be held — recurrence alone \
              doesn't bypass the linguistic gate"
+        );
+    }
+
+    #[test]
+    fn slow_lane_near_known_held_when_no_web_freq() {
+        // `aduluts` (the user's reported leak): slow lane (candidate
+        // "adults"), clean motor, plausibility well above the floor
+        // by mean bigram, but ZERO Norvig frequency — never seen on
+        // the web. The combined "near-known + no web presence" signal
+        // catches it. Slow-lane proximity must hold here.
+        let mut ledger = DecisionLedger::new();
+        let id = append_slow(
+            &mut ledger,
+            "aduluts",
+            "adults",
+            0.5,
+            Confidence::High,
+            clean_motor("aduluts"),
+        );
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+
+        let mut p = LexiconProposer::new();
+        p.note_record(&kept);
+        let prop = p.get("aduluts").unwrap();
+        assert_eq!(prop.motor_verdict, MotorVerdict::Clean);
+        assert_eq!(prop.proximity, ProximityVerdict::NearKnownEdit2);
+        assert_eq!(
+            prop.norvig_freq, 0,
+            "aduluts must have zero Norvig freq (purely a typo)"
+        );
+        assert_eq!(
+            prop.tier,
+            ProposalTier::Held {
+                reason: HoldReason::NearKnownWord
+            }
+        );
+    }
+
+    #[test]
+    fn slow_lane_near_known_promotes_when_word_has_web_freq() {
+        // `lol` is the counter-example: slow lane (candidate "lot"),
+        // clean motor, near-known — but Norvig freq is 16M (genuine
+        // informal use on the web). The combo signal doesn't fire;
+        // promotion proceeds normally. This is the "informal real
+        // word near a known one" the brief said should still be
+        // promotable.
+        let mut ledger = DecisionLedger::new();
+        let id = append_slow(
+            &mut ledger,
+            "lol",
+            "lot",
+            0.4,
+            Confidence::Medium,
+            clean_motor("lol"),
+        );
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+
+        let mut p = LexiconProposer::new();
+        p.note_record(&kept);
+        let prop = p.get("lol").unwrap();
+        assert!(
+            prop.norvig_freq > 0,
+            "lol has documented web frequency (Norvig 16M)"
+        );
+        // Single occasion → Provisional (slow lane confirmation
+        // threshold is higher; 5 occasions needed for Confirmed).
+        assert_eq!(prop.tier, ProposalTier::Provisional);
+    }
+
+    #[test]
+    fn slow_lane_confirmation_requires_more_occasions_than_fast() {
+        // Same lol case: three occasions still Provisional on slow
+        // lane (would be Confirmed on fast lane). Five occasions
+        // confirm.
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
+            let id = append_slow(
+                &mut ledger,
+                "lol",
+                "lot",
+                0.4,
+                Confidence::Medium,
+                clean_motor("lol"),
+            );
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+        assert_eq!(p.get("lol").unwrap().tier, ProposalTier::Provisional);
+
+        for _ in 0..(CONFIRMED_OCCASIONS_THRESHOLD_SLOW - CONFIRMED_OCCASIONS_THRESHOLD_FAST) {
+            let id = append_slow(
+                &mut ledger,
+                "lol",
+                "lot",
+                0.4,
+                Confidence::Medium,
+                clean_motor("lol"),
+            );
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+        assert_eq!(p.get("lol").unwrap().tier, ProposalTier::Confirmed);
+    }
+
+    #[test]
+    fn two_char_word_held_as_fragment_regardless_of_lane() {
+        // `un` (the user's reported leak): 2 chars. The eligibility
+        // veto holds it as a fragment no matter how many times it
+        // recurs — count never bypasses eligibility.
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_SLOW + 2 {
+            let id = append_slow(
+                &mut ledger,
+                "un",
+                "an",
+                0.6,
+                Confidence::High,
+                clean_motor("un"),
+            );
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+        let prop = p.get("un").unwrap();
+        assert_eq!(
+            prop.tier,
+            ProposalTier::Held {
+                reason: HoldReason::ObviousFragment
+            },
+            "`un` is 2 chars — held as fragment regardless of recurrence count"
         );
     }
 
