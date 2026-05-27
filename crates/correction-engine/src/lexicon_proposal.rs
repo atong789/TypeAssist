@@ -79,6 +79,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::lexicon::Lexicon;
+use crate::linguistic::{linguistic_signal, LinguisticSignal, ProximityVerdict};
 use crate::log::{LogConfidence, LogRecord, Outcome};
 use crate::motor_signal::TokenMotorVerdict;
 
@@ -87,10 +89,14 @@ use crate::motor_signal::TokenMotorVerdict;
 ///
 /// v2 — C5b motor-signal fix: gate reads `token_motor` (candidate
 /// independent) instead of `top_motor_evidence`; dropped the
-/// `HighConfidenceRejection` hold reason (string-distance based,
-/// against the brief's "clean execution outweighs high-confidence
-/// suggestion" rule).
-pub const LEXICON_PROPOSAL_VERSION: u32 = 2;
+/// `HighConfidenceRejection` hold reason.
+///
+/// v3 — C5b linguistic stack: per-word plausibility + proximity
+/// computed at credit time; three new hold reasons (`IllFormed`,
+/// `NearKnownWord`, `SegmentableMerge`). Net fast-lane promotion now
+/// requires motor-clean AND well-formed AND not-near-known AND
+/// not-segmentable AND not-prefix-merge.
+pub const LEXICON_PROPOSAL_VERSION: u32 = 3;
 
 // ---- Tunable PLACEHOLDERS — replace with values from real Observing data --
 
@@ -150,15 +156,29 @@ pub enum MotorVerdict {
 pub enum HoldReason {
     /// Word length below [`MIN_PROMOTABLE_WORD_LEN`]. Likely a
     /// premature-space boundary fragment (e.g. `Soum` from `Soumyo`);
-    /// 5c will reconstruct, 5b just refuses to learn. Not a motor
-    /// signal per se — a structural disqualifier the proposer can't
-    /// reason past at this scale.
+    /// 5c will reconstruct, 5b just refuses to learn.
     ObviousFragment,
     /// Latest occasion's motor signature is slip-like —
-    /// `token_motor.verdict == Slip`. The C5b gate's primary reason
-    /// for holding a word back: clean execution can outweigh anything
-    /// else, slip execution can be outweighed by nothing.
+    /// `token_motor.verdict == Slip`.
     SlipSignature,
+    /// Plausibility below [`crate::linguistic::PLAUSIBILITY_FLOOR`].
+    /// A character-bigram backstop for truly anomalous letter
+    /// sequences (`qzqz`-class). Spatial mangles built from common
+    /// bigrams pass this and are caught by the proximity gates instead.
+    IllFormed,
+    /// A high-frequency known word sits within edit distance ≤ 2
+    /// (`ProximityVerdict::NearKnownEdit2`). The token is a mangle
+    /// of an existing word, not novel vocabulary. Catches `imapc`
+    /// (near `impact`), `potentjual` (near `potential`).
+    NearKnownWord,
+    /// Word splits into 2+ known words (`ProximityVerdict::Segmentable`).
+    /// Catches dropped-space merges like `andthe`, `inthe`.
+    SegmentableMerge,
+    /// Word starts with a high-frequency known prefix and has a
+    /// non-empty suffix (`ProximityVerdict::PrefixMerge`). Softer
+    /// segmentation signal that catches `themach`-class merges
+    /// where the suffix isn't itself a recognized word.
+    PrefixMerge,
 }
 
 /// Where the proposer thinks the word stands right now.
@@ -194,6 +214,16 @@ pub struct LexiconProposal {
     pub last_record_id: u64,
     /// Timestamp (ms since epoch) of the most recent contributing record.
     pub last_seen_ms: u64,
+    /// Mean-log10-probability of the word's character bigrams against
+    /// the bundled SCOWL distribution. Surfaced on the LEXICON panel
+    /// next to the motor verdict so the builder can see the raw
+    /// linguistic read.
+    pub plausibility: f64,
+    /// Proximity verdict: FarFromKnown / NearKnownEdit2 / Segmentable
+    /// / PrefixMerge. The verdict drives the gate (held-vs-promote)
+    /// and is surfaced in the panel so the builder can see WHY each
+    /// non-FarFromKnown verdict fired.
+    pub proximity: ProximityVerdict,
     /// Wire shape version. See [`LEXICON_PROPOSAL_VERSION`].
     pub version: u32,
 }
@@ -218,10 +248,29 @@ struct RecordContribution {
 /// In-memory lexicon-learning proposer. Owned by the engine; reset on
 /// engine restart by design. Phase 2 persistence will swap the storage
 /// behind it.
-#[derive(Debug, Default)]
+///
+/// Holds a static reference to the shared [`Lexicon`] so the
+/// linguistic gate has the dictionary it needs at credit time.
+/// Constructed via [`Self::new`] (defaults to `Lexicon::shared`).
 pub struct LexiconProposer {
     proposals: HashMap<String, LexiconProposal>,
     record_contributions: HashMap<u64, RecordContribution>,
+    lex: &'static Lexicon,
+}
+
+impl std::fmt::Debug for LexiconProposer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LexiconProposer")
+            .field("proposals", &self.proposals.len())
+            .field("record_contributions", &self.record_contributions.len())
+            .finish()
+    }
+}
+
+impl Default for LexiconProposer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Result of a [`LexiconProposer::note_record`] call. Carries either
@@ -242,7 +291,11 @@ pub enum ProposalUpdate {
 
 impl LexiconProposer {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            proposals: HashMap::new(),
+            record_contributions: HashMap::new(),
+            lex: Lexicon::shared(),
+        }
     }
 
     /// All current proposals, ordered by most-recently-touched first.
@@ -344,12 +397,17 @@ impl LexiconProposer {
         let word = record.original_text.clone();
         let lane = lane_for(record);
         let motor_verdict = motor_verdict_for(record);
-        // Panel surface: the slip_score from the per-token signal —
-        // populated for fast-lane records (where top_motor_evidence
-        // was None and the m·ev column rendered blank).
         let last_motor_evidence = slip_score_for(record);
         let last_record_id = record.id;
         let last_seen_ms = record.timestamp_ms;
+        // Compute the linguistic signal once per credited record
+        // against the proposer's stored lexicon. Cached on the
+        // proposal so subsequent ticks don't recompute.
+        let LinguisticSignal {
+            plausibility,
+            well_formed: _,
+            proximity,
+        } = linguistic_signal(&word, self.lex);
 
         let entry = self.proposals.entry(word.clone()).or_insert_with(|| {
             LexiconProposal {
@@ -361,6 +419,8 @@ impl LexiconProposer {
                 last_motor_evidence,
                 last_record_id,
                 last_seen_ms,
+                plausibility,
+                proximity,
                 version: LEXICON_PROPOSAL_VERSION,
             }
         });
@@ -371,7 +431,16 @@ impl LexiconProposer {
         entry.last_motor_evidence = last_motor_evidence;
         entry.last_record_id = last_record_id;
         entry.last_seen_ms = last_seen_ms;
-        entry.tier = recompute_tier(&entry.word, &entry.lane, entry.motor_verdict, entry.occasions);
+        entry.plausibility = plausibility;
+        entry.proximity = proximity;
+        entry.tier = recompute_tier(
+            &entry.word,
+            &entry.lane,
+            entry.motor_verdict,
+            entry.plausibility,
+            entry.proximity,
+            entry.occasions,
+        );
     }
 
     fn retract_kept_contribution(&mut self, word: &str) {
@@ -384,7 +453,14 @@ impl LexiconProposer {
             if p.occasions == 0 {
                 should_remove = true;
             } else {
-                p.tier = recompute_tier(&p.word, &p.lane, p.motor_verdict, p.occasions);
+                p.tier = recompute_tier(
+                    &p.word,
+                    &p.lane,
+                    p.motor_verdict,
+                    p.plausibility,
+                    p.proximity,
+                    p.occasions,
+                );
             }
         }
         if should_remove {
@@ -431,42 +507,75 @@ fn slip_score_for(record: &LogRecord) -> Option<f64> {
     record.token_motor.map(|s| s.slip_score)
 }
 
-/// Decide the tier given lane + motor verdict + occasions. Pure
-/// function — the proposer state is just bookkeeping around this.
+/// Decide the tier from the stacked motor + linguistic gates plus
+/// occasion count.
 ///
-/// **Held is motor-only.** The lane is *informational* — it tells the
-/// builder which track a word is on — but it never holds a word.
-/// String distance to a known word, rejected-suggestion confidence,
-/// or any other lexicon-shape signal does not gate on its own. Only
-/// the motor signature (or the structural fragment disqualifier)
-/// holds.
+/// **Held reasons** (in order of evaluation; first match wins so the
+/// reported reason is the *most specific* signal):
+///   1. `ObviousFragment` — word too short to reason about.
+///   2. `SlipSignature` — motor-clean execution required.
+///   3. `IllFormed` — bigram plausibility below the floor.
+///   4. `SegmentableMerge` — strictly splits into 2+ known words.
+///   5. `PrefixMerge` — high-freq known prefix + non-empty suffix.
+///   6. `NearKnownWord` — within edit-2 of a high-freq known word.
+///
+/// Net: a Kept must clear motor AND linguistic to promote.
+/// Recurrence (multiple occasions) does NOT bypass any gate — a
+/// systematic recurring mangle still holds. The same gates apply on
+/// both lanes; slow-lane proximity is implicit (it has a candidate
+/// by definition), but a Slow-lane Kept on an ill-formed token
+/// still holds.
+#[allow(clippy::too_many_arguments)]
 fn recompute_tier(
     word: &str,
-    _lane: &Lane,
+    lane: &Lane,
     motor_verdict: MotorVerdict,
+    plausibility: f64,
+    proximity: ProximityVerdict,
     occasions: u32,
 ) -> ProposalTier {
-    // Gate 1: obvious fragments — single-character tokens are
-    // overwhelmingly premature-space breaks; we refuse to learn them.
-    // (Empty would also fall here, but the tokenizer rejects empty
-    // cores upstream.) Structural disqualifier, not a motor signal,
-    // but functionally equivalent: "we can't reason about this token."
     if word.chars().count() < MIN_PROMOTABLE_WORD_LEN {
         return ProposalTier::Held {
             reason: HoldReason::ObviousFragment,
         };
     }
-
-    // Gate 2: slip signature — the one and only motor-based hold.
-    // "If the fingers did it cleanly, he meant it" — even rejecting
-    // a HIGH-confidence suggestion promotes when token_motor is Clean.
     if matches!(motor_verdict, MotorVerdict::Slip) {
         return ProposalTier::Held {
             reason: HoldReason::SlipSignature,
         };
     }
-
-    // Gate 3: enough occasions → Confirmed; otherwise Provisional.
+    if plausibility < crate::linguistic::PLAUSIBILITY_FLOOR {
+        return ProposalTier::Held {
+            reason: HoldReason::IllFormed,
+        };
+    }
+    // Segmentation and prefix-merge fire on BOTH lanes — a slow-lane
+    // Kept that happens to be a dropped-space merge is just as much a
+    // mangling as a fast-lane one.
+    match proximity {
+        ProximityVerdict::Segmentable => {
+            return ProposalTier::Held {
+                reason: HoldReason::SegmentableMerge,
+            };
+        }
+        ProximityVerdict::PrefixMerge => {
+            return ProposalTier::Held {
+                reason: HoldReason::PrefixMerge,
+            };
+        }
+        ProximityVerdict::NearKnownEdit2 => {
+            // Slow lane already has a candidate at edit-1; the proximity
+            // gate would double-fire on it. Only hold on fast lane,
+            // where NearKnownEdit2 means "the engine had no theory of
+            // what you meant, but a high-freq word sits 2 edits away."
+            if matches!(lane, Lane::Fast) {
+                return ProposalTier::Held {
+                    reason: HoldReason::NearKnownWord,
+                };
+            }
+        }
+        ProximityVerdict::FarFromKnown => {}
+    }
     if occasions >= CONFIRMED_OCCASIONS_THRESHOLD {
         ProposalTier::Confirmed
     } else {
@@ -826,10 +935,154 @@ mod tests {
         assert_eq!(prop.occasions, 1);
     }
 
+    // ---- Linguistic gate (calibration corpus) --------------------------
+    //
+    // The motor gate alone was leaking garbage from natural typing —
+    // `themach` / `imapc` / `potentjual` all "clean / 0.00" reached
+    // Provisional. These tests deterministically pin the linguistic
+    // stack's job: a real novel name promotes; a spatial mangle, a
+    // dropped-space merge, and a high-frequency-prefix merge all
+    // HELD despite clean motor.
+
+    #[test]
+    fn novel_name_with_clean_motor_promotes_provisional() {
+        // Soumyo: not in SCOWL, not in seed, not near a high-freq
+        // known word, not segmentable. Net: FarFromKnown +
+        // well-formed + clean motor → Provisional.
+        let mut ledger = DecisionLedger::new();
+        let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+
+        let mut p = LexiconProposer::new();
+        p.note_record(&kept);
+        let prop = p.get("Soumyo").unwrap();
+        assert_eq!(prop.proximity, ProximityVerdict::FarFromKnown);
+        assert_eq!(prop.tier, ProposalTier::Provisional);
+    }
+
+    #[test]
+    fn spatial_mangle_held_near_known_word_despite_clean_motor() {
+        // imapc is edit-2 of `impact` (61M-freq). Clean motor doesn't
+        // override; held(NearKnownWord).
+        let mut ledger = DecisionLedger::new();
+        let id = append_fast(&mut ledger, "imapc", clean_motor("imapc"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+
+        let mut p = LexiconProposer::new();
+        p.note_record(&kept);
+        let prop = p.get("imapc").unwrap();
+        assert_eq!(prop.motor_verdict, MotorVerdict::Clean);
+        assert_eq!(prop.proximity, ProximityVerdict::NearKnownEdit2);
+        assert_eq!(
+            prop.tier,
+            ProposalTier::Held {
+                reason: HoldReason::NearKnownWord
+            }
+        );
+    }
+
+    #[test]
+    fn dropped_space_merge_held_segmentable_despite_clean_motor() {
+        // andthe: `and`+`the`, both high-freq → strictly segmentable.
+        let mut ledger = DecisionLedger::new();
+        let id = append_fast(&mut ledger, "andthe", clean_motor("andthe"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+
+        let mut p = LexiconProposer::new();
+        p.note_record(&kept);
+        let prop = p.get("andthe").unwrap();
+        assert_eq!(prop.motor_verdict, MotorVerdict::Clean);
+        assert_eq!(prop.proximity, ProximityVerdict::Segmentable);
+        assert_eq!(
+            prop.tier,
+            ProposalTier::Held {
+                reason: HoldReason::SegmentableMerge
+            }
+        );
+    }
+
+    #[test]
+    fn prefix_merge_held_themach_despite_clean_motor() {
+        // themach: `the` high-freq prefix + `mach` (not in SCOWL) →
+        // prefix-merge.
+        let mut ledger = DecisionLedger::new();
+        let id = append_fast(&mut ledger, "themach", clean_motor("themach"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+
+        let mut p = LexiconProposer::new();
+        p.note_record(&kept);
+        let prop = p.get("themach").unwrap();
+        assert_eq!(prop.motor_verdict, MotorVerdict::Clean);
+        assert_eq!(prop.proximity, ProximityVerdict::PrefixMerge);
+        assert_eq!(
+            prop.tier,
+            ProposalTier::Held {
+                reason: HoldReason::PrefixMerge
+            }
+        );
+    }
+
+    #[test]
+    fn systematic_recurring_mangle_does_not_promote_on_recurrence() {
+        // The C5b brief: "a systematic slip recurs too, but it carries
+        // its signature every time." Three Kept occasions of `imapc`
+        // would otherwise hit Confirmed — but each occasion carries
+        // the near-known signature, so each one holds. Recurrence
+        // alone does NOT bypass the linguistic gate.
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD + 2 {
+            let id = append_fast(&mut ledger, "imapc", clean_motor("imapc"));
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+        let prop = p.get("imapc").unwrap();
+        assert_eq!(
+            prop.tier,
+            ProposalTier::Held {
+                reason: HoldReason::NearKnownWord
+            },
+            "5 occasions of imapc must still be held — recurrence alone \
+             doesn't bypass the linguistic gate"
+        );
+    }
+
+    #[test]
+    fn slow_lane_segmentable_held_despite_clean_motor() {
+        // The user's tightening on the slow lane: an ill-formed or
+        // near-known kept-despite-suggestion word shouldn't confirm on
+        // recurrence alone. Use `andthe` — a slow-lane record where
+        // some candidate exists but the linguistic gate still
+        // identifies it as a merge.
+        let mut ledger = DecisionLedger::new();
+        let id = append_slow(
+            &mut ledger,
+            "andthe",
+            "another", // a plausible candidate
+            0.2,
+            Confidence::Low,
+            clean_motor("andthe"),
+        );
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+
+        let mut p = LexiconProposer::new();
+        p.note_record(&kept);
+        let prop = p.get("andthe").unwrap();
+        assert_eq!(prop.motor_verdict, MotorVerdict::Clean);
+        assert_eq!(
+            prop.tier,
+            ProposalTier::Held {
+                reason: HoldReason::SegmentableMerge
+            },
+            "slow-lane segmentation must hold the same way fast lane does"
+        );
+    }
+
     // ---- snapshot ordering ---------------------------------------------
 
     #[test]
     fn snapshot_orders_by_most_recent_first() {
+        let _lex = Lexicon::shared();
         let mut ledger = DecisionLedger::new();
         let mut p = LexiconProposer::new();
         let id1 = ledger.append(

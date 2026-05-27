@@ -20,6 +20,7 @@ pub mod decision;
 pub mod keyboard;
 pub mod lexicon;
 pub mod lexicon_proposal;
+pub mod linguistic;
 pub mod log;
 pub mod motor_signal;
 pub mod resolver;
@@ -35,6 +36,10 @@ pub use lexicon::{Lexicon, LEXICON_VERSION};
 pub use lexicon_proposal::{
     HoldReason, Lane, LexiconProposal, LexiconProposer, MotorVerdict, ProposalTier,
     ProposalUpdate, LEXICON_PROPOSAL_VERSION,
+};
+pub use linguistic::{
+    is_well_formed, linguistic_signal, plausibility, proximity_verdict, LinguisticSignal,
+    ProximityVerdict, MAX_PROXIMITY_LEN, PLAUSIBILITY_FLOOR,
 };
 pub use log::{
     has_motor_evidence, should_log, DecisionLedger, LogConfidence, LogRecord, Outcome,

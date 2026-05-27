@@ -129,6 +129,13 @@ impl Lexicon {
         LEX.get_or_init(Lexicon::load)
     }
 
+    /// Iterate every word in the clean membership set — lowercase, no
+    /// guaranteed order. Used by C5b's bigram plausibility model to
+    /// build its frequency table at module load. Not for hot-path use.
+    pub fn iter_clean(&self) -> impl Iterator<Item = &str> {
+        self.clean.iter().map(|s| s.as_str())
+    }
+
     /// True iff the word is a member of the clean spelling dictionary or
     /// the seed fixture. Frequency is *not* consulted — a corpus typo like
     /// `teh` with millions of web occurrences is still unknown. Case-

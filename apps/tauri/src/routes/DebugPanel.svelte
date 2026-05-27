@@ -286,15 +286,31 @@
     | { kind: "fast" }
     | { kind: "slow"; rejected_confidence: LogConfidence };
   type MotorVerdict = "clean" | "mixed" | "slip" | "unknown";
-  /// Mirrors the v2 `HoldReason` after the C5b motor-fix —
-  /// `high_confidence_rejection` is gone (string-distance based,
-  /// against "clean execution outweighs high-conf suggestion").
-  type HoldReason = "obvious_fragment" | "slip_signature";
+  /// Mirrors the v3 `HoldReason` after the linguistic-gate stack.
+  /// Held is "this token's execution looks slip-like OR this token
+  /// is structurally unlike novel vocabulary" — motor + linguistic
+  /// signals, never lane-only.
+  type HoldReason =
+    | "obvious_fragment"
+    | "slip_signature"
+    | "ill_formed"
+    | "near_known_word"
+    | "segmentable_merge"
+    | "prefix_merge";
+  /// Mirrors `correction_engine::linguistic::ProximityVerdict`.
+  type ProximityVerdict =
+    | "far_from_known"
+    | "near_known_edit2"
+    | "segmentable"
+    | "prefix_merge";
   type ProposalTier =
     | { kind: "held"; reason: HoldReason }
     | { kind: "provisional" }
     | { kind: "confirmed" };
   /// Mirrors `correction_engine::lexicon_proposal::LexiconProposal`.
+  /// v3 adds `plausibility` (bigram log10-prob mean) and `proximity`
+  /// (verdict from the linguistic gate). Panel renders both so the
+  /// builder can see why each word holds or promotes.
   type LexiconProposal = {
     word: string;
     lane: Lane;
@@ -304,6 +320,8 @@
     last_motor_evidence: number | null;
     last_record_id: number;
     last_seen_ms: number;
+    plausibility: number;
+    proximity: ProximityVerdict;
     version: number;
   };
   /// Mirrors the `LexiconProposalEvent` engine payload — proposal=null
@@ -772,7 +790,30 @@
         return "fragment";
       case "slip_signature":
         return "slip";
+      case "ill_formed":
+        return "ill-formed";
+      case "near_known_word":
+        return "near-known";
+      case "segmentable_merge":
+        return "segment";
+      case "prefix_merge":
+        return "prefix-merge";
     }
+  }
+  function fmtProximity(p: ProximityVerdict): string {
+    switch (p) {
+      case "far_from_known":
+        return "far";
+      case "near_known_edit2":
+        return "near-edit2";
+      case "segmentable":
+        return "segment";
+      case "prefix_merge":
+        return "prefix";
+    }
+  }
+  function fmtPlausibility(p: number): string {
+    return p.toFixed(2);
   }
   function fmtProposalTier(t: ProposalTier): string {
     switch (t.kind) {
@@ -1159,6 +1200,8 @@
                 <span class="col-lxl">lane</span>
                 <span class="col-lxm">motor</span>
                 <span class="col-lxs num" title="slip_score from the per-token motor signal: fraction of chars in span whose dwell ≤ graze threshold (≤30ms). 0.00 = all clean. 1.00 = all graze.">slip</span>
+                <span class="col-lxp num" title="Mean log10-probability of the word's character bigrams against the SCOWL distribution. Negative; higher = more well-formed. Below PLAUSIBILITY_FLOOR → Held(ill-formed).">plaus</span>
+                <span class="col-lxx" title="Proximity verdict: far / near-edit2 / segment / prefix. Any non-far value holds the proposal.">prox</span>
                 <span class="col-lxt">tier</span>
                 <span class="col-lxo num">×</span>
               </div>
@@ -1172,6 +1215,8 @@
                   <span class="col-lxl">{fmtLane(p.lane)}</span>
                   <span class="col-lxm lex-motor-{p.motor_verdict}">{fmtMotorVerdict(p.motor_verdict)}</span>
                   <span class="col-lxs num">{fmtMotorEvidence(p.last_motor_evidence)}</span>
+                  <span class="col-lxp num">{fmtPlausibility(p.plausibility)}</span>
+                  <span class="col-lxx lex-prox-{p.proximity}">{fmtProximity(p.proximity)}</span>
                   <span class="col-lxt">{fmtProposalTier(p.tier)}</span>
                   <span class="col-lxo num">{p.occasions}</span>
                 </div>
@@ -1935,7 +1980,15 @@
   }
   .lex-row {
     display: grid;
-    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.4fr) 56px 52px minmax(0, 1.4fr) 36px;
+    grid-template-columns:
+      minmax(0, 1.2fr) /* word */
+      minmax(0, 1.2fr) /* lane */
+      52px            /* motor */
+      48px            /* slip */
+      52px            /* plaus */
+      80px            /* prox */
+      minmax(0, 1.4fr) /* tier */
+      32px;           /* × */
     column-gap: 0.5rem;
     align-items: baseline;
     padding: 0.2rem 0.75rem;
@@ -1982,6 +2035,14 @@
   .lex-motor-mixed  { color: #d2c87b; font-weight: 600; }
   .lex-motor-slip   { color: #d2885d; font-weight: 600; }
   .lex-motor-unknown { color: #7f8a96; }
+  /* Proximity-verdict colors: far = green (clear to promote);
+     non-far = warning shades (a gate would fire). */
+  .col-lxp { color: #8aa1b8; }
+  .col-lxx { color: #d5d5d5; }
+  .lex-prox-far_from_known   { color: #6ea76e; }
+  .lex-prox-near_known_edit2 { color: #d2885d; font-weight: 600; }
+  .lex-prox-segmentable      { color: #d2885d; font-weight: 600; }
+  .lex-prox-prefix_merge     { color: #d2c87b; font-weight: 600; }
 
   /* SLIPS section header annotation for the C5b L3-map kill-switch.
      Bright when live, dim/warning when off. */
