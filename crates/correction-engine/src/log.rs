@@ -152,12 +152,18 @@ pub struct LogRecord {
     /// the `WouldCorrect` arm (with `suggested` + confidence + score) or
     /// the `LeaveAlone` arm (with `reason`).
     pub decision: DecisionOutcome,
-    /// Engine's top candidate text. `Some` for `WouldCorrect`;
-    /// `None` for any `LeaveAlone` arm (including `NoCandidates`).
+    /// Engine's top candidate text — the strongest edit-1 neighbour the
+    /// score pass turned up, **regardless of whether the mode acted on
+    /// it**. Present whenever `score_candidates` produced at least one
+    /// candidate; `None` only for `LeaveAlone(NoCandidates)`. The
+    /// resolver matches the user's post-edit text against this string
+    /// to attribute `CorrectedToSuggestion` — crucially, that includes
+    /// the `LeaveAlone(BelowActiveTier)` arm where the mode declined to
+    /// suggest but the candidate was right anyway.
     pub top_candidate: Option<String>,
     /// Engine's top candidate raw score. Same nullability as
-    /// `top_candidate`: present on `WouldCorrect`, absent on
-    /// `LeaveAlone`. C5 uses this to weight learning later.
+    /// `top_candidate`: present whenever a candidate existed, absent
+    /// only when none did. C5 uses this to weight learning later.
     pub top_score: Option<f64>,
     /// 4-state confidence band. See [`LogConfidence`]. Always present —
     /// `BelowFloor` covers both "below floor" and "no candidate".
@@ -241,24 +247,31 @@ impl DecisionLedger {
     /// **Always writes [`Outcome::Pending`]** — the C4 contract. The
     /// caller is responsible for the upstream gating ([`should_log`] +
     /// [`has_motor_evidence`]); this method does not re-check them.
+    ///
+    /// `top_candidate` and `top_score` are sourced from the engine's
+    /// **score report**, not from the decision arm. They carry the
+    /// strongest edit-1 neighbour the engine identified for this word,
+    /// **independent of whether the mode chose to act on it**. This is
+    /// the load-bearing change from C5a: a `LeaveAlone(BelowActiveTier)`
+    /// decision still carries the candidate, so the resolver can
+    /// classify `CorrectedToSuggestion` when the user lands on the
+    /// candidate Cautious wouldn't have suggested. Pass `None`/`None`
+    /// only when the score report had no candidates at all.
+    #[allow(clippy::too_many_arguments)]
     pub fn append(
         &mut self,
         timestamp_ms: u64,
         decision: DecisionOutcome,
         anchor_id: u32,
         active_tier: ConfidenceTier,
+        top_candidate: Option<String>,
+        top_score: Option<f64>,
         top_confidence: Option<Confidence>,
     ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
 
         let original_text = decision.original().to_string();
-        let (top_candidate, top_score) = match &decision {
-            DecisionOutcome::WouldCorrect {
-                suggested, score, ..
-            } => (Some(suggested.clone()), Some(*score)),
-            DecisionOutcome::LeaveAlone { .. } => (None, None),
-        };
         let confidence = LogConfidence::from_optional(top_confidence);
 
         let record = LogRecord {
@@ -494,11 +507,45 @@ mod tests {
 
     // ---- DecisionLedger basics ------------------------------------------
 
+    /// Convenience for tests: append a `WouldCorrect`-shaped record and
+    /// also populate the matching candidate/score on the record (mirrors
+    /// what engine.rs does — sourced from the score report, not the
+    /// decision arm).
+    #[allow(clippy::too_many_arguments)]
+    fn append_would_correct(
+        ledger: &mut DecisionLedger,
+        timestamp_ms: u64,
+        original: &str,
+        suggested: &str,
+        score: f64,
+        anchor_id: u32,
+        tier: ConfidenceTier,
+        conf: Confidence,
+    ) -> u64 {
+        ledger.append(
+            timestamp_ms,
+            would_correct(original, suggested, score),
+            anchor_id,
+            tier,
+            Some(suggested.to_string()),
+            Some(score),
+            Some(conf),
+        )
+    }
+
     #[test]
     fn append_initialises_outcome_to_pending() {
         let mut ledger = DecisionLedger::new();
-        let d = would_correct("teh", "the", 0.82);
-        let id = ledger.append(1_000, d, 42, ConfidenceTier::Cautious, Some(Confidence::High));
+        let id = append_would_correct(
+            &mut ledger,
+            1_000,
+            "teh",
+            "the",
+            0.82,
+            42,
+            ConfidenceTier::Cautious,
+            Confidence::High,
+        );
         let rec = ledger.get(id).unwrap();
         assert_eq!(rec.outcome, Outcome::Pending);
         assert_eq!(rec.anchor_id, 42);
@@ -515,37 +562,55 @@ mod tests {
     fn append_for_leave_alone_no_candidates_sets_below_floor_band() {
         let mut ledger = DecisionLedger::new();
         let d = leave_alone("Soumyo", LeaveAloneReason::NoCandidates);
-        let id = ledger.append(2_000, d, 7, ConfidenceTier::Balanced, None);
+        // NoCandidates is the only arm where the score report had
+        // nothing — `top_candidate` / `top_score` are legitimately
+        // `None` here.
+        let id = ledger.append(2_000, d, 7, ConfidenceTier::Balanced, None, None, None);
         let rec = ledger.get(id).unwrap();
-        // No candidate → no top fields, band is BelowFloor.
         assert!(rec.top_candidate.is_none());
         assert!(rec.top_score.is_none());
         assert_eq!(rec.confidence, LogConfidence::BelowFloor);
     }
 
     #[test]
+    fn append_for_leave_alone_with_candidate_keeps_candidate() {
+        // C5a load-bearing: a `LeaveAlone(BelowActiveTier)` decision
+        // **still carries the candidate** so the resolver can attribute
+        // `CorrectedToSuggestion` when the user lands on a suggestion
+        // the mode wouldn't have fired. This is the change that fixes
+        // the "bullon → bullion" misclassification: the engine knows
+        // the candidate, only the mode declined to act.
+        let mut ledger = DecisionLedger::new();
+        let d = leave_alone("bullon", LeaveAloneReason::BelowActiveTier);
+        let id = ledger.append(
+            0,
+            d,
+            1,
+            ConfidenceTier::Cautious,
+            Some("bullion".to_string()),
+            Some(0.47),
+            Some(Confidence::Medium),
+        );
+        let rec = ledger.get(id).unwrap();
+        assert_eq!(rec.top_candidate.as_deref(), Some("bullion"));
+        assert_eq!(rec.top_score, Some(0.47));
+        assert_eq!(rec.confidence, LogConfidence::Medium);
+        // Decision arm is still `LeaveAlone` — the candidate is a
+        // *score-report* field, orthogonal to the engine's action.
+        assert!(matches!(rec.decision, DecisionOutcome::LeaveAlone { .. }));
+    }
+
+    #[test]
     fn ids_are_monotonic_across_appends() {
         let mut ledger = DecisionLedger::new();
-        let id0 = ledger.append(
-            0,
-            would_correct("a", "an", 0.6),
-            1,
-            ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+        let id0 = append_would_correct(
+            &mut ledger, 0, "a", "an", 0.6, 1, ConfidenceTier::Eager, Confidence::Medium,
         );
-        let id1 = ledger.append(
-            0,
-            would_correct("b", "be", 0.6),
-            2,
-            ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+        let id1 = append_would_correct(
+            &mut ledger, 0, "b", "be", 0.6, 2, ConfidenceTier::Eager, Confidence::Medium,
         );
-        let id2 = ledger.append(
-            0,
-            would_correct("c", "cat", 0.6),
-            3,
-            ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+        let id2 = append_would_correct(
+            &mut ledger, 0, "c", "cat", 0.6, 3, ConfidenceTier::Eager, Confidence::Medium,
         );
         assert_eq!((id0, id1, id2), (0, 1, 2));
     }
@@ -555,34 +620,18 @@ mod tests {
     #[test]
     fn capacity_evicts_oldest_when_full() {
         let mut ledger = DecisionLedger::with_capacity(3);
-        let id0 = ledger.append(
-            0,
-            would_correct("a", "an", 0.6),
-            1,
-            ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+        let id0 = append_would_correct(
+            &mut ledger, 0, "a", "an", 0.6, 1, ConfidenceTier::Eager, Confidence::Medium,
         );
-        let id1 = ledger.append(
-            0,
-            would_correct("b", "be", 0.6),
-            2,
-            ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+        let id1 = append_would_correct(
+            &mut ledger, 0, "b", "be", 0.6, 2, ConfidenceTier::Eager, Confidence::Medium,
         );
-        let id2 = ledger.append(
-            0,
-            would_correct("c", "cat", 0.6),
-            3,
-            ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+        let id2 = append_would_correct(
+            &mut ledger, 0, "c", "cat", 0.6, 3, ConfidenceTier::Eager, Confidence::Medium,
         );
         // Capacity full; the next append should evict id0.
-        let id3 = ledger.append(
-            0,
-            would_correct("d", "do", 0.6),
-            4,
-            ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+        let id3 = append_would_correct(
+            &mut ledger, 0, "d", "do", 0.6, 4, ConfidenceTier::Eager, Confidence::Medium,
         );
         assert_eq!(ledger.len(), 3);
         assert!(ledger.get(id0).is_none(), "oldest record should be evicted");
@@ -597,12 +646,15 @@ mod tests {
     fn iter_yields_oldest_first() {
         let mut ledger = DecisionLedger::with_capacity(3);
         for i in 0..3 {
-            ledger.append(
+            append_would_correct(
+                &mut ledger,
                 i,
-                would_correct(&format!("w{i}"), "x", 0.6),
+                &format!("w{i}"),
+                "x",
+                0.6,
                 i as u32,
                 ConfidenceTier::Eager,
-                Some(Confidence::Medium),
+                Confidence::Medium,
             );
         }
         let timestamps: Vec<u64> = ledger.iter().map(|r| r.timestamp_ms).collect();
@@ -614,12 +666,15 @@ mod tests {
     #[test]
     fn resolve_outcome_updates_existing_record() {
         let mut ledger = DecisionLedger::new();
-        let id = ledger.append(
+        let id = append_would_correct(
+            &mut ledger,
             0,
-            would_correct("teh", "the", 0.82),
+            "teh",
+            "the",
+            0.82,
             1,
             ConfidenceTier::Cautious,
-            Some(Confidence::High),
+            Confidence::High,
         );
         assert_eq!(ledger.get(id).unwrap().outcome, Outcome::Pending);
 
@@ -634,12 +689,15 @@ mod tests {
     #[test]
     fn resolve_outcome_returns_false_for_unknown_id() {
         let mut ledger = DecisionLedger::new();
-        ledger.append(
+        append_would_correct(
+            &mut ledger,
             0,
-            would_correct("teh", "the", 0.82),
+            "teh",
+            "the",
+            0.82,
             1,
             ConfidenceTier::Cautious,
-            Some(Confidence::High),
+            Confidence::High,
         );
         assert!(!ledger.resolve_outcome(9999, Outcome::Kept));
     }
@@ -648,26 +706,14 @@ mod tests {
     fn resolve_outcome_returns_false_for_evicted_id() {
         // Capacity 2 — the third append evicts id0; resolve_outcome on it fails.
         let mut ledger = DecisionLedger::with_capacity(2);
-        let id0 = ledger.append(
-            0,
-            would_correct("a", "an", 0.6),
-            1,
-            ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+        let id0 = append_would_correct(
+            &mut ledger, 0, "a", "an", 0.6, 1, ConfidenceTier::Eager, Confidence::Medium,
         );
-        ledger.append(
-            0,
-            would_correct("b", "be", 0.6),
-            2,
-            ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+        append_would_correct(
+            &mut ledger, 0, "b", "be", 0.6, 2, ConfidenceTier::Eager, Confidence::Medium,
         );
-        ledger.append(
-            0,
-            would_correct("c", "cat", 0.6),
-            3,
-            ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+        append_would_correct(
+            &mut ledger, 0, "c", "cat", 0.6, 3, ConfidenceTier::Eager, Confidence::Medium,
         );
         assert!(!ledger.resolve_outcome(id0, Outcome::Kept));
     }

@@ -330,6 +330,16 @@ fn emit_sealed_token<R: Runtime>(
         let outcome = decide(&tok.core, known, &report, ACTIVE_TIER);
         let decide_time_ms = t_decide_start.elapsed().as_secs_f64() * 1000.0;
 
+        // Snapshot what the C5a resolver will need from the score report
+        // BEFORE we move `report.scored` into the panel emission. Sourced
+        // from the report (not the decision arm) so a
+        // `LeaveAlone(BelowActiveTier)` record still carries the
+        // candidate — that's the load-bearing fix for the
+        // "bullon → bullion under Cautious" misclassification.
+        let top_candidate_word = report.scored.first().map(|s| s.word.clone());
+        let top_score_for_log = report.top_score;
+        let top_confidence_for_log = report.top_confidence;
+
         // CANDIDATES only when there's something to show — known words
         // get no candidate set.
         if !known {
@@ -375,7 +385,9 @@ fn emit_sealed_token<R: Runtime>(
                     outcome,
                     anchor_id,
                     ACTIVE_TIER,
-                    report.top_confidence,
+                    top_candidate_word,
+                    top_score_for_log,
+                    top_confidence_for_log,
                 );
                 // Emit the just-appended record. The ledger owns it and
                 // may evict later, but the panel keeps its own copy in
