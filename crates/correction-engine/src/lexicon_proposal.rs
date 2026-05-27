@@ -127,6 +127,33 @@ const CONFIRMED_OCCASIONS_THRESHOLD_FAST: u32 = 3;
 /// less; we want more independent occasions before confirming.
 const CONFIRMED_OCCASIONS_THRESHOLD_SLOW: u32 = 5;
 
+// ---- Casing baseline (relative-to-this-user rescue) -----------------------
+//
+// The all-caps → brand-name rescue is *informative only when all-caps
+// is unusual for this user*. For a habitual all-caps typist (or
+// transient caps-lock burst), every near-known typo looks like an
+// acronym and everything gets rescued. Track the recency-weighted
+// share of all-caps tokens; the rescue fires only when that share is
+// below the threshold AND we've seen enough samples to trust it.
+
+/// Per-token decay applied to both casing weights before incrementing.
+/// 0.99 → half-life ≈ 69 tokens; a 50-token caps-lock burst lifts the
+/// share enough to suppress the rescue, but a return to normal typing
+/// recovers it within another ~100 tokens. **PLACEHOLDER** — tune
+/// from the panel.
+pub const CASING_DECAY_PER_TOKEN: f64 = 0.99;
+
+/// All-caps share strictly below this → rescue active. At-or-above →
+/// rescue suppressed (all-caps too common for the case-signal to
+/// distinguish intent). **PLACEHOLDER**.
+pub const CASING_RESCUE_THRESHOLD: f64 = 0.20;
+
+/// Total sample-weight floor before the share is trusted. While the
+/// total weight is below this, the rescue defaults to ACTIVE — a
+/// brand-new session shouldn't suppress acronym learning from one
+/// stray observation. **PLACEHOLDER**.
+pub const CASING_MIN_SAMPLES: f64 = 5.0;
+
 // ---- Public types ---------------------------------------------------------
 
 /// Which promotion path a candidate word is on. The lane is determined
@@ -207,6 +234,38 @@ pub enum ProposalTier {
     Confirmed,
 }
 
+/// The user's recency-weighted casing baseline + the derived
+/// rescue-active flag. Surfaced on the panel so the signal's state
+/// is visible: a normal-cased user sees `rescue_active: true` and
+/// expects acronym carve-outs; an all-caps user sees it `false` and
+/// understands why their all-caps tokens get the same gates as
+/// lowercase ones.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CasingBaseline {
+    /// Share of sealed Word/Acronym tokens that were all-caps,
+    /// weighted by recency (exponential decay; see
+    /// [`CASING_DECAY_PER_TOKEN`]). `[0.0, 1.0]`. Zero before any
+    /// observations.
+    pub all_caps_share: f64,
+    /// Sum of decayed token weights. Below [`CASING_MIN_SAMPLES`]
+    /// the share is too noisy to use, and the rescue defaults active.
+    pub sample_count: f64,
+    /// `true` iff the all-caps brand-name rescue should fire.
+    /// Lane-independent of any specific proposal.
+    pub rescue_active: bool,
+}
+
+impl CasingBaseline {
+    /// Cold-start default: no observations, rescue active.
+    pub fn cold_start() -> Self {
+        Self {
+            all_caps_share: 0.0,
+            sample_count: 0.0,
+            rescue_active: true,
+        }
+    }
+}
+
 /// One row in the proposal table — everything the panel needs to render
 /// "why would (or wouldn't) this word promote?"
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -282,6 +341,14 @@ pub struct LexiconProposer {
     proposals: HashMap<String, LexiconProposal>,
     record_contributions: HashMap<u64, RecordContribution>,
     lex: &'static Lexicon,
+    /// Recency-weighted count of all-caps (`Acronym`-kind) seals.
+    /// Decayed by [`CASING_DECAY_PER_TOKEN`] on every fresh seal.
+    casing_acronym_weight: f64,
+    /// Recency-weighted count of non-all-caps (`Word`-kind) seals.
+    /// Same decay schedule — both weights decay on every seal regardless
+    /// of which one increments, so the ratio reflects RECENCY, not
+    /// total observations.
+    casing_word_weight: f64,
 }
 
 impl std::fmt::Debug for LexiconProposer {
@@ -321,6 +388,50 @@ impl LexiconProposer {
             proposals: HashMap::new(),
             record_contributions: HashMap::new(),
             lex: Lexicon::shared(),
+            casing_acronym_weight: 0.0,
+            casing_word_weight: 0.0,
+        }
+    }
+
+    /// Observe a sealed `Word` or `Acronym` token for the casing
+    /// baseline. **Called per fresh seal** (not per replay) by the
+    /// engine so backspace rebuilds don't double-count. Includes
+    /// known-word seals — the baseline reflects all of the user's
+    /// real typing, not just unknown words.
+    ///
+    /// Both weights decay before the increment, so the metric is
+    /// the recency-weighted ratio, not raw counts. A 50-token
+    /// caps-lock burst shifts the share enough to suppress the
+    /// rescue; ~100 subsequent normal tokens restore it.
+    pub fn note_token_seal(&mut self, is_acronym: bool) {
+        self.casing_acronym_weight *= CASING_DECAY_PER_TOKEN;
+        self.casing_word_weight *= CASING_DECAY_PER_TOKEN;
+        if is_acronym {
+            self.casing_acronym_weight += 1.0;
+        } else {
+            self.casing_word_weight += 1.0;
+        }
+    }
+
+    /// Current [`CasingBaseline`]. Cold-start (no observations) is
+    /// `rescue_active: true` — a brand-new session shouldn't suppress
+    /// acronym learning. Below [`CASING_MIN_SAMPLES`] total weight the
+    /// share is also treated as untrusted (rescue active). Above the
+    /// floor, `rescue_active` is true iff `all_caps_share` <
+    /// [`CASING_RESCUE_THRESHOLD`].
+    pub fn casing_baseline(&self) -> CasingBaseline {
+        let total = self.casing_acronym_weight + self.casing_word_weight;
+        let share = if total > 0.0 {
+            self.casing_acronym_weight / total
+        } else {
+            0.0
+        };
+        let rescue_active =
+            total < CASING_MIN_SAMPLES || share < CASING_RESCUE_THRESHOLD;
+        CasingBaseline {
+            all_caps_share: share,
+            sample_count: total,
+            rescue_active,
         }
     }
 
@@ -426,17 +537,17 @@ impl LexiconProposer {
         let last_motor_evidence = slip_score_for(record);
         let last_record_id = record.id;
         let last_seen_ms = record.timestamp_ms;
-        // Linguistic signal — plausibility + proximity, computed once
-        // per credited record. The Norvig-frequency lookup is a
-        // separate signal (not derived from the bigram model) — it's
-        // what tells `aduluts`-class typos apart from `lol`-class
-        // informal real words.
+        // Linguistic + casing signals — sampled once per credited
+        // record. casing rescue_active is global (per user, not
+        // per record) but we read it here so the recompute_tier
+        // call sees the latest value.
         let LinguisticSignal {
             plausibility,
             well_formed: _,
             proximity,
         } = linguistic_signal(&word, self.lex);
         let norvig_freq = self.lex.frequency(&word);
+        let rescue_active = self.casing_baseline().rescue_active;
 
         let entry = self.proposals.entry(word.clone()).or_insert_with(|| {
             LexiconProposal {
@@ -471,11 +582,15 @@ impl LexiconProposer {
             entry.plausibility,
             entry.proximity,
             entry.norvig_freq,
+            rescue_active,
             entry.occasions,
         );
     }
 
     fn retract_kept_contribution(&mut self, word: &str) {
+        // Resolve the casing baseline BEFORE the mutable borrow on the
+        // proposal — `casing_baseline()` borrows &self.
+        let rescue_active = self.casing_baseline().rescue_active;
         let mut should_remove = false;
         if let Some(p) = self.proposals.get_mut(word) {
             // Saturating: a previously-credited Kept must have a count
@@ -492,6 +607,7 @@ impl LexiconProposer {
                     p.plausibility,
                     p.proximity,
                     p.norvig_freq,
+                    rescue_active,
                     p.occasions,
                 );
             }
@@ -610,16 +726,17 @@ fn recompute_tier(
     plausibility: f64,
     proximity: ProximityVerdict,
     norvig_freq: u64,
+    rescue_active: bool,
     occasions: u32,
 ) -> ProposalTier {
     // ---- Stage 1: Eligibility (veto) ----
 
-    // Acronym-shape tokens get differentiated gates: the case-signal
-    // ("user deliberately held shift") relaxes both the minimum
-    // length (AI/GM/VP are 2-char acronyms, not fragments) and the
-    // near-known veto (BBMP-class novel acronyms have many short
-    // edit-2 neighbours but are genuine intent).
-    let acronym = is_acronym_shape(word);
+    // Acronym-shape tokens get differentiated gates ONLY when the
+    // user's casing baseline says all-caps is rare for them (`rescue_active`).
+    // A habitual all-caps typist (or a caps-lock burst) makes every typo
+    // look like an acronym; the case-signal isn't informative for them, so
+    // we fall back to the lowercase gates.
+    let acronym = is_acronym_shape(word) && rescue_active;
     let min_len = if acronym {
         MIN_PROMOTABLE_ACRONYM_LEN
     } else {
@@ -1280,6 +1397,179 @@ mod tests {
             },
             "`un` is 2 chars — held as fragment regardless of recurrence count"
         );
+    }
+
+    // ---- Casing baseline (relative-to-this-user) -----------------------
+
+    #[test]
+    fn cold_start_has_rescue_active_and_zero_share() {
+        let p = LexiconProposer::new();
+        let b = p.casing_baseline();
+        assert_eq!(b.all_caps_share, 0.0);
+        assert_eq!(b.sample_count, 0.0);
+        assert!(
+            b.rescue_active,
+            "cold start MUST default rescue active — \
+             a brand-new session shouldn't suppress acronym learning"
+        );
+    }
+
+    #[test]
+    fn normal_typing_keeps_rescue_active() {
+        // 200 word seals, no acronyms → share ≈ 0% → rescue active.
+        let mut p = LexiconProposer::new();
+        for _ in 0..200 {
+            p.note_token_seal(false);
+        }
+        let b = p.casing_baseline();
+        assert!(b.sample_count > CASING_MIN_SAMPLES);
+        assert!(b.all_caps_share < CASING_RESCUE_THRESHOLD);
+        assert!(b.rescue_active);
+    }
+
+    #[test]
+    fn habitual_all_caps_user_suppresses_rescue() {
+        // 200 acronym seals, no words → share = 100% → rescue suppressed.
+        // This is the user the brief specifically warned about (caps
+        // lock on or always-all-caps typist).
+        let mut p = LexiconProposer::new();
+        for _ in 0..200 {
+            p.note_token_seal(true);
+        }
+        let b = p.casing_baseline();
+        assert!(b.all_caps_share > CASING_RESCUE_THRESHOLD);
+        assert!(!b.rescue_active);
+    }
+
+    #[test]
+    fn caps_lock_burst_temporarily_suppresses_then_recovers() {
+        // Start normal (rescue active), do a 50-token caps-lock burst
+        // (rescue should suppress mid-burst), then 100 word tokens
+        // (rescue should recover).
+        let mut p = LexiconProposer::new();
+        // Normal typing baseline.
+        for _ in 0..100 {
+            p.note_token_seal(false);
+        }
+        assert!(p.casing_baseline().rescue_active);
+
+        // Caps-lock burst.
+        for _ in 0..50 {
+            p.note_token_seal(true);
+        }
+        assert!(
+            !p.casing_baseline().rescue_active,
+            "share after 50-acronym burst must exceed threshold \
+             — the rescue should be suppressed DURING the burst \
+             (share = {:.3})",
+            p.casing_baseline().all_caps_share
+        );
+
+        // Return to normal typing.
+        for _ in 0..150 {
+            p.note_token_seal(false);
+        }
+        assert!(
+            p.casing_baseline().rescue_active,
+            "after 150 normal tokens following the burst, decay \
+             should restore rescue (share = {:.3})",
+            p.casing_baseline().all_caps_share
+        );
+    }
+
+    #[test]
+    fn bbmp_promoted_when_user_normally_lowercase() {
+        // Normal user (rescue active) + BBMP → eligible.
+        let mut p = LexiconProposer::new();
+        for _ in 0..100 {
+            p.note_token_seal(false);
+        }
+
+        let mut ledger = DecisionLedger::new();
+        let id = append_fast(&mut ledger, "BBMP", clean_motor("BBMP"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+        p.note_token_seal(true); // BBMP itself counts as one acronym
+        p.note_record(&kept);
+
+        let prop = p.get("BBMP").unwrap();
+        assert_eq!(
+            prop.tier,
+            ProposalTier::Provisional,
+            "BBMP must promote — normal user means rescue is active \
+             and acronym-shape bypasses the near-known + no-web veto"
+        );
+    }
+
+    #[test]
+    fn bbmp_held_when_user_is_habitual_all_caps() {
+        // All-caps user (rescue suppressed) + BBMP → falls back to
+        // word-style gates → near-known + zero Norvig → Held.
+        let mut p = LexiconProposer::new();
+        for _ in 0..200 {
+            p.note_token_seal(true);
+        }
+        assert!(
+            !p.casing_baseline().rescue_active,
+            "precondition: rescue must be suppressed"
+        );
+
+        let mut ledger = DecisionLedger::new();
+        let id = append_fast(&mut ledger, "BBMP", clean_motor("BBMP"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+        p.note_token_seal(true);
+        p.note_record(&kept);
+
+        let prop = p.get("BBMP").unwrap();
+        assert_eq!(
+            prop.tier,
+            ProposalTier::Held {
+                reason: HoldReason::NearKnownWord
+            },
+            "BBMP must be held — for an all-caps user the case-signal \
+             carries no rescue, so the standard near-known + no-web \
+             veto applies"
+        );
+    }
+
+    #[test]
+    fn ai_two_char_acronym_eligible_for_normal_user_held_for_all_caps_user() {
+        // AI (2 chars, all-caps, in Norvig): normal user → eligible
+        // (length-2 carve-out via acronym). All-caps user → fragment
+        // veto fires (carve-out off; MIN_PROMOTABLE_WORD_LEN=3).
+        {
+            let mut p = LexiconProposer::new();
+            for _ in 0..100 {
+                p.note_token_seal(false);
+            }
+            let mut ledger = DecisionLedger::new();
+            let id = append_fast(&mut ledger, "AI", clean_motor("AI"));
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_token_seal(true);
+            p.note_record(&kept);
+            assert!(
+                !matches!(p.get("AI").unwrap().tier, ProposalTier::Held { .. }),
+                "normal user: AI must be eligible"
+            );
+        }
+        {
+            let mut p = LexiconProposer::new();
+            for _ in 0..200 {
+                p.note_token_seal(true);
+            }
+            let mut ledger = DecisionLedger::new();
+            let id = append_fast(&mut ledger, "AI", clean_motor("AI"));
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_token_seal(true);
+            p.note_record(&kept);
+            assert_eq!(
+                p.get("AI").unwrap().tier,
+                ProposalTier::Held {
+                    reason: HoldReason::ObviousFragment
+                },
+                "all-caps user: AI must be a fragment — the case-signal \
+                 carries no information, fall back to word-style gates"
+            );
+        }
     }
 
     // ---- Acronym calibration (all-caps novel tokens) -------------------

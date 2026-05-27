@@ -94,6 +94,12 @@ pub const EVT_LOG_RECORD_UPDATED: &str = "engine://log-record-updated";
 /// back). The LEXICON panel keys its table by `word` and applies the
 /// update in place.
 pub const EVT_LEXICON_PROPOSAL: &str = "engine://lexicon-proposal";
+/// Fired after every fresh Word/Acronym seal: the proposer's casing
+/// baseline (recency-weighted all-caps share + rescue-active flag).
+/// The LEXICON panel renders this in its header so the user can see
+/// whether the all-caps brand-name rescue is currently active. The
+/// signal is global, not per-word.
+pub const EVT_CASING_BASELINE: &str = "engine://casing-baseline";
 
 /// Top-N candidates the engine surfaces per unknown word. Keep small so the
 /// debug panel and any future spatial-scorer aren't paying for a long tail.
@@ -366,6 +372,16 @@ fn emit_sealed_token<R: Runtime>(
         let fresh_id = anchors.try_register(tok.start, tok.end, &tok.core);
         let anchor_id = fresh_id
             .or_else(|| anchors.find_tracking_id(tok.start, tok.end, &tok.core));
+
+        // C5b casing baseline. Count only fresh seals so backspace
+        // replays don't double-count. Includes known-word seals — the
+        // baseline reflects ALL of the user's real typing, which is
+        // exactly the signal we need to decide if all-caps is rare
+        // for them (rescue active) or routine (rescue suppressed).
+        if fresh_id.is_some() {
+            proposer.note_token_seal(matches!(tok.kind, TokenKind::Acronym));
+            let _ = app.emit(EVT_CASING_BASELINE, proposer.casing_baseline());
+        }
 
         let row = lexicon_row_for(&tok.core, lexicon);
         let known = row.known;

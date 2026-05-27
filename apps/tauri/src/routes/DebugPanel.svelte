@@ -307,6 +307,16 @@
     | { kind: "held"; reason: HoldReason }
     | { kind: "provisional" }
     | { kind: "confirmed" };
+  /// Mirrors `correction_engine::lexicon_proposal::CasingBaseline`.
+  /// Recency-weighted typing baseline + the derived rescue-active
+  /// flag. The all-caps brand rescue fires only when this user
+  /// hasn't been doing a lot of all-caps lately.
+  type CasingBaseline = {
+    all_caps_share: number;
+    sample_count: number;
+    rescue_active: boolean;
+  };
+
   /// Mirrors `correction_engine::lexicon_proposal::LexiconProposal`.
   /// v4 adds `norvig_freq` — the typed word's web-corpus frequency
   /// (NOT through is_known). Combined with near-known proximity,
@@ -415,6 +425,15 @@
   /// mirrors the snapshot via per-word update events. Phase 1 is
   /// observe-only: nothing here writes to is_known.
   let lexiconProposals: Record<string, LexiconProposal> = {};
+
+  /// Recency-weighted casing baseline. Updated on every fresh
+  /// Word/Acronym seal — surfaced in the LEXICON header so the
+  /// rescue's current state is visible.
+  let casingBaseline: CasingBaseline = {
+    all_caps_share: 0,
+    sample_count: 0,
+    rescue_active: true,
+  };
 
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
@@ -605,6 +624,14 @@
           const el = document.getElementById("debug-log-tail");
           if (el) el.scrollIntoView({ block: "nearest" });
         });
+      }),
+    );
+    unlistens.push(
+      // Component 5b — casing baseline. Updated on every fresh
+      // Word/Acronym seal; the engine emits the full snapshot each
+      // time, so the panel just replaces wholesale.
+      await listen<CasingBaseline>("engine://casing-baseline", (e) => {
+        casingBaseline = e.payload;
       }),
     );
     unlistens.push(
@@ -1192,7 +1219,16 @@
           {/if}
         </div>
 
-        <div class="model-sub model-sub-sticky">LEXICON · 5b proposals · observe-only · is_known untouched</div>
+        <div class="model-sub model-sub-sticky">
+          LEXICON · 5b proposals · observe-only · is_known untouched ·
+          all-caps <span class="num">{(casingBaseline.all_caps_share * 100).toFixed(0)}%</span>
+          {#if casingBaseline.rescue_active}
+            <span class="casing-rescue-on">rescue ✓</span>
+          {:else}
+            <span class="casing-rescue-off">rescue OFF</span>
+          {/if}
+          <span class="casing-samples">(n={casingBaseline.sample_count.toFixed(0)})</span>
+        </div>
         <div class="lex-block">
           {#if lexiconProposalList.length === 0}
             <div class="empty">no proposals yet…</div>
@@ -2059,6 +2095,12 @@
      shade as near-known proximity so the eye reads the combo at a glance. */
   .col-lxn { color: #8aa1b8; }
   .lex-no-web { color: #d2885d; font-weight: 600; }
+  /* Casing baseline annotation — green when the rescue is firing for
+     this user, amber when suppressed (all-caps is their norm or a
+     burst is in progress). */
+  .casing-rescue-on  { color: #6ea76e; font-weight: 600; }
+  .casing-rescue-off { color: #d2885d; font-weight: 600; }
+  .casing-samples    { color: #7f8a96; }
 
   /* SLIPS section header annotation for the C5b L3-map kill-switch.
      Bright when live, dim/warning when off. */
