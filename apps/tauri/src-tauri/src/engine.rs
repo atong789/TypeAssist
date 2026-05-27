@@ -350,7 +350,14 @@ fn emit_sealed_token<R: Runtime>(
     line_dwells: &[u32],
     proposer: &mut LexiconProposer,
 ) {
-    if matches!(tok.kind, TokenKind::Word) {
+    // C5b acronym fix: route `Acronym` tokens through the same L4
+    // pipeline as `Word`. All-caps product names (UPI, BBMP, ONDC) were
+    // classified as Acronym by the tokenizer and previously skipped
+    // anchoring / decision / ledger / proposer entirely, so they could
+    // never be learned. The decide() pipeline is observe-only — even
+    // if it produces a `WouldCorrect` arm for an acronym, nothing
+    // injects; the panel just sees it.
+    if matches!(tok.kind, TokenKind::Word | TokenKind::Acronym) {
         // Resolve the anchor id BEFORE running the pipeline so a missing
         // id (a real bug, not a normal outcome) shows up next to the
         // decision in the log. Fresh registrations return Some(id);

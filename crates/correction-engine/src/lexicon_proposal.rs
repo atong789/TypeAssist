@@ -101,12 +101,19 @@ pub const LEXICON_PROPOSAL_VERSION: u32 = 4;
 // ---- Tunable PLACEHOLDERS — replace with values from real Observing data --
 
 /// Minimum word length to be eligible for promotion. Two-char unknown
-/// tokens (`un`, `iv`, `qz`) are overwhelmingly typos / fragments of
-/// real words; legitimate 2-char words (`of`, `to`, `is`) are all in
+/// lowercase tokens (`un`, `iv`, `qz`) are overwhelmingly typos /
+/// fragments; legitimate 2-char words (`of`, `to`, `is`) are all in
 /// SCOWL and never reach the proposer. Strictly less than this →
-/// `Held(ObviousFragment)`. Bumped from 2 to 3 after slow-lane
-/// leaks (`un` was reaching Confirmed).
+/// `Held(ObviousFragment)`.
 const MIN_PROMOTABLE_WORD_LEN: usize = 3;
+
+/// Minimum length for **acronym-shape** tokens (all-caps alphabetic).
+/// All-caps `AI` / `GM` / `VP` are intentional 2-char acronyms; the
+/// case carries the "deliberate, not a typo" signal that the
+/// lowercase fragment gate can't see. Tokenizer's Acronym
+/// classification requires length ≥ 2 already, so this aligns the
+/// proposer with the tokenizer.
+const MIN_PROMOTABLE_ACRONYM_LEN: usize = 2;
 
 /// Occasions at which a `Provisional` proposal upgrades to `Confirmed`
 /// on the **fast lane** (no candidate exists — engine has no theory
@@ -533,6 +540,24 @@ fn slip_score_for(record: &LogRecord) -> Option<f64> {
     record.token_motor.map(|s| s.slip_score)
 }
 
+/// Detect an **acronym-shape** original text: all chars uppercase
+/// ASCII alphabetic, length ≥ 2. Mirrors the tokenizer's `Acronym`
+/// classification rule so the proposer's differentiated gates fire
+/// exactly where the tokenizer routed the input as an acronym.
+/// We re-derive from `original_text` rather than carrying TokenKind
+/// on the record — keeps `LogRecord`'s wire shape stable and the
+/// signal is reconstructable losslessly from the string.
+fn is_acronym_shape(text: &str) -> bool {
+    let mut len: usize = 0;
+    for c in text.chars() {
+        if !c.is_ascii_alphabetic() || !c.is_ascii_uppercase() {
+            return false;
+        }
+        len += 1;
+    }
+    len >= 2
+}
+
 /// Decide the tier from the stacked motor + linguistic gates plus
 /// occasion count.
 ///
@@ -589,7 +614,18 @@ fn recompute_tier(
 ) -> ProposalTier {
     // ---- Stage 1: Eligibility (veto) ----
 
-    if word.chars().count() < MIN_PROMOTABLE_WORD_LEN {
+    // Acronym-shape tokens get differentiated gates: the case-signal
+    // ("user deliberately held shift") relaxes both the minimum
+    // length (AI/GM/VP are 2-char acronyms, not fragments) and the
+    // near-known veto (BBMP-class novel acronyms have many short
+    // edit-2 neighbours but are genuine intent).
+    let acronym = is_acronym_shape(word);
+    let min_len = if acronym {
+        MIN_PROMOTABLE_ACRONYM_LEN
+    } else {
+        MIN_PROMOTABLE_WORD_LEN
+    };
+    if word.chars().count() < min_len {
         return ProposalTier::Held {
             reason: HoldReason::ObviousFragment,
         };
@@ -620,9 +656,16 @@ fn recompute_tier(
             // (`lol`, `meh`, etc.) sit near a known word AND have
             // genuine web usage. The combined signal "near-known AND
             // no Norvig presence" is what flags a typo. Both lanes
-            // get this gate — the slow lane's existing candidate is
-            // additional slip evidence, not a free pass.
-            if norvig_freq == 0 {
+            // get this gate.
+            //
+            // **Acronyms bypass this veto.** All-caps product names
+            // (BBMP, ONDC) have near-known edit-2 neighbours by
+            // construction (4-char strings have many edit-2 hits in
+            // a 90k-word dict) but the case signal makes them
+            // deliberate. Trade-off: a caps-lock typo of a real word
+            // (TGE for "the") becomes promotable too — accepted per
+            // the brief's "let all-caps NOVEL tokens be learnable."
+            if norvig_freq == 0 && !acronym {
                 return ProposalTier::Held {
                     reason: HoldReason::NearKnownWord,
                 };
@@ -1237,6 +1280,126 @@ mod tests {
             },
             "`un` is 2 chars — held as fragment regardless of recurrence count"
         );
+    }
+
+    // ---- Acronym calibration (all-caps novel tokens) -------------------
+
+    #[test]
+    fn novel_all_caps_acronym_with_near_known_neighbours_promotes() {
+        // BBMP: 4-char all-caps product name. Near-known (close to
+        // `temp`, `bump`, etc.) but the case-signal says "deliberate
+        // acronym, not typo." Eligible despite near-known + zero
+        // Norvig — that combo only vetoes lowercase tokens.
+        let mut ledger = DecisionLedger::new();
+        let id = append_fast(&mut ledger, "BBMP", clean_motor("BBMP"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+
+        let mut p = LexiconProposer::new();
+        p.note_record(&kept);
+        let prop = p.get("BBMP").unwrap();
+        assert!(
+            !matches!(prop.tier, ProposalTier::Held { .. }),
+            "BBMP must not be held — acronym-shape bypasses the \
+             near-known + no-web veto. Got: {:?}",
+            prop.tier
+        );
+        assert_eq!(prop.tier, ProposalTier::Provisional);
+    }
+
+    #[test]
+    fn two_char_acronym_eligible_while_lowercase_two_char_fragment() {
+        // The user's calibration corpus: AI/GM/VP (2-char acronyms)
+        // must be eligible, while `un` (2-char lowercase) must stay
+        // Held as a fragment. The case-signal is the differentiator.
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+
+        // 2-char acronym: eligible.
+        let id = append_fast(&mut ledger, "AI", clean_motor("AI"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+        p.note_record(&kept);
+        assert!(
+            !matches!(p.get("AI").unwrap().tier, ProposalTier::Held { .. }),
+            "AI (2-char acronym) must not be a fragment"
+        );
+
+        // 2-char lowercase: held as fragment (count never bypasses).
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_SLOW + 2 {
+            let id = append_slow(
+                &mut ledger,
+                "un",
+                "an",
+                0.6,
+                Confidence::High,
+                clean_motor("un"),
+            );
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+        assert_eq!(
+            p.get("un").unwrap().tier,
+            ProposalTier::Held {
+                reason: HoldReason::ObviousFragment
+            }
+        );
+    }
+
+    #[test]
+    fn acronym_is_still_held_on_slip_motor() {
+        // The acronym carve-outs relax length and near-known, NOT
+        // motor. A slip-shaped acronym (caps-lock typo with grazes)
+        // still holds.
+        let mut ledger = DecisionLedger::new();
+        let id = append_fast(&mut ledger, "BBMP", slip_motor("BBMP"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+
+        let mut p = LexiconProposer::new();
+        p.note_record(&kept);
+        assert_eq!(
+            p.get("BBMP").unwrap().tier,
+            ProposalTier::Held {
+                reason: HoldReason::SlipSignature
+            }
+        );
+    }
+
+    #[test]
+    fn acronym_recurrence_confirms_after_threshold() {
+        // Three Kept occasions of UPI (fast lane) → Confirmed.
+        // Acronyms use the same per-lane occasion thresholds as
+        // words; only the eligibility gates differ.
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
+            let id = append_fast(&mut ledger, "UPI", clean_motor("UPI"));
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+        assert_eq!(p.get("UPI").unwrap().tier, ProposalTier::Confirmed);
+    }
+
+    #[test]
+    fn is_acronym_shape_pins_classification() {
+        // Pure unit test of the shape detector — mirrors the
+        // tokenizer's Acronym rule (length ≥ 2, all-caps alphabetic).
+        assert!(is_acronym_shape("AI"));
+        assert!(is_acronym_shape("BBMP"));
+        assert!(is_acronym_shape("ONDC"));
+        assert!(is_acronym_shape("UPI"));
+        assert!(is_acronym_shape("ZAMS"));
+        // Length 1 fails (single letter is too short for the
+        // tokenizer's acronym rule too).
+        assert!(!is_acronym_shape("A"));
+        // Lowercase fails.
+        assert!(!is_acronym_shape("ai"));
+        assert!(!is_acronym_shape("Soumyo"));
+        // Mixed case fails (Soumyo isn't an acronym).
+        assert!(!is_acronym_shape("UPi"));
+        // Empty fails.
+        assert!(!is_acronym_shape(""));
+        // Digits / punctuation fail.
+        assert!(!is_acronym_shape("U2"));
+        assert!(!is_acronym_shape("A.I"));
     }
 
     #[test]

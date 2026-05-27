@@ -398,7 +398,18 @@ mod tests {
     #[ignore]
     fn dump_edit_2_matches_for_calibration_words() {
         let lex = Lexicon::shared();
-        let words = ["Soumyo", "Krutrim", "ZAMS", "imapc", "potentjual"];
+        let words = [
+            "Soumyo",
+            "Krutrim",
+            "ZAMS",
+            "imapc",
+            "potentjual",
+            "UPI",
+            "BBMP",
+            "ONDC",
+            "HTML",
+            "NASA",
+        ];
         for w in &words {
             let lower = w.to_ascii_lowercase();
             let mut hits: Vec<String> = Vec::new();
@@ -416,6 +427,24 @@ mod tests {
                 }
             }
             eprintln!("{:>15} edit-2 known: {:?}", w, hits);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_proximity_verdicts() {
+        let lex = Lexicon::shared();
+        let words = [
+            "Soumyo", "imapc", "potentjual", "themach", "andthe",
+            "UPI", "BBMP", "ONDC", "HTML", "NASA", "AI", "GM", "VP",
+        ];
+        for w in &words {
+            eprintln!(
+                "{:>15} → proximity={:?}  norvig={}",
+                w,
+                proximity_verdict(w, lex),
+                lex.frequency(w)
+            );
         }
     }
 
