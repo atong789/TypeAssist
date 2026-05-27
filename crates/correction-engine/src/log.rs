@@ -54,11 +54,12 @@ use crate::ConfidenceTier;
 /// or the [`Outcome`] / [`LogConfidence`] enums.
 ///
 /// v2 — Component 5a adds [`Outcome::Abandoned`] for the whole-word-delete
-/// terminal state. C4 builds wrote `outcome = Pending` everywhere and never
-/// emitted the new variant; v2 is forward-compatible read-only (older
-/// readers parsing v2 wire records would fail on `abandoned`, but the
-/// ledger is process-memory only — there is no on-disk corpus to migrate).
-pub const LOG_VERSION: u32 = 2;
+/// terminal state.
+///
+/// v3 — Component 5b adds `top_motor_evidence` so the lexicon-learning
+/// proposer can read the C3 motor signal (clean vs slip-like) without
+/// re-fetching the score report.
+pub const LOG_VERSION: u32 = 3;
 
 /// **PLACEHOLDER capacity.** A few hundred records — enough to span a
 /// typical writing session without growing unbounded. Tune from real
@@ -165,6 +166,14 @@ pub struct LogRecord {
     /// `top_candidate`: present whenever a candidate existed, absent
     /// only when none did. C5 uses this to weight learning later.
     pub top_score: Option<f64>,
+    /// **Motor evidence** of the top candidate's edit shape (sub / trans
+    /// / ins / del) — the same `[0, 1]` value C3 uses to justify a
+    /// correction. High = the typed word is a plausible motor slip of
+    /// a real word; low = clean execution (no slip signature matches).
+    /// Component 5b's lexicon proposer reads this to gate promotion:
+    /// slip-signature Kepts are likely uncaught slips of an existing
+    /// word, not new vocabulary. Same nullability as `top_candidate`.
+    pub top_motor_evidence: Option<f64>,
     /// 4-state confidence band. See [`LogConfidence`]. Always present —
     /// `BelowFloor` covers both "below floor" and "no candidate".
     pub confidence: LogConfidence,
@@ -248,15 +257,23 @@ impl DecisionLedger {
     /// caller is responsible for the upstream gating ([`should_log`] +
     /// [`has_motor_evidence`]); this method does not re-check them.
     ///
-    /// `top_candidate` and `top_score` are sourced from the engine's
-    /// **score report**, not from the decision arm. They carry the
-    /// strongest edit-1 neighbour the engine identified for this word,
-    /// **independent of whether the mode chose to act on it**. This is
-    /// the load-bearing change from C5a: a `LeaveAlone(BelowActiveTier)`
-    /// decision still carries the candidate, so the resolver can
-    /// classify `CorrectedToSuggestion` when the user lands on the
-    /// candidate Cautious wouldn't have suggested. Pass `None`/`None`
-    /// only when the score report had no candidates at all.
+    /// `top_candidate`, `top_score`, and `top_motor_evidence` are
+    /// sourced from the engine's **score report**, not from the
+    /// decision arm. They carry the strongest edit-1 neighbour the
+    /// engine identified for this word and that neighbour's motor
+    /// plausibility — **independent of whether the mode chose to act
+    /// on it**. The decoupling is load-bearing for two downstream
+    /// consumers:
+    ///
+    /// * C5a's resolver: classifies `CorrectedToSuggestion` when the
+    ///   user lands on a candidate Cautious wouldn't have suggested.
+    /// * C5b's lexicon proposer: gates promotion of Kept words by the
+    ///   motor signature (high motor_evidence = slip-like → hold;
+    ///   clean = lean intended).
+    ///
+    /// Pass `None`/`None`/`None` only when the score report had no
+    /// candidates at all (e.g. `LeaveAlone(NoCandidates)` for an
+    /// unfamiliar name).
     #[allow(clippy::too_many_arguments)]
     pub fn append(
         &mut self,
@@ -266,6 +283,7 @@ impl DecisionLedger {
         active_tier: ConfidenceTier,
         top_candidate: Option<String>,
         top_score: Option<f64>,
+        top_motor_evidence: Option<f64>,
         top_confidence: Option<Confidence>,
     ) -> u64 {
         let id = self.next_id;
@@ -281,6 +299,7 @@ impl DecisionLedger {
             decision,
             top_candidate,
             top_score,
+            top_motor_evidence,
             confidence,
             anchor_id,
             active_tier,
@@ -510,7 +529,8 @@ mod tests {
     /// Convenience for tests: append a `WouldCorrect`-shaped record and
     /// also populate the matching candidate/score on the record (mirrors
     /// what engine.rs does — sourced from the score report, not the
-    /// decision arm).
+    /// decision arm). Motor evidence defaults to 0.5 (a neutral
+    /// placeholder for tests that don't exercise the motor signal).
     #[allow(clippy::too_many_arguments)]
     fn append_would_correct(
         ledger: &mut DecisionLedger,
@@ -529,6 +549,7 @@ mod tests {
             tier,
             Some(suggested.to_string()),
             Some(score),
+            Some(0.5),
             Some(conf),
         )
     }
@@ -554,6 +575,7 @@ mod tests {
         assert_eq!(rec.original_text, "teh");
         assert_eq!(rec.top_candidate.as_deref(), Some("the"));
         assert_eq!(rec.top_score, Some(0.82));
+        assert_eq!(rec.top_motor_evidence, Some(0.5));
         assert_eq!(rec.confidence, LogConfidence::High);
         assert_eq!(rec.log_version, LOG_VERSION);
     }
@@ -565,10 +587,12 @@ mod tests {
         // NoCandidates is the only arm where the score report had
         // nothing — `top_candidate` / `top_score` are legitimately
         // `None` here.
-        let id = ledger.append(2_000, d, 7, ConfidenceTier::Balanced, None, None, None);
+        let id =
+            ledger.append(2_000, d, 7, ConfidenceTier::Balanced, None, None, None, None);
         let rec = ledger.get(id).unwrap();
         assert!(rec.top_candidate.is_none());
         assert!(rec.top_score.is_none());
+        assert!(rec.top_motor_evidence.is_none());
         assert_eq!(rec.confidence, LogConfidence::BelowFloor);
     }
 
@@ -589,6 +613,7 @@ mod tests {
             ConfidenceTier::Cautious,
             Some("bullion".to_string()),
             Some(0.47),
+            Some(0.55),
             Some(Confidence::Medium),
         );
         let rec = ledger.get(id).unwrap();

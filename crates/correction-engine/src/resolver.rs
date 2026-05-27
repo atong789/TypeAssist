@@ -430,6 +430,15 @@ mod tests {
         top_candidate: Option<&str>,
         top_score: Option<f64>,
     ) -> u64 {
+        // Motor evidence is irrelevant for resolver tests — they
+        // exercise the C5a state machine, not the C5b lexicon
+        // proposer. Default to None when there's no candidate,
+        // 0.5 (neutral) otherwise.
+        let top_motor_evidence = if top_candidate.is_some() {
+            Some(0.5)
+        } else {
+            None
+        };
         ledger.append(
             0,
             decision,
@@ -437,6 +446,7 @@ mod tests {
             ConfidenceTier::Eager,
             top_candidate.map(|s| s.to_string()),
             top_score,
+            top_motor_evidence,
             Some(Confidence::High),
         )
     }

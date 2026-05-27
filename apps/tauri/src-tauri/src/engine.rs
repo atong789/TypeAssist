@@ -26,6 +26,8 @@
 //!   `engine://log-record`          — per appended decision-ledger record (Component 4)
 //!   `engine://log-record-updated`  — outcome transition for a ledger record (Component 5a). Revisable —
 //!                                    the same record id may receive several updates as the user revisits the span.
+//!   `engine://lexicon-proposal`    — per word, the C5b lexicon-learning proposal (lane, motor verdict,
+//!                                    tier, occasions). Observe-only — does not write is_known yet.
 
 use std::time::Instant;
 
@@ -35,8 +37,9 @@ use behavioural_model::{BehaviouralModel, InputEvent};
 use correction_engine::{
     decide, has_motor_evidence, ranked_known_candidates, score_candidates, should_log,
     AnchorTracker, Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome, Lexicon,
-    OutcomeResolver, ScoredCandidate, Token, TokenKind, Tokenizer, ACTIVE_TIER,
-    CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION, SCORE_VERSION,
+    LexiconProposer, OutcomeResolver, ProposalUpdate, ScoredCandidate, Token, TokenKind,
+    Tokenizer, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
+    SCORE_VERSION,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
@@ -83,6 +86,14 @@ pub const EVT_LOG_RECORD: &str = "engine://log-record";
 /// record id may receive multiple updates as the user revisits the
 /// span, and the panel must update in place (look up by `id`).
 pub const EVT_LOG_RECORD_UPDATED: &str = "engine://log-record-updated";
+/// Fired by the Component 5b [`LexiconProposer`] each time a word's
+/// proposal state changes — a Kept resolution credits a contribution,
+/// a revisable transition retracts one, etc. Payload shape:
+/// `{ word: String, proposal: LexiconProposal | null }` — `null` means
+/// the proposal was retracted (its only contributing record rolled
+/// back). The LEXICON panel keys its table by `word` and applies the
+/// update in place.
+pub const EVT_LEXICON_PROPOSAL: &str = "engine://lexicon-proposal";
 
 /// Top-N candidates the engine surfaces per unknown word. Keep small so the
 /// debug panel and any future spatial-scorer aren't paying for a long tail.
@@ -253,26 +264,62 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Run one [`OutcomeResolver`] pass and surface every transition. The
-/// resolver itself is a pure observer — this helper applies the
-/// transitions to the ledger and broadcasts the updated record on
-/// [`EVT_LOG_RECORD_UPDATED`]. Called from every anchor-affecting site:
-/// once a fresh anchor lands (so the debounce timer starts ticking),
-/// and once after each edit that might move a record's outcome.
+/// Payload for [`EVT_LEXICON_PROPOSAL`]. `proposal: None` means the
+/// proposal was retracted (its only contributing record rolled back
+/// under C5a's revisable transitions).
+#[derive(Serialize, Clone)]
+struct LexiconProposalEvent {
+    word: String,
+    proposal: Option<correction_engine::LexiconProposal>,
+}
+
+/// Run one [`OutcomeResolver`] pass and surface every transition,
+/// including the C5b proposer side-effects. The resolver is a pure
+/// observer; this helper:
+///   1. Applies any resolved transitions to the ledger.
+///   2. Broadcasts each updated record on [`EVT_LOG_RECORD_UPDATED`].
+///   3. Re-notes each updated record into the proposer and emits
+///      [`EVT_LEXICON_PROPOSAL`] if the word's proposal changed.
+///
+/// Called from every anchor-affecting site: once a fresh anchor lands
+/// (so the debounce timer starts ticking), and once after each edit
+/// that might move a record's outcome.
 fn tick_resolver<R: Runtime>(
     app: &AppHandle<R>,
     resolver: &mut OutcomeResolver,
     anchors: &AnchorTracker,
     line_buf: &[char],
     ledger: &mut DecisionLedger,
+    proposer: &mut LexiconProposer,
 ) {
     let changes = resolver.tick(now_ms(), anchors.anchors(), line_buf, ledger);
     for (record_id, outcome) in changes {
         if ledger.resolve_outcome(record_id, outcome) {
             if let Some(rec) = ledger.get(record_id).cloned() {
-                let _ = app.emit(EVT_LOG_RECORD_UPDATED, rec);
+                let _ = app.emit(EVT_LOG_RECORD_UPDATED, rec.clone());
+                emit_proposal_change(app, proposer, &rec);
             }
         }
+    }
+}
+
+/// Note a record into the proposer and broadcast the result if the
+/// proposal changed. Called from `tick_resolver` after each C5a
+/// transition AND from the initial Pending append (so the proposer
+/// has a contribution slot to credit on the subsequent transition).
+fn emit_proposal_change<R: Runtime>(
+    app: &AppHandle<R>,
+    proposer: &mut LexiconProposer,
+    record: &correction_engine::LogRecord,
+) {
+    match proposer.note_record(record) {
+        ProposalUpdate::Changed(proposal, word) => {
+            let _ = app.emit(
+                EVT_LEXICON_PROPOSAL,
+                LexiconProposalEvent { word, proposal },
+            );
+        }
+        ProposalUpdate::NoChange => {}
     }
 }
 
@@ -301,6 +348,7 @@ fn emit_sealed_token<R: Runtime>(
     map: &VolatilityMap,
     ledger: &mut DecisionLedger,
     line_dwells: &[u32],
+    proposer: &mut LexiconProposer,
 ) {
     if matches!(tok.kind, TokenKind::Word) {
         // Resolve the anchor id BEFORE running the pipeline so a missing
@@ -330,13 +378,15 @@ fn emit_sealed_token<R: Runtime>(
         let outcome = decide(&tok.core, known, &report, ACTIVE_TIER);
         let decide_time_ms = t_decide_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Snapshot what the C5a resolver will need from the score report
-        // BEFORE we move `report.scored` into the panel emission. Sourced
-        // from the report (not the decision arm) so a
-        // `LeaveAlone(BelowActiveTier)` record still carries the
-        // candidate — that's the load-bearing fix for the
-        // "bullon → bullion under Cautious" misclassification.
+        // Snapshot what the C5a resolver and C5b proposer will need
+        // from the score report BEFORE we move `report.scored` into the
+        // panel emission. All sourced from the report (not the decision
+        // arm) so a `LeaveAlone(BelowActiveTier)` record still carries
+        // the candidate + motor signal. Motor evidence is what C5b
+        // reads to decide "clean vs slip" without re-fetching the
+        // report.
         let top_candidate_word = report.scored.first().map(|s| s.word.clone());
+        let top_motor_for_log = report.scored.first().map(|s| s.motor_evidence);
         let top_score_for_log = report.top_score;
         let top_confidence_for_log = report.top_confidence;
 
@@ -387,13 +437,19 @@ fn emit_sealed_token<R: Runtime>(
                     ACTIVE_TIER,
                     top_candidate_word,
                     top_score_for_log,
+                    top_motor_for_log,
                     top_confidence_for_log,
                 );
                 // Emit the just-appended record. The ledger owns it and
                 // may evict later, but the panel keeps its own copy in
                 // its own bounded list.
                 if let Some(rec) = ledger.get(new_id).cloned() {
-                    let _ = app.emit(EVT_LOG_RECORD, rec);
+                    let _ = app.emit(EVT_LOG_RECORD, rec.clone());
+                    // Seed the proposer with the Pending record so a
+                    // subsequent resolver transition has a contribution
+                    // slot to credit. Pending notes are no-credit but
+                    // they cache the per-record state.
+                    emit_proposal_change(app, proposer, &rec);
                 }
             } else {
                 // Decision passed the gates but the anchor id wasn't
@@ -520,6 +576,15 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
         // Pending until the next key arrives — fine for the debug
         // panel; revisit if real users notice.
         let mut resolver = OutcomeResolver::new();
+        // L4 Observing brief, Component 5b Phase 1: lexicon proposer.
+        // Watches Kept outcomes from the resolver, classifies each
+        // word's promotion lane and motor verdict, and emits per-word
+        // proposals to the debug panel. **Observe-only** this phase —
+        // does NOT touch `lexicon.is_known`. Reacts to revisable
+        // resolver transitions: Kept-then-Corrected retracts the
+        // contribution so a kept-then-corrected word never stays
+        // promoted.
+        let mut proposer = LexiconProposer::new();
         // L4 lexicon (Component 3a). Process-wide singleton — first touch
         // parses the ~50k-entry bundled list; subsequent reads are HashMap
         // lookups. Read-only this slice: scoring/correction come later.
@@ -627,6 +692,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                         model.slip_detector.map(),
                                         &mut ledger,
                                         &line_dwells,
+                                        &mut proposer,
                                     );
                                 }
                             }
@@ -641,6 +707,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                 &anchors,
                                 &line_buf,
                                 &mut ledger,
+                                &mut proposer,
                             );
                             let snap = anchors.snapshot();
                             let _ = app_handle.emit(
@@ -747,6 +814,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                                     model.slip_detector.map(),
                                                     &mut ledger,
                                                     &line_dwells,
+                                                    &mut proposer,
                                                 );
                                             }
                                             line_buf.clear();
@@ -795,6 +863,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                                         model.slip_detector.map(),
                                                         &mut ledger,
                                                         &line_dwells,
+                                                        &mut proposer,
                                                     );
                                                 }
                                             } else {
@@ -819,6 +888,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                                             model.slip_detector.map(),
                                                             &mut ledger,
                                                             &line_dwells,
+                                                            &mut proposer,
                                                         );
                                                     }
                                                 }
@@ -838,6 +908,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                                 &anchors,
                                                 &line_buf,
                                                 &mut ledger,
+                                                &mut proposer,
                                             );
                                             let snap = anchors.snapshot();
                                             let _ = app_handle.emit(

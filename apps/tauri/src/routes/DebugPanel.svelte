@@ -247,7 +247,8 @@
     | { kind: "abandoned" };
   /// Mirrors `correction_engine::log::LogRecord` — one decision ledger
   /// row. The full `decision` is the canonical outcome; `top_candidate`
-  /// / `top_score` are convenience projections for cheap rendering.
+  /// / `top_score` / `top_motor_evidence` are convenience projections
+  /// for cheap rendering — and the C5b proposer's input signal.
   type LogRecord = {
     id: number;
     timestamp_ms: number;
@@ -255,11 +256,46 @@
     decision: DecisionOutcome;
     top_candidate: string | null;
     top_score: number | null;
+    top_motor_evidence: number | null;
     confidence: LogConfidence;
     anchor_id: number;
     active_tier: ConfidenceTier;
     outcome: Outcome;
     log_version: number;
+  };
+
+  // ---- Component 5b — lexicon proposals -------------------------------
+  /// Mirrors `correction_engine::lexicon_proposal::Lane`.
+  type Lane =
+    | { kind: "fast" }
+    | { kind: "slow"; rejected_confidence: LogConfidence };
+  type MotorVerdict = "clean" | "mixed" | "slip" | "unknown";
+  type HoldReason =
+    | "obvious_fragment"
+    | "slip_signature"
+    | "high_confidence_rejection";
+  type ProposalTier =
+    | { kind: "held"; reason: HoldReason }
+    | { kind: "provisional" }
+    | { kind: "confirmed" };
+  /// Mirrors `correction_engine::lexicon_proposal::LexiconProposal`.
+  type LexiconProposal = {
+    word: string;
+    lane: Lane;
+    motor_verdict: MotorVerdict;
+    tier: ProposalTier;
+    occasions: number;
+    last_motor_evidence: number | null;
+    last_record_id: number;
+    last_seen_ms: number;
+    version: number;
+  };
+  /// Mirrors the `LexiconProposalEvent` engine payload — proposal=null
+  /// means the proposal was retracted (all contributing records rolled
+  /// back under C5a's revisable transitions).
+  type LexiconProposalEvent = {
+    word: string;
+    proposal: LexiconProposal | null;
   };
   type ModelSnapshot = {
     timing: { per_key: KeyTimingRow[]; per_finger: FingerTimingRow[] };
@@ -338,6 +374,12 @@
   const MAX_LOG_ROWS = 200;
   let logRows: LogRecord[] = [];
 
+  /// Component 5b lexicon proposals — keyed by word (case-preserved).
+  /// The engine is the source of truth (in-memory only); the panel
+  /// mirrors the snapshot via per-word update events. Phase 1 is
+  /// observe-only: nothing here writes to is_known.
+  let lexiconProposals: Record<string, LexiconProposal> = {};
+
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
 
@@ -412,6 +454,10 @@
     // LOG is session-spanning, but Clear should reset the panel view —
     // the engine's ledger keeps its own copy as the source of truth.
     logRows = [];
+    // Same for LEXICON proposals: engine owns the truth, panel just
+    // mirrors. Clear wipes the local copy; the next proposal event
+    // will repopulate.
+    lexiconProposals = {};
     // Note: Clear only resets the *view*. The L2 model in the backend keeps
     // its own counts — modelRows/fingerRows will repopulate on the next keystroke.
   }
@@ -523,6 +569,21 @@
           const el = document.getElementById("debug-log-tail");
           if (el) el.scrollIntoView({ block: "nearest" });
         });
+      }),
+    );
+    unlistens.push(
+      // Component 5b — per-word proposal updates. proposal=null means
+      // the proposal was retracted; remove from the local map so the
+      // panel matches the engine's state.
+      await listen<LexiconProposalEvent>("engine://lexicon-proposal", (e) => {
+        const { word, proposal } = e.payload;
+        if (proposal === null) {
+          const next = { ...lexiconProposals };
+          delete next[word];
+          lexiconProposals = next;
+        } else {
+          lexiconProposals = { ...lexiconProposals, [word]: proposal };
+        }
       }),
     );
     unlistens.push(
@@ -668,6 +729,53 @@
         return "abandoned";
     }
   }
+  // ---- LEXICON (Component 5b) formatters --------------------------------
+  function fmtLane(l: Lane): string {
+    return l.kind === "fast"
+      ? "fast"
+      : `slow · rejected ${fmtLogConfidence(l.rejected_confidence)}`;
+  }
+  function fmtMotorVerdict(v: MotorVerdict): string {
+    switch (v) {
+      case "clean":
+        return "clean";
+      case "slip":
+        return "slip";
+      case "mixed":
+        return "mixed";
+      case "unknown":
+        return "—";
+    }
+  }
+  function fmtMotorEvidence(m: number | null): string {
+    return m === null ? "—" : m.toFixed(2);
+  }
+  function fmtHoldReason(r: HoldReason): string {
+    switch (r) {
+      case "obvious_fragment":
+        return "fragment";
+      case "slip_signature":
+        return "slip";
+      case "high_confidence_rejection":
+        return "hi-conf rej.";
+    }
+  }
+  function fmtProposalTier(t: ProposalTier): string {
+    switch (t.kind) {
+      case "held":
+        return `held · ${fmtHoldReason(t.reason)}`;
+      case "provisional":
+        return "provisional";
+      case "confirmed":
+        return "confirmed";
+    }
+  }
+  /// Most-recent-first ordering for the LEXICON table. Mirrors the
+  /// Rust-side snapshot() ordering so test reasoning carries over.
+  function sortedProposals(map: Record<string, LexiconProposal>): LexiconProposal[] {
+    return Object.values(map).sort((a, b) => b.last_seen_ms - a.last_seen_ms);
+  }
+  $: lexiconProposalList = sortedProposals(lexiconProposals);
   function fmtRatio(r: number): string {
     return `${r.toFixed(2)}×`;
   }
@@ -1016,6 +1124,44 @@
               {/each}
               <!-- Tail anchor so the listener can scrollIntoView on append. -->
               <div id="debug-log-tail" />
+            </div>
+          {/if}
+        </div>
+
+        <div class="model-sub model-sub-sticky">LEXICON · 5b proposals · observe-only · is_known untouched</div>
+        <div class="lex-block">
+          {#if lexiconProposalList.length === 0}
+            <div class="empty">no proposals yet…</div>
+          {:else}
+            <div class="lex-status">
+              <span class="num">{lexiconProposalList.length}</span> candidate word{lexiconProposalList.length === 1 ? "" : "s"} ·
+              <span class="num">{lexiconProposalList.filter((p) => p.tier.kind === "confirmed").length}</span> confirmed ·
+              <span class="num">{lexiconProposalList.filter((p) => p.tier.kind === "provisional").length}</span> provisional ·
+              <span class="num">{lexiconProposalList.filter((p) => p.tier.kind === "held").length}</span> held
+            </div>
+            <div class="lex-table">
+              <div class="lex-row lex-head">
+                <span class="col-lxw">word</span>
+                <span class="col-lxl">lane</span>
+                <span class="col-lxm">motor</span>
+                <span class="col-lxs num">m·ev</span>
+                <span class="col-lxt">tier</span>
+                <span class="col-lxo num">×</span>
+              </div>
+              {#each lexiconProposalList as p (p.word)}
+                <div
+                  class="lex-row"
+                  class:lex-held={p.tier.kind === "held"}
+                  class:lex-confirmed={p.tier.kind === "confirmed"}
+                >
+                  <span class="col-lxw">{p.word}</span>
+                  <span class="col-lxl">{fmtLane(p.lane)}</span>
+                  <span class="col-lxm lex-motor-{p.motor_verdict}">{fmtMotorVerdict(p.motor_verdict)}</span>
+                  <span class="col-lxs num">{fmtMotorEvidence(p.last_motor_evidence)}</span>
+                  <span class="col-lxt">{fmtProposalTier(p.tier)}</span>
+                  <span class="col-lxo num">{p.occasions}</span>
+                </div>
+              {/each}
             </div>
           {/if}
         </div>
@@ -1748,6 +1894,73 @@
   }
   .col-la { color: #8aa1b8; }
   .col-lx { color: #d5d5d5; }
+
+  /* LEXICON proposals (Component 5b) — same visual family as LOG but its
+     own column shape: word | lane | motor verdict | motor score | tier |
+     occasions. Held rows fade slightly; confirmed rows get a green rail
+     to mirror the "promote" intent. is_known is untouched in Phase 1 — the
+     panel only exposes what the proposer would judge. */
+  .lex-block {
+    padding: 0.25rem 0 0.5rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .lex-status {
+    color: #8893a0;
+    padding: 0.15rem 0.75rem 0.3rem;
+    font-size: 11px;
+  }
+  .lex-table {
+    padding: 0 0 0.2rem;
+  }
+  .lex-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.4fr) 56px 52px minmax(0, 1.4fr) 36px;
+    column-gap: 0.5rem;
+    align-items: baseline;
+    padding: 0.2rem 0.75rem;
+    white-space: nowrap;
+  }
+  .lex-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.25rem;
+    margin-bottom: 0.1rem;
+  }
+  .lex-row:not(.lex-head):nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
+  }
+  .lex-held {
+    opacity: 0.65;
+  }
+  .lex-confirmed {
+    border-left: 2px solid #2e5a2e;
+    padding-left: calc(0.75rem - 2px);
+  }
+  .col-lxw {
+    color: #e6e6e6;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .col-lxl {
+    color: #d5d5d5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .col-lxm { text-align: center; }
+  .col-lxs { color: #8aa1b8; }
+  .col-lxt {
+    color: #d5d5d5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .col-lxo { color: #8aa1b8; }
+  /* Motor-verdict colors mirror the cand-conf badge palette so the eye
+     reads "clean = green-ish, slip = warning" at a glance. */
+  .lex-motor-clean  { color: #6ea76e; font-weight: 600; }
+  .lex-motor-mixed  { color: #d2c87b; font-weight: 600; }
+  .lex-motor-slip   { color: #d2885d; font-weight: 600; }
+  .lex-motor-unknown { color: #7f8a96; }
 
   /* ANCHORS — L4 Observing, Component 2. Sibling of TOKENS; one row per
      live anchor on the current line. Voided rows get a faded look but

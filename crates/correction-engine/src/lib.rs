@@ -19,6 +19,7 @@ pub mod candidates;
 pub mod decision;
 pub mod keyboard;
 pub mod lexicon;
+pub mod lexicon_proposal;
 pub mod log;
 pub mod resolver;
 pub mod score;
@@ -30,6 +31,10 @@ pub use decision::{
     DECISION_VERSION, SEPARATION_MARGIN,
 };
 pub use lexicon::{Lexicon, LEXICON_VERSION};
+pub use lexicon_proposal::{
+    HoldReason, Lane, LexiconProposal, LexiconProposer, MotorVerdict, ProposalTier,
+    ProposalUpdate, LEXICON_PROPOSAL_VERSION,
+};
 pub use log::{
     has_motor_evidence, should_log, DecisionLedger, LogConfidence, LogRecord, Outcome,
     DEFAULT_LEDGER_CAPACITY, LOG_VERSION,
