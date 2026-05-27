@@ -149,6 +149,11 @@
     per_pair: PairSlipRow[];
     map_swap_pairs: number;
     map_key_confidence: number;
+    /// C5b kill-switch state — when false, confirmed slips tally but
+    /// don't write to the L3 volatility map. Defaulted off pending
+    /// motor-verdict validation; the SLIPS section reflects the live
+    /// state so the builder always knows whether learning is active.
+    map_writes_enabled: boolean;
   };
   type SlipPayload = {
     aimed_for: string;
@@ -245,10 +250,20 @@
     | { kind: "corrected_to_suggestion" }
     | { kind: "corrected_to_other" }
     | { kind: "abandoned" };
+  /// Mirrors `correction_engine::motor_signal::TokenMotorSignal` —
+  /// the candidate-INDEPENDENT per-token motor signal C5b reads.
+  /// Present on every loggable record (fast lane included).
+  type TokenMotorVerdict = "clean" | "slip" | "insufficient";
+  type TokenMotorSignal = {
+    verdict: TokenMotorVerdict;
+    slip_score: number;
+    graze_count: number;
+    char_count: number;
+  };
   /// Mirrors `correction_engine::log::LogRecord` — one decision ledger
   /// row. The full `decision` is the canonical outcome; `top_candidate`
-  /// / `top_score` / `top_motor_evidence` are convenience projections
-  /// for cheap rendering — and the C5b proposer's input signal.
+  /// / `top_score` / `top_motor_evidence` are diagnostic projections;
+  /// `token_motor` is what the C5b proposer actually gates on.
   type LogRecord = {
     id: number;
     timestamp_ms: number;
@@ -257,6 +272,7 @@
     top_candidate: string | null;
     top_score: number | null;
     top_motor_evidence: number | null;
+    token_motor: TokenMotorSignal | null;
     confidence: LogConfidence;
     anchor_id: number;
     active_tier: ConfidenceTier;
@@ -270,10 +286,10 @@
     | { kind: "fast" }
     | { kind: "slow"; rejected_confidence: LogConfidence };
   type MotorVerdict = "clean" | "mixed" | "slip" | "unknown";
-  type HoldReason =
-    | "obvious_fragment"
-    | "slip_signature"
-    | "high_confidence_rejection";
+  /// Mirrors the v2 `HoldReason` after the C5b motor-fix —
+  /// `high_confidence_rejection` is gone (string-distance based,
+  /// against "clean execution outweighs high-conf suggestion").
+  type HoldReason = "obvious_fragment" | "slip_signature";
   type ProposalTier =
     | { kind: "held"; reason: HoldReason }
     | { kind: "provisional" }
@@ -756,8 +772,6 @@
         return "fragment";
       case "slip_signature":
         return "slip";
-      case "high_confidence_rejection":
-        return "hi-conf rej.";
     }
   }
   function fmtProposalTier(t: ProposalTier): string {
@@ -1144,7 +1158,7 @@
                 <span class="col-lxw">word</span>
                 <span class="col-lxl">lane</span>
                 <span class="col-lxm">motor</span>
-                <span class="col-lxs num">m·ev</span>
+                <span class="col-lxs num" title="slip_score from the per-token motor signal: fraction of chars in span whose dwell ≤ graze threshold (≤30ms). 0.00 = all clean. 1.00 = all graze.">slip</span>
                 <span class="col-lxt">tier</span>
                 <span class="col-lxo num">×</span>
               </div>
@@ -1166,7 +1180,14 @@
           {/if}
         </div>
 
-        <div class="model-sub model-sub-sticky">SLIPS · strict-filtered candidates · writes to L3 map</div>
+        <div class="model-sub model-sub-sticky">
+          SLIPS · strict-filtered candidates ·
+          {#if slips?.map_writes_enabled}
+            <span class="slips-writes-on">writes to L3 map (live)</span>
+          {:else}
+            <span class="slips-writes-off">L3 map writes OFF (C5b kill-switch)</span>
+          {/if}
+        </div>
         <div class="slip-block">
           {#if slips === null}
             <div class="empty">no data yet…</div>
@@ -1961,6 +1982,11 @@
   .lex-motor-mixed  { color: #d2c87b; font-weight: 600; }
   .lex-motor-slip   { color: #d2885d; font-weight: 600; }
   .lex-motor-unknown { color: #7f8a96; }
+
+  /* SLIPS section header annotation for the C5b L3-map kill-switch.
+     Bright when live, dim/warning when off. */
+  .slips-writes-on  { color: #6ea76e; }
+  .slips-writes-off { color: #d2885d; }
 
   /* ANCHORS — L4 Observing, Component 2. Sibling of TOKENS; one row per
      live anchor on the current line. Voided rows get a faded look but

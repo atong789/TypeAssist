@@ -21,6 +21,7 @@ pub mod keyboard;
 pub mod lexicon;
 pub mod lexicon_proposal;
 pub mod log;
+pub mod motor_signal;
 pub mod resolver;
 pub mod score;
 pub mod tokenizer;
@@ -38,6 +39,9 @@ pub use lexicon_proposal::{
 pub use log::{
     has_motor_evidence, should_log, DecisionLedger, LogConfidence, LogRecord, Outcome,
     DEFAULT_LEDGER_CAPACITY, LOG_VERSION,
+};
+pub use motor_signal::{
+    measure_token_motor, TokenMotorSignal, TokenMotorVerdict, GRAZE_DWELL_MS, MIN_SAMPLE_CHARS,
 };
 pub use resolver::{OutcomeResolver, DEFAULT_DEBOUNCE_MS, RESOLVER_VERSION};
 pub use score::{

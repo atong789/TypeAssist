@@ -56,10 +56,17 @@ use crate::ConfidenceTier;
 /// v2 — Component 5a adds [`Outcome::Abandoned`] for the whole-word-delete
 /// terminal state.
 ///
-/// v3 — Component 5b adds `top_motor_evidence` so the lexicon-learning
-/// proposer can read the C3 motor signal (clean vs slip-like) without
-/// re-fetching the score report.
-pub const LOG_VERSION: u32 = 3;
+/// v3 — Component 5b first cut adds `top_motor_evidence` (C3's
+/// candidate-dependent motor score) so the proposer could read motor
+/// info without re-fetching the score report.
+///
+/// v4 — Component 5b fix: `top_motor_evidence` was blank for the
+/// fast lane (no candidate → no edit-shape to score). Adds
+/// `token_motor`, a candidate-INDEPENDENT per-token motor signal
+/// computed from `line_dwells`. Every loggable record now carries a
+/// motor verdict; the proposer reads `token_motor.verdict` rather
+/// than `top_motor_evidence` to decide hold vs promote.
+pub const LOG_VERSION: u32 = 4;
 
 /// **PLACEHOLDER capacity.** A few hundred records — enough to span a
 /// typical writing session without growing unbounded. Tune from real
@@ -169,11 +176,24 @@ pub struct LogRecord {
     /// **Motor evidence** of the top candidate's edit shape (sub / trans
     /// / ins / del) — the same `[0, 1]` value C3 uses to justify a
     /// correction. High = the typed word is a plausible motor slip of
-    /// a real word; low = clean execution (no slip signature matches).
-    /// Component 5b's lexicon proposer reads this to gate promotion:
-    /// slip-signature Kepts are likely uncaught slips of an existing
-    /// word, not new vocabulary. Same nullability as `top_candidate`.
+    /// a real word; low = no slip-shape match against the candidate.
+    /// Same nullability as `top_candidate`. **Diagnostic** for the
+    /// debug panel; the C5b proposer reads [`Self::token_motor`]
+    /// instead (the candidate-independent signal) so the fast lane
+    /// has a verdict too.
     pub top_motor_evidence: Option<f64>,
+    /// **Per-token motor cleanliness** computed from the keystrokes
+    /// themselves — `line_dwells[start..end]`. Candidate-independent,
+    /// present on every loggable record (fast lane included). The
+    /// C5b proposer reads `token_motor.verdict` to decide
+    /// hold-as-slip vs promote-as-clean; the proposer no longer
+    /// consults `top_motor_evidence` for the gate.
+    ///
+    /// `None` only when the engine couldn't read the dwell slice for
+    /// the token's span (defensive — should not happen in normal
+    /// flow). A 1-char token still gets `Some(_)` with verdict
+    /// `Insufficient` so the panel renders the right cell.
+    pub token_motor: Option<crate::motor_signal::TokenMotorSignal>,
     /// 4-state confidence band. See [`LogConfidence`]. Always present —
     /// `BelowFloor` covers both "below floor" and "no candidate".
     pub confidence: LogConfidence,
@@ -258,22 +278,22 @@ impl DecisionLedger {
     /// [`has_motor_evidence`]); this method does not re-check them.
     ///
     /// `top_candidate`, `top_score`, and `top_motor_evidence` are
-    /// sourced from the engine's **score report**, not from the
-    /// decision arm. They carry the strongest edit-1 neighbour the
-    /// engine identified for this word and that neighbour's motor
-    /// plausibility — **independent of whether the mode chose to act
-    /// on it**. The decoupling is load-bearing for two downstream
-    /// consumers:
+    /// sourced from the engine's **score report**. `token_motor` is
+    /// sourced from the **per-char dwell slice** of the token's span
+    /// — a candidate-independent read that's present on every
+    /// loggable record (fast lane included).
     ///
     /// * C5a's resolver: classifies `CorrectedToSuggestion` when the
-    ///   user lands on a candidate Cautious wouldn't have suggested.
-    /// * C5b's lexicon proposer: gates promotion of Kept words by the
-    ///   motor signature (high motor_evidence = slip-like → hold;
-    ///   clean = lean intended).
+    ///   user lands on a candidate Cautious wouldn't have suggested
+    ///   (reads `top_candidate`).
+    /// * C5b's lexicon proposer: gates promotion of Kept words by
+    ///   `token_motor.verdict` — clean execution promotes, slip
+    ///   execution holds. `top_motor_evidence` is no longer the gate;
+    ///   it's kept on the record as a diagnostic.
     ///
-    /// Pass `None`/`None`/`None` only when the score report had no
-    /// candidates at all (e.g. `LeaveAlone(NoCandidates)` for an
-    /// unfamiliar name).
+    /// Pass `None` for `top_*` whenever the score report had no
+    /// candidates. `token_motor` should always be `Some(_)`; a `None`
+    /// indicates a bug in the engine's dwell-tracking (defensive).
     #[allow(clippy::too_many_arguments)]
     pub fn append(
         &mut self,
@@ -285,6 +305,7 @@ impl DecisionLedger {
         top_score: Option<f64>,
         top_motor_evidence: Option<f64>,
         top_confidence: Option<Confidence>,
+        token_motor: Option<crate::motor_signal::TokenMotorSignal>,
     ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -300,6 +321,7 @@ impl DecisionLedger {
             top_candidate,
             top_score,
             top_motor_evidence,
+            token_motor,
             confidence,
             anchor_id,
             active_tier,
@@ -551,6 +573,14 @@ mod tests {
             Some(score),
             Some(0.5),
             Some(conf),
+            // Test default: a 3-char clean span. Tests that want
+            // specific motor verdicts construct the signal explicitly.
+            Some(crate::motor_signal::TokenMotorSignal {
+                verdict: crate::motor_signal::TokenMotorVerdict::Clean,
+                slip_score: 0.0,
+                graze_count: 0,
+                char_count: 3,
+            }),
         )
     }
 
@@ -587,12 +617,25 @@ mod tests {
         // NoCandidates is the only arm where the score report had
         // nothing — `top_candidate` / `top_score` are legitimately
         // `None` here.
-        let id =
-            ledger.append(2_000, d, 7, ConfidenceTier::Balanced, None, None, None, None);
+        let id = ledger.append(
+            2_000,
+            d,
+            7,
+            ConfidenceTier::Balanced,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         let rec = ledger.get(id).unwrap();
         assert!(rec.top_candidate.is_none());
         assert!(rec.top_score.is_none());
         assert!(rec.top_motor_evidence.is_none());
+        // token_motor is independent of candidate availability — for
+        // a NoCandidates record we pass None defensively, the engine
+        // path actually populates it from line_dwells.
+        assert!(rec.token_motor.is_none());
         assert_eq!(rec.confidence, LogConfidence::BelowFloor);
     }
 
@@ -615,6 +658,7 @@ mod tests {
             Some(0.47),
             Some(0.55),
             Some(Confidence::Medium),
+            None,
         );
         let rec = ledger.get(id).unwrap();
         assert_eq!(rec.top_candidate.as_deref(), Some("bullion"));

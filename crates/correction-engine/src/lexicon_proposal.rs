@@ -29,24 +29,30 @@
 //!   confidence suggestion is the strongest "user knows what they're
 //!   doing" signal, but also the highest cost if we're wrong.
 //!
-//! ## Motor verdict (modulates the bar, both lanes)
+//! ## Motor verdict (held = motor-only)
 //!
-//! The proposer reads [`LogRecord::top_motor_evidence`] — the same `[0,1]`
-//! "this typed word is a plausible motor slip of the top candidate"
-//! score C3 uses to justify a correction. The reading is intentionally
-//! re-used; we don't invent a new motor signal.
+//! Held means **this token's execution looks slip-like, nothing else**
+//! — *not* "the engine had a high-confidence suggestion." String
+//! distance to a known word never holds a record on its own: a
+//! deliberate novel word that happens to be edit-1 from a frequent
+//! word should still promote if the fingers executed cleanly.
 //!
-//! | `top_motor_evidence` | verdict        | meaning                          |
-//! |----------------------|----------------|----------------------------------|
-//! | `≥ 0.6`              | `Slip`         | Typed word fits a known slip shape (high prior the user slipped). |
-//! | `≤ 0.4`              | `Clean`        | No slip signature — fingers executed deliberately. |
-//! | `> 0.4 && < 0.6`     | `Mixed`        | Inconclusive. Lean clean for promotion (cautious). |
-//! | `None`               | `Unknown`      | No candidate to compute slip-shape against. Fast-lane default. |
+//! The proposer reads [`LogRecord::token_motor`] — the
+//! candidate-independent per-token motor signal from
+//! [`crate::motor_signal`]. It's computed from the dwell slice over
+//! the token's own keystrokes, so the **fast lane** (no candidate)
+//! has a real verdict instead of falling through to `Unknown` and
+//! degenerating the gate to lane + count.
 //!
-//! Thresholds are **PLACEHOLDERS** — chosen to bracket the C3 floors
-//! (`CONFIDENCE_LOW_FLOOR = 0.25`, `CONFIDENCE_MEDIUM_FLOOR = 0.5`)
-//! conservatively. Tune from real Observing data; the panel surfaces the
-//! raw score so we can see what threshold actually splits intended-vs-slip.
+//! | `TokenMotorVerdict`  | proposer reads as | meaning                          |
+//! |----------------------|-------------------|----------------------------------|
+//! | `Clean`              | `MotorVerdict::Clean` | All char dwells passed the graze threshold — fingers executed deliberately. |
+//! | `Slip`               | `MotorVerdict::Slip` | At least one graze-shaped dwell in the span — looks like an uncaught slip. |
+//! | `Insufficient`       | `MotorVerdict::Unknown` | Span too short to read — won't promote off it, won't hold off it. |
+//! | (record carries `None`) | `MotorVerdict::Unknown` | Defensive — engine should always populate. |
+//!
+//! See [`crate::motor_signal`] for the (placeholder) graze threshold
+//! and the dwell-based heuristic.
 //!
 //! ## Tiers (display-only this phase)
 //!
@@ -74,21 +80,19 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::log::{LogConfidence, LogRecord, Outcome};
+use crate::motor_signal::TokenMotorVerdict;
 
 /// Version of the proposal wire shape. Bump on any change to
 /// [`LexiconProposal`] / [`Lane`] / [`MotorVerdict`] / [`ProposalTier`].
-pub const LEXICON_PROPOSAL_VERSION: u32 = 1;
+///
+/// v2 — C5b motor-signal fix: gate reads `token_motor` (candidate
+/// independent) instead of `top_motor_evidence`; dropped the
+/// `HighConfidenceRejection` hold reason (string-distance based,
+/// against the brief's "clean execution outweighs high-confidence
+/// suggestion" rule).
+pub const LEXICON_PROPOSAL_VERSION: u32 = 2;
 
 // ---- Tunable PLACEHOLDERS — replace with values from real Observing data --
-
-/// `top_motor_evidence >= this` → motor verdict `Slip`. Brackets the
-/// medium-confidence floor where C3 would consider a correction
-/// plausible — a slip-like Kept under that bar should hold for review.
-const MOTOR_SLIP_THRESHOLD: f64 = 0.6;
-/// `top_motor_evidence <= this` → motor verdict `Clean`. Below the
-/// engine's lowest correction floor; the fingers didn't fit any
-/// slip-shape the candidate set offered.
-const MOTOR_CLEAN_THRESHOLD: f64 = 0.4;
 
 /// Minimum word length to be eligible for promotion. Single-letter
 /// tokens are routinely premature-space boundary fragments (the
@@ -136,20 +140,25 @@ pub enum MotorVerdict {
 }
 
 /// Why a proposal is held back from promotion. Surfaced on the panel so
-/// the builder can see exactly which gate fired.
+/// the builder can see exactly which gate fired. **Motor-only by
+/// design**: a hold says "this token's execution looks slip-like" (or
+/// is structurally disqualified). String distance to a known word
+/// never holds — a deliberate novel word that resembles a frequent
+/// one still promotes if the fingers were clean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HoldReason {
     /// Word length below [`MIN_PROMOTABLE_WORD_LEN`]. Likely a
     /// premature-space boundary fragment (e.g. `Soum` from `Soumyo`);
-    /// 5c will reconstruct, 5b just refuses to learn.
+    /// 5c will reconstruct, 5b just refuses to learn. Not a motor
+    /// signal per se — a structural disqualifier the proposer can't
+    /// reason past at this scale.
     ObviousFragment,
-    /// Latest occasion's motor signature is slip-like.
+    /// Latest occasion's motor signature is slip-like —
+    /// `token_motor.verdict == Slip`. The C5b gate's primary reason
+    /// for holding a word back: clean execution can outweigh anything
+    /// else, slip execution can be outweighed by nothing.
     SlipSignature,
-    /// Slow lane + rejected a HIGH-confidence suggestion + corroboration
-    /// hasn't accumulated. Even clean execution shouldn't promote here
-    /// after only one or two occurrences — wait for more.
-    HighConfidenceRejection,
 }
 
 /// Where the proposer thinks the word stands right now.
@@ -335,7 +344,10 @@ impl LexiconProposer {
         let word = record.original_text.clone();
         let lane = lane_for(record);
         let motor_verdict = motor_verdict_for(record);
-        let last_motor_evidence = record.top_motor_evidence;
+        // Panel surface: the slip_score from the per-token signal —
+        // populated for fast-lane records (where top_motor_evidence
+        // was None and the m·ev column rendered blank).
+        let last_motor_evidence = slip_score_for(record);
         let last_record_id = record.id;
         let last_seen_ms = record.timestamp_ms;
 
@@ -396,59 +408,65 @@ fn lane_for(record: &LogRecord) -> Lane {
     }
 }
 
-/// Map `top_motor_evidence` → [`MotorVerdict`] using the placeholder
-/// thresholds at the top of this file.
+/// Map [`LogRecord::token_motor`] → [`MotorVerdict`]. The proposer
+/// reads the candidate-independent token signal here, not
+/// `top_motor_evidence` — see the module doc for why string-distance
+/// motor signals don't gate alone. `Mixed` is currently unreachable
+/// (the token signal is three-state); kept on the enum for the panel
+/// in case a future detector adds a mixed state.
 fn motor_verdict_for(record: &LogRecord) -> MotorVerdict {
-    match record.top_motor_evidence {
+    match record.token_motor {
         None => MotorVerdict::Unknown,
-        Some(m) if m >= MOTOR_SLIP_THRESHOLD => MotorVerdict::Slip,
-        Some(m) if m <= MOTOR_CLEAN_THRESHOLD => MotorVerdict::Clean,
-        Some(_) => MotorVerdict::Mixed,
+        Some(s) => match s.verdict {
+            TokenMotorVerdict::Clean => MotorVerdict::Clean,
+            TokenMotorVerdict::Slip => MotorVerdict::Slip,
+            TokenMotorVerdict::Insufficient => MotorVerdict::Unknown,
+        },
     }
+}
+
+/// Slip-score for panel display — drawn from the token signal. `None`
+/// only when the engine couldn't compute one (defensive).
+fn slip_score_for(record: &LogRecord) -> Option<f64> {
+    record.token_motor.map(|s| s.slip_score)
 }
 
 /// Decide the tier given lane + motor verdict + occasions. Pure
 /// function — the proposer state is just bookkeeping around this.
+///
+/// **Held is motor-only.** The lane is *informational* — it tells the
+/// builder which track a word is on — but it never holds a word.
+/// String distance to a known word, rejected-suggestion confidence,
+/// or any other lexicon-shape signal does not gate on its own. Only
+/// the motor signature (or the structural fragment disqualifier)
+/// holds.
 fn recompute_tier(
     word: &str,
-    lane: &Lane,
+    _lane: &Lane,
     motor_verdict: MotorVerdict,
     occasions: u32,
 ) -> ProposalTier {
     // Gate 1: obvious fragments — single-character tokens are
     // overwhelmingly premature-space breaks; we refuse to learn them.
     // (Empty would also fall here, but the tokenizer rejects empty
-    // cores upstream.)
+    // cores upstream.) Structural disqualifier, not a motor signal,
+    // but functionally equivalent: "we can't reason about this token."
     if word.chars().count() < MIN_PROMOTABLE_WORD_LEN {
         return ProposalTier::Held {
             reason: HoldReason::ObviousFragment,
         };
     }
 
-    // Gate 2: slip signature. Clean execution can outweigh a
-    // high-confidence suggestion ("if the fingers did it cleanly, he
-    // meant it"); a slip signature blocks regardless of lane or count.
+    // Gate 2: slip signature — the one and only motor-based hold.
+    // "If the fingers did it cleanly, he meant it" — even rejecting
+    // a HIGH-confidence suggestion promotes when token_motor is Clean.
     if matches!(motor_verdict, MotorVerdict::Slip) {
         return ProposalTier::Held {
             reason: HoldReason::SlipSignature,
         };
     }
 
-    // Gate 3: slow lane with high-confidence rejection needs
-    // corroboration — even clean execution shouldn't promote a
-    // single rejection of a HIGH-confidence suggestion.
-    if let Lane::Slow {
-        rejected_confidence: LogConfidence::High,
-    } = lane
-    {
-        if occasions < CONFIRMED_OCCASIONS_THRESHOLD {
-            return ProposalTier::Held {
-                reason: HoldReason::HighConfidenceRejection,
-            };
-        }
-    }
-
-    // Gate 4: enough occasions → Confirmed; otherwise Provisional.
+    // Gate 3: enough occasions → Confirmed; otherwise Provisional.
     if occasions >= CONFIRMED_OCCASIONS_THRESHOLD {
         ProposalTier::Confirmed
     } else {
@@ -463,11 +481,38 @@ mod tests {
     use super::*;
     use crate::decision::{DecisionOutcome, LeaveAloneReason};
     use crate::log::{DecisionLedger, LogConfidence};
+    use crate::motor_signal::{TokenMotorSignal, TokenMotorVerdict};
     use crate::score::Confidence;
     use crate::ConfidenceTier;
 
-    /// Append a `LeaveAlone(NoCandidates)`-shaped record — fast lane.
-    fn append_fast(ledger: &mut DecisionLedger, word: &str) -> u64 {
+    /// Build a clean-motor signal for `word.len()` chars.
+    fn clean_motor(word: &str) -> TokenMotorSignal {
+        TokenMotorSignal {
+            verdict: TokenMotorVerdict::Clean,
+            slip_score: 0.0,
+            graze_count: 0,
+            char_count: word.chars().count() as u32,
+        }
+    }
+
+    /// Build a slip-motor signal (one graze) for `word.len()` chars.
+    fn slip_motor(word: &str) -> TokenMotorSignal {
+        let n = word.chars().count() as u32;
+        TokenMotorSignal {
+            verdict: TokenMotorVerdict::Slip,
+            slip_score: 1.0 / (n as f64).max(1.0),
+            graze_count: 1,
+            char_count: n,
+        }
+    }
+
+    /// Append a `LeaveAlone(NoCandidates)`-shaped record — fast lane —
+    /// with the supplied per-token motor signal.
+    fn append_fast(
+        ledger: &mut DecisionLedger,
+        word: &str,
+        motor: TokenMotorSignal,
+    ) -> u64 {
         ledger.append(
             0,
             DecisionOutcome::LeaveAlone {
@@ -480,17 +525,21 @@ mod tests {
             None,
             None,
             None,
+            Some(motor),
         )
     }
 
-    /// Append a `LeaveAlone(BelowActiveTier)`-shaped record — slow lane
-    /// (engine had a candidate, mode declined, user kept the original).
+    /// Append a `LeaveAlone(BelowActiveTier)` — slow lane — record.
+    /// `motor` is the per-token signal; the legacy
+    /// `top_motor_evidence` is still set for diagnostic display but no
+    /// longer drives the gate.
     fn append_slow(
         ledger: &mut DecisionLedger,
         word: &str,
         candidate: &str,
-        motor: f64,
+        legacy_motor_evidence: f64,
         rejected_conf: Confidence,
+        motor: TokenMotorSignal,
     ) -> u64 {
         ledger.append(
             0,
@@ -502,8 +551,9 @@ mod tests {
             ConfidenceTier::Cautious,
             Some(candidate.to_string()),
             Some(0.50),
-            Some(motor),
+            Some(legacy_motor_evidence),
             Some(rejected_conf),
+            Some(motor),
         )
     }
 
@@ -512,101 +562,96 @@ mod tests {
         ledger.get(id).cloned().unwrap()
     }
 
-    // ---- Fast lane ------------------------------------------------------
+    // ---- Held-via-motor (the core C5b contract) ------------------------
 
     #[test]
-    fn no_candidate_kept_lands_provisional_clean_fast_lane() {
-        // Soumyo: name, no edit-1 neighbour, user kept it. Fast lane,
-        // motor verdict Unknown (no candidate to compute slip-shape).
-        // Single occasion → Provisional.
+    fn no_candidate_kept_with_slip_dwells_is_held() {
+        // Same fast-lane word as the Provisional case below, but with a
+        // slip-shaped per-token signal injected. Motor signature is the
+        // ONLY thing that holds — fast lane and single occasion would
+        // otherwise promote.
         let mut ledger = DecisionLedger::new();
-        let id = append_fast(&mut ledger, "Soumyo");
+        let id = append_fast(&mut ledger, "Soumyo", slip_motor("Soumyo"));
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
         let mut p = LexiconProposer::new();
-        let upd = p.note_record(&kept);
+        p.note_record(&kept);
         let prop = p.get("Soumyo").unwrap();
         assert_eq!(prop.lane, Lane::Fast);
-        assert_eq!(prop.motor_verdict, MotorVerdict::Unknown);
+        assert_eq!(prop.motor_verdict, MotorVerdict::Slip);
+        assert_eq!(
+            prop.tier,
+            ProposalTier::Held {
+                reason: HoldReason::SlipSignature
+            }
+        );
+        // Slip-score surfaces on the panel so the builder can see WHY.
+        assert!(prop.last_motor_evidence.is_some());
+    }
+
+    #[test]
+    fn no_candidate_kept_with_clean_dwells_promotes_provisional() {
+        // Same word, clean motor signal → Provisional. The pair of
+        // tests deterministically pins the slip-vs-clean axis.
+        let mut ledger = DecisionLedger::new();
+        let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+
+        let mut p = LexiconProposer::new();
+        p.note_record(&kept);
+        let prop = p.get("Soumyo").unwrap();
+        assert_eq!(prop.lane, Lane::Fast);
+        assert_eq!(prop.motor_verdict, MotorVerdict::Clean);
         assert_eq!(prop.tier, ProposalTier::Provisional);
         assert_eq!(prop.occasions, 1);
-        assert!(prop.last_motor_evidence.is_none());
-        assert!(matches!(upd, ProposalUpdate::Changed(Some(_), _)));
+        assert_eq!(prop.last_motor_evidence, Some(0.0));
     }
 
     #[test]
-    fn three_kept_occasions_promote_to_confirmed() {
-        // Same word kept three times → Confirmed. Pin the placeholder
-        // threshold so a future tune doesn't silently change behaviour
-        // without updating the test.
+    fn slow_lane_high_confidence_rejection_promotes_when_motor_is_clean() {
+        // The earlier `HighConfidenceRejection` hold is gone — clean
+        // motor outweighs how confident the engine was that the user
+        // typed a typo. One occasion of a HIGH-conf rejection +
+        // clean execution → Provisional (NOT Held).
         let mut ledger = DecisionLedger::new();
-        let mut p = LexiconProposer::new();
-        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD {
-            let id = append_fast(&mut ledger, "Krutrim");
-            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
-            p.note_record(&kept);
-        }
-        assert_eq!(p.get("Krutrim").unwrap().tier, ProposalTier::Confirmed);
-        assert_eq!(p.get("Krutrim").unwrap().occasions, 3);
-    }
-
-    // ---- Slow lane ------------------------------------------------------
-
-    #[test]
-    fn slow_lane_clean_motor_promotes_when_low_rejected_confidence() {
-        // User kept "foo" even though engine had a LOW-confidence
-        // suggestion "boo". Clean motor (0.2) → not Held(Slip); LOW
-        // rejection → not Held(HighConfidenceRejection); single
-        // occasion → Provisional.
-        let mut ledger = DecisionLedger::new();
-        let id = append_slow(&mut ledger, "foo", "boo", 0.2, Confidence::Low);
+        let id = append_slow(
+            &mut ledger,
+            "foo",
+            "the",
+            0.2,
+            Confidence::High,
+            clean_motor("foo"),
+        );
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("foo").unwrap();
-        assert!(matches!(prop.lane, Lane::Slow { rejected_confidence: LogConfidence::Low }));
+        assert!(matches!(
+            prop.lane,
+            Lane::Slow {
+                rejected_confidence: LogConfidence::High
+            }
+        ));
         assert_eq!(prop.motor_verdict, MotorVerdict::Clean);
         assert_eq!(prop.tier, ProposalTier::Provisional);
     }
 
     #[test]
-    fn slow_lane_high_confidence_rejection_holds_until_corroborated() {
-        // Rejecting a HIGH-confidence suggestion needs corroboration.
-        // Even with clean motor, the first Kept holds.
-        let mut ledger = DecisionLedger::new();
-        let id = append_slow(&mut ledger, "foo", "the", 0.2, Confidence::High);
-        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
-
-        let mut p = LexiconProposer::new();
-        p.note_record(&kept);
-        let prop = p.get("foo").unwrap();
-        assert_eq!(
-            prop.tier,
-            ProposalTier::Held {
-                reason: HoldReason::HighConfidenceRejection
-            }
-        );
-
-        // Two more occasions → corroborated → Confirmed (jumps past
-        // Provisional because the HighConfidenceRejection gate clears
-        // exactly when CONFIRMED_OCCASIONS_THRESHOLD lands).
-        for _ in 0..2 {
-            let id = append_slow(&mut ledger, "foo", "the", 0.2, Confidence::High);
-            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
-            p.note_record(&kept);
-        }
-        assert_eq!(p.get("foo").unwrap().tier, ProposalTier::Confirmed);
-    }
-
-    #[test]
-    fn slip_signature_holds_even_with_clean_history() {
-        // Motor evidence above the slip threshold → Held(SlipSignature)
-        // regardless of lane or occasion count.
+    fn slip_signature_holds_regardless_of_lane_and_count() {
+        // Many Kept occasions can't outweigh a slip signature.
+        // Motor-only contract: slip beats everything.
         let mut ledger = DecisionLedger::new();
         let mut p = LexiconProposer::new();
         for _ in 0..5 {
-            let id = append_slow(&mut ledger, "wordl", "world", 0.85, Confidence::Medium);
+            let id = append_slow(
+                &mut ledger,
+                "wordl",
+                "world",
+                0.85,
+                Confidence::Medium,
+                slip_motor("wordl"),
+            );
             let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
             p.note_record(&kept);
         }
@@ -618,6 +663,48 @@ mod tests {
                 reason: HoldReason::SlipSignature
             }
         );
+        // Slip-score is the per-token signal's, NOT top_motor_evidence.
+        assert_eq!(prop.last_motor_evidence, Some(1.0 / 5.0));
+    }
+
+    // ---- Fast-lane promotion path --------------------------------------
+
+    #[test]
+    fn three_kept_occasions_promote_to_confirmed() {
+        // Same word kept three times with clean motor → Confirmed. Pin
+        // the placeholder threshold so a future tune doesn't silently
+        // change behaviour.
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD {
+            let id = append_fast(&mut ledger, "Krutrim", clean_motor("Krutrim"));
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+        assert_eq!(p.get("Krutrim").unwrap().tier, ProposalTier::Confirmed);
+        assert_eq!(p.get("Krutrim").unwrap().occasions, 3);
+    }
+
+    // ---- Slow-lane promotion path --------------------------------------
+
+    #[test]
+    fn slow_lane_clean_motor_promotes_with_low_rejected_confidence() {
+        let mut ledger = DecisionLedger::new();
+        let id = append_slow(
+            &mut ledger,
+            "foo",
+            "boo",
+            0.2,
+            Confidence::Low,
+            clean_motor("foo"),
+        );
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+
+        let mut p = LexiconProposer::new();
+        p.note_record(&kept);
+        let prop = p.get("foo").unwrap();
+        assert_eq!(prop.motor_verdict, MotorVerdict::Clean);
+        assert_eq!(prop.tier, ProposalTier::Provisional);
     }
 
     // ---- Reversibility (revisable C5a transitions) ---------------------
@@ -626,7 +713,7 @@ mod tests {
     fn kept_then_corrected_retracts_the_kept_contribution() {
         // Critical: a Kept that later flips to Corrected must un-count.
         let mut ledger = DecisionLedger::new();
-        let id = append_fast(&mut ledger, "Soumyo");
+        let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
         let mut p = LexiconProposer::new();
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
         p.note_record(&kept);
@@ -644,7 +731,7 @@ mod tests {
     #[test]
     fn kept_then_abandoned_retracts_the_kept_contribution() {
         let mut ledger = DecisionLedger::new();
-        let id = append_fast(&mut ledger, "Soumyo");
+        let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
         let mut p = LexiconProposer::new();
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
         p.note_record(&kept);
@@ -662,7 +749,7 @@ mod tests {
         let mut p = LexiconProposer::new();
         let mut ids = Vec::new();
         for _ in 0..3 {
-            let id = append_fast(&mut ledger, "Soumyo");
+            let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
             let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
             p.note_record(&kept);
             ids.push(id);
@@ -678,7 +765,7 @@ mod tests {
     #[test]
     fn idempotent_repeat_note_returns_no_change() {
         let mut ledger = DecisionLedger::new();
-        let id = append_fast(&mut ledger, "Soumyo");
+        let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
         let mut p = LexiconProposer::new();
         let first = p.note_record(&kept);
@@ -694,7 +781,7 @@ mod tests {
         // contribution shape is stashed so the eventual Pending→Kept
         // transition counts cleanly.
         let mut ledger = DecisionLedger::new();
-        let id = append_fast(&mut ledger, "Soumyo");
+        let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
         let pending = ledger.get(id).cloned().unwrap();
         let mut p = LexiconProposer::new();
         p.note_record(&pending);
@@ -708,7 +795,7 @@ mod tests {
     #[test]
     fn corrected_records_do_not_feed_learning() {
         let mut ledger = DecisionLedger::new();
-        let id = append_fast(&mut ledger, "Soumyo");
+        let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
         let mut p = LexiconProposer::new();
         let corrected = flip_outcome(&mut ledger, id, Outcome::CorrectedToSuggestion);
         p.note_record(&corrected);
@@ -723,7 +810,7 @@ mod tests {
         // don't reconstruct (that's 5c) but we also don't pretend to
         // learn a single-char "word."
         let mut ledger = DecisionLedger::new();
-        let id = append_fast(&mut ledger, "a");
+        let id = append_fast(&mut ledger, "a", clean_motor("a"));
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
@@ -745,7 +832,6 @@ mod tests {
     fn snapshot_orders_by_most_recent_first() {
         let mut ledger = DecisionLedger::new();
         let mut p = LexiconProposer::new();
-        // First word at t=10.
         let id1 = ledger.append(
             10,
             DecisionOutcome::LeaveAlone {
@@ -758,10 +844,10 @@ mod tests {
             None,
             None,
             None,
+            Some(clean_motor("alpha")),
         );
         let kept1 = flip_outcome(&mut ledger, id1, Outcome::Kept);
         p.note_record(&kept1);
-        // Second word at t=20.
         let id2 = ledger.append(
             20,
             DecisionOutcome::LeaveAlone {
@@ -774,6 +860,7 @@ mod tests {
             None,
             None,
             None,
+            Some(clean_motor("beta")),
         );
         let kept2 = flip_outcome(&mut ledger, id2, Outcome::Kept);
         p.note_record(&kept2);

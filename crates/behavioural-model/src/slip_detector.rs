@@ -23,6 +23,23 @@
 //! principle that motor-pattern detections stay low-confidence until they
 //! can be cross-checked against labeled corrections — which is exactly
 //! what this loop is starting to produce.
+//!
+//! ## L3 map-writes kill-switch (Component 5b sentinel)
+//!
+//! The slip detector's [`VolatilityMap`] mutations — `swap_pairs`
+//! frequencies and `KeyConfidence` decrements — feed C3's
+//! `motor_evidence_for`, which drives correction priors. Until the
+//! C5b per-token motor verdict is validated against real typing, we
+//! don't want an unvalidated slip signal teaching the motor map.
+//! [`SlipDetector::with_map_writes`] gates exactly those mutations
+//! behind a boolean (default OFF). Everything else stays live: the
+//! `by_pair` tally, `total_slips`, the `SlipEvent`s drained by
+//! `take_new_slips()` for the debug feed — all in-memory diagnostics
+//! the panel uses. Only the writes that actually influence engine
+//! behavior are gated.
+//!
+//! Flip back on by constructing the detector with
+//! `SlipDetector::with_map_writes(true)` from the host (engine.rs).
 
 use std::collections::HashMap;
 
@@ -59,6 +76,14 @@ pub struct SlipDetector {
     /// Slips detected since the last `take_new_slips()` call. Used by the
     /// engine host to emit Tauri events for the debug feed.
     pending_new: Vec<SlipEvent>,
+    /// **C5b sentinel.** Whether confirmed slips update the
+    /// [`VolatilityMap`] (`swap_pairs` and `KeyConfidence`). Default
+    /// `false` — those writes feed C3's correction priors and we don't
+    /// want an unvalidated slip signal teaching the motor map until
+    /// the C5b per-token verdict has been observed against real
+    /// typing. All other slip-detector outputs (the in-memory tally,
+    /// `total_slips`, `SlipEvent`s on the debug feed) stay live.
+    map_writes_enabled: bool,
 }
 
 impl Default for SlipDetector {
@@ -106,7 +131,19 @@ struct SlipRecord {
 }
 
 impl SlipDetector {
+    /// Build a detector with the C5b safety default: L3 map writes
+    /// **OFF**. The in-memory tally and `SlipEvent` feed stay live;
+    /// the volatility map is constructed empty and never mutated
+    /// until the kill-switch is flipped on.
     pub fn new() -> Self {
+        Self::with_map_writes(false)
+    }
+
+    /// Build a detector with the L3 map-writes kill-switch in the
+    /// requested state. Pass `true` once the C5b motor verdict has
+    /// been validated and you want confirmed slips to start feeding
+    /// the volatility map again.
+    pub fn with_map_writes(map_writes_enabled: bool) -> Self {
         Self {
             state: DetectionState::Idle,
             by_pair: HashMap::new(),
@@ -122,7 +159,14 @@ impl SlipDetector {
                 },
             ),
             pending_new: Vec::new(),
+            map_writes_enabled,
         }
+    }
+
+    /// Whether the L3 map-writes kill-switch is on. Surfaced so the
+    /// host (engine.rs) can mirror the state to the debug panel.
+    pub fn map_writes_enabled(&self) -> bool {
+        self.map_writes_enabled
     }
 
     pub fn observe(&mut self, event: &InputEvent) {
@@ -170,6 +214,7 @@ impl SlipDetector {
             per_pair,
             map_swap_pairs: self.map.swap_pairs.len() as u32,
             map_key_confidence: self.map.keys.len() as u32,
+            map_writes_enabled: self.map_writes_enabled,
         }
     }
 
@@ -375,42 +420,46 @@ impl SlipDetector {
         entry.last_seen_ms = ts;
         self.total_slips += 1;
 
-        // Live volatility-map writes. Only mapped keys go into L3 — the
-        // schema requires Hand + Finger and we don't fabricate them.
-        if let (Some(h), Some(f)) = (hand, finger) {
-            // Swap pair: bump frequency or insert a new entry.
-            if let Some(pair) = self
-                .map
-                .swap_pairs
-                .iter_mut()
-                .find(|p| p.aimed_for == aimed_for && p.hit_instead == hit_instead)
-            {
-                pair.frequency += 1.0;
-            } else {
-                self.map.swap_pairs.push(SwapPair {
-                    aimed_for: aimed_for.to_string(),
-                    hit_instead: hit_instead.to_string(),
-                    frequency: 1.0,
-                    hand: h,
-                    finger: f,
-                });
-            }
+        // Live volatility-map writes — **gated by the C5b kill-switch**.
+        // Default off: an unvalidated slip signal must not teach the
+        // motor map. When the host enables writes, only mapped keys
+        // go into L3 (the schema requires Hand + Finger).
+        if self.map_writes_enabled {
+            if let (Some(h), Some(f)) = (hand, finger) {
+                // Swap pair: bump frequency or insert a new entry.
+                if let Some(pair) = self
+                    .map
+                    .swap_pairs
+                    .iter_mut()
+                    .find(|p| p.aimed_for == aimed_for && p.hit_instead == hit_instead)
+                {
+                    pair.frequency += 1.0;
+                } else {
+                    self.map.swap_pairs.push(SwapPair {
+                        aimed_for: aimed_for.to_string(),
+                        hit_instead: hit_instead.to_string(),
+                        frequency: 1.0,
+                        hand: h,
+                        finger: f,
+                    });
+                }
 
-            // Key confidence: slips lightly degrade the aimed-for key.
-            // mean_dwell_ms stays 0.0 here — that's L2's timing aggregator's
-            // job, and a proper L2→L3 projection will fold it in later.
-            if let Some(kc) = self.map.keys.iter_mut().find(|k| k.key == aimed_for) {
-                kc.sample_count = kc.sample_count.saturating_add(1);
-                kc.confidence = Confidence::new(kc.confidence.0 - CONFIDENCE_DECREMENT);
-            } else {
-                self.map.keys.push(KeyConfidence {
-                    key: aimed_for.to_string(),
-                    confidence: Confidence::new(1.0 - CONFIDENCE_DECREMENT),
-                    sample_count: 1,
-                    mean_dwell_ms: 0.0,
-                    hand: h,
-                    finger: f,
-                });
+                // Key confidence: slips lightly degrade the aimed-for key.
+                // mean_dwell_ms stays 0.0 here — that's L2's timing aggregator's
+                // job, and a proper L2→L3 projection will fold it in later.
+                if let Some(kc) = self.map.keys.iter_mut().find(|k| k.key == aimed_for) {
+                    kc.sample_count = kc.sample_count.saturating_add(1);
+                    kc.confidence = Confidence::new(kc.confidence.0 - CONFIDENCE_DECREMENT);
+                } else {
+                    self.map.keys.push(KeyConfidence {
+                        key: aimed_for.to_string(),
+                        confidence: Confidence::new(1.0 - CONFIDENCE_DECREMENT),
+                        sample_count: 1,
+                        mean_dwell_ms: 0.0,
+                        hand: h,
+                        finger: f,
+                    });
+                }
             }
         }
 
@@ -444,6 +493,12 @@ pub struct SlipsSnapshot {
     pub map_swap_pairs: u32,
     /// Number of key-confidence entries in the live volatility map.
     pub map_key_confidence: u32,
+    /// **C5b sentinel state.** `true` once the host has flipped the
+    /// kill-switch on; until then, confirmed slips are tallied but
+    /// the L3 map stays empty (`map_swap_pairs` / `map_key_confidence`
+    /// remain 0). The SLIPS debug panel reads this so it can label
+    /// whether the path is actually feeding correction priors.
+    pub map_writes_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,10 +539,22 @@ mod tests {
         InputEvent::Backspace { timestamp_ms: ts }
     }
 
+    /// Most existing slip-detector tests assert that confirmed slips
+    /// **do** populate the volatility map. After the C5b kill-switch
+    /// flipped the default to map-writes-off, those tests construct
+    /// the detector with writes explicitly enabled. Tests of the
+    /// kill-switch itself construct with `with_map_writes(false)` or
+    /// `new()` directly.
+    fn writes_on() -> SlipDetector {
+        SlipDetector::with_map_writes(true)
+    }
+
     #[test]
     fn single_char_slip_is_recorded() {
-        // Aimed 's', hit 'a' instead, corrected immediately.
-        let mut d = SlipDetector::new();
+        // Aimed 's', hit 'a' instead, corrected immediately. Map writes
+        // explicitly enabled — the assertion below pins L3 mutation,
+        // which the C5b kill-switch defaults off.
+        let mut d = writes_on();
         d.observe(&key("a", 0));
         d.observe(&bs(50));
         d.observe(&key("s", 100));
@@ -619,7 +686,7 @@ mod tests {
 
     #[test]
     fn repeated_same_slip_increments_count_and_swap_pair_frequency() {
-        let mut d = SlipDetector::new();
+        let mut d = writes_on();
         for i in 0..3 {
             let base = i * 1_000;
             d.observe(&key("a", base));
@@ -670,9 +737,48 @@ mod tests {
         assert_eq!(d.snapshot().total_slips, 1);
     }
 
+    // ---- C5b kill-switch on L3 map writes ------------------------------
+
+    #[test]
+    fn default_constructor_disables_l3_map_writes() {
+        // `SlipDetector::new()` is the C5b safety default — map writes
+        // OFF. Confirmed slips still tally and still emit SlipEvents,
+        // but the volatility map stays empty.
+        let mut d = SlipDetector::new();
+        assert!(!d.map_writes_enabled());
+        d.observe(&key("a", 0));
+        d.observe(&bs(50));
+        d.observe(&key("s", 100));
+        let snap = d.snapshot();
+        // Diagnostic outputs stay live.
+        assert_eq!(snap.total_slips, 1);
+        assert_eq!(snap.per_pair.len(), 1);
+        assert_eq!(d.take_new_slips().len(), 1);
+        // L3 map untouched.
+        assert_eq!(snap.map_swap_pairs, 0);
+        assert_eq!(snap.map_key_confidence, 0);
+        assert!(d.map().swap_pairs.is_empty());
+        assert!(d.map().keys.is_empty());
+    }
+
+    #[test]
+    fn with_map_writes_true_enables_l3_map_writes() {
+        // The flip-on path — once the C5b motor verdict has been
+        // validated, the host (engine.rs) can construct the detector
+        // with writes enabled and learning resumes.
+        let mut d = SlipDetector::with_map_writes(true);
+        assert!(d.map_writes_enabled());
+        d.observe(&key("a", 0));
+        d.observe(&bs(50));
+        d.observe(&key("s", 100));
+        let snap = d.snapshot();
+        assert_eq!(snap.map_swap_pairs, 1);
+        assert_eq!(snap.map_key_confidence, 1);
+    }
+
     #[test]
     fn confidence_drops_per_slip_and_clamps_at_zero() {
-        let mut d = SlipDetector::new();
+        let mut d = writes_on();
         // 25 slips on the same aimed key → 25 × 0.05 = 1.25 would be
         // negative — must clamp to 0.0.
         for i in 0..25 {

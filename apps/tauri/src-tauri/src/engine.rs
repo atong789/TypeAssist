@@ -35,10 +35,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use behavioural_model::{BehaviouralModel, InputEvent};
 use correction_engine::{
-    decide, has_motor_evidence, ranked_known_candidates, score_candidates, should_log,
-    AnchorTracker, Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome, Lexicon,
-    LexiconProposer, OutcomeResolver, ProposalUpdate, ScoredCandidate, Token, TokenKind,
-    Tokenizer, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
+    decide, has_motor_evidence, measure_token_motor, ranked_known_candidates, score_candidates,
+    should_log, AnchorTracker, Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome,
+    Lexicon, LexiconProposer, OutcomeResolver, ProposalUpdate, ScoredCandidate, Token,
+    TokenKind, Tokenizer, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
     SCORE_VERSION,
 };
 use serde::Serialize;
@@ -430,6 +430,18 @@ fn emit_sealed_token<R: Runtime>(
         if should_log(&outcome, has_motor) {
             if let Some(anchor_id) = anchor_id {
                 let ts = now_ms();
+                // C5b fix: candidate-INDEPENDENT motor signal computed
+                // from the dwell slice on the token's own keystrokes.
+                // Populated for every loggable record so the fast
+                // lane (no candidate) has a real motor verdict.
+                let span_dwells = if tok.end <= line_dwells.len() {
+                    &line_dwells[tok.start..tok.end]
+                } else {
+                    // Defensive — should be unreachable given C4's
+                    // motor-evidence gate above.
+                    &[][..]
+                };
+                let token_motor = Some(measure_token_motor(span_dwells));
                 let new_id = ledger.append(
                     ts,
                     outcome,
@@ -439,6 +451,7 @@ fn emit_sealed_token<R: Runtime>(
                     top_score_for_log,
                     top_motor_for_log,
                     top_confidence_for_log,
+                    token_motor,
                 );
                 // Emit the just-appended record. The ledger owns it and
                 // may evict later, but the panel keeps its own copy in
