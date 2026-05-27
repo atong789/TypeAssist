@@ -549,6 +549,59 @@ mod tests {
     }
 
     #[test]
+    fn delete_in_place_waits_for_move_on_then_resolves_abandoned() {
+        // Pins the keystroke-gated trigger semantics that surfaced in
+        // manual testing: emptying a span doesn't itself fire a
+        // resolution — the resolver only acts on subsequent ticks past
+        // the debounce window. "Delete in place" (no further tick) =
+        // record stays at its previous outcome (Pending here). "Move
+        // on" (a later tick) = Abandoned fires.
+        let mut line: Vec<char> = "bullon ".chars().collect();
+        let mut anchors = AnchorTracker::new();
+        let aid = anchors.try_register(0, 6, "bullon").unwrap();
+        let mut ledger = DecisionLedger::new();
+        let rid = log_with_candidate(
+            &mut ledger,
+            leave_alone("bullon", LeaveAloneReason::BelowActiveTier),
+            aid,
+            Some("bullion"),
+            Some(0.47),
+        );
+
+        // Backspace everything — the "delete in place" moment.
+        anchors.apply_delete(6, ' ');
+        line.remove(6);
+        for (p, c) in [(5, 'n'), (4, 'o'), (3, 'l'), (2, 'l'), (1, 'u'), (0, 'b')] {
+            anchors.apply_delete(p, c);
+            line.remove(p);
+        }
+        assert!(line.is_empty());
+
+        let mut r = OutcomeResolver::with_debounce_ms(100);
+        // First tick — the keystroke that completed the delete. Stamps
+        // the new observation; elapsed=0 → no transition. The record
+        // stays Pending: the user has emptied the span but not yet
+        // "moved on."
+        let changes = r.tick(0, anchors.anchors(), &line, &ledger);
+        assert!(
+            changes.is_empty(),
+            "delete-in-place must not resolve at the deletion tick — that's the wait-for-move-on contract"
+        );
+        assert_eq!(ledger.get(rid).unwrap().outcome, Outcome::Pending);
+
+        // Still inside the debounce window — no move-on yet.
+        let changes = r.tick(50, anchors.anchors(), &line, &ledger);
+        assert!(changes.is_empty());
+        assert_eq!(ledger.get(rid).unwrap().outcome, Outcome::Pending);
+
+        // Move-on: a later tick past the debounce window. Models any
+        // subsequent keystroke (typing somewhere else, hitting return,
+        // anything that wakes the resolver). Abandoned fires.
+        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        assert_eq!(changes, vec![(rid, Outcome::Abandoned)]);
+    }
+
+    #[test]
     fn whole_word_deleted_with_empty_line_resolves_to_abandoned() {
         // Same as the full-backspace setup but with no retype — line is
         // empty after the deletes. Successor lookup finds nothing →
@@ -577,6 +630,116 @@ mod tests {
         r.tick(0, anchors.anchors(), &line, &ledger);
         let changes = r.tick(150, anchors.anchors(), &line, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::Abandoned)]);
+    }
+
+    // ---- Revisable transitions (Component 5a's "latest write wins") ----
+    //
+    // These pin the two transitions that scrambled in manual debug-panel
+    // testing (likely premature debounce firing during slow editing).
+    // Each test resolves once, applies the next phase of edits, and
+    // asserts the SECOND transition fires — which is the contract.
+
+    #[test]
+    fn revisable_kept_then_full_delete_re_resolves_to_abandoned() {
+        // Phase 1: type "bullon ", record resolves Kept after debounce.
+        // Phase 2: backspace everything, anchor voids Deleted, record
+        // re-resolves Kept → Abandoned.
+        let mut line: Vec<char> = "bullon ".chars().collect();
+        let mut anchors = AnchorTracker::new();
+        let aid = anchors.try_register(0, 6, "bullon").unwrap();
+        let mut ledger = DecisionLedger::new();
+        let rid = log_with_candidate(
+            &mut ledger,
+            leave_alone("bullon", LeaveAloneReason::BelowActiveTier),
+            aid,
+            Some("bullion"),
+            Some(0.47),
+        );
+
+        let mut r = OutcomeResolver::with_debounce_ms(100);
+        // Phase 1 — resolve Kept on untouched word.
+        r.tick(0, anchors.anchors(), &line, &ledger);
+        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        assert_eq!(changes, vec![(rid, Outcome::Kept)], "phase 1: Kept");
+        assert!(ledger.resolve_outcome(rid, Outcome::Kept));
+
+        // Phase 2 — full backspace through ' ' (after-ignore) and the
+        // six letters (six inside-deletes, the last voids).
+        anchors.apply_delete(6, ' ');
+        line.remove(6);
+        for (p, c) in [(5, 'n'), (4, 'o'), (3, 'l'), (2, 'l'), (1, 'u'), (0, 'b')] {
+            anchors.apply_delete(p, c);
+            line.remove(p);
+        }
+        let original = anchors.anchors().iter().find(|a| a.id == aid).unwrap();
+        assert!(matches!(
+            original.state,
+            AnchorState::Void {
+                reason: VoidReason::Deleted
+            }
+        ));
+        assert!(line.is_empty());
+
+        // First tick after the deletes — observation changed
+        // (Tracking,"bullon") → (Void,empty). stable_since resets.
+        let changes = r.tick(200, anchors.anchors(), &line, &ledger);
+        assert!(changes.is_empty(), "debounce not yet elapsed after delete");
+
+        // Past debounce: record revises from Kept → Abandoned.
+        let changes = r.tick(350, anchors.anchors(), &line, &ledger);
+        assert_eq!(changes, vec![(rid, Outcome::Abandoned)]);
+    }
+
+    #[test]
+    fn revisable_abandoned_then_retype_re_resolves_to_corrected_to_other() {
+        // Phase 1: type "bullon ", backspace it entirely, record
+        // resolves Abandoned. Phase 2: retype "hello " — successor B
+        // seals at [0,5). Record re-resolves Abandoned → ToOther.
+        let mut line: Vec<char> = "bullon ".chars().collect();
+        let mut anchors = AnchorTracker::new();
+        let aid = anchors.try_register(0, 6, "bullon").unwrap();
+        let mut ledger = DecisionLedger::new();
+        let rid = log_with_candidate(
+            &mut ledger,
+            leave_alone("bullon", LeaveAloneReason::BelowActiveTier),
+            aid,
+            Some("bullion"),
+            Some(0.47),
+        );
+
+        // Phase 1: backspace ' ' then six letters; void the anchor.
+        anchors.apply_delete(6, ' ');
+        line.remove(6);
+        for (p, c) in [(5, 'n'), (4, 'o'), (3, 'l'), (2, 'l'), (1, 'u'), (0, 'b')] {
+            anchors.apply_delete(p, c);
+            line.remove(p);
+        }
+        assert!(line.is_empty());
+
+        let mut r = OutcomeResolver::with_debounce_ms(100);
+        r.tick(0, anchors.anchors(), &line, &ledger);
+        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        assert_eq!(changes, vec![(rid, Outcome::Abandoned)], "phase 1: Abandoned");
+        assert!(ledger.resolve_outcome(rid, Outcome::Abandoned));
+
+        // Phase 2: type "hello ". C2 ignores the Void anchor on each
+        // insert (Void anchors don't track). Trailing space seals
+        // "hello" at [0,5) as a new Tracking anchor B — the successor.
+        for (i, c) in "hello ".chars().enumerate() {
+            anchors.apply_insert(i, c);
+            line.insert(i, c);
+        }
+        let _new_aid = anchors.try_register(0, 5, "hello").unwrap();
+
+        // First tick after the retype — observation went from
+        // (Void,empty) to (Void,"hello"). stable_since resets.
+        let changes = r.tick(200, anchors.anchors(), &line, &ledger);
+        assert!(changes.is_empty(), "debounce not yet elapsed after retype");
+
+        // Past debounce: "hello" ≠ original "bullon" ≠ candidate
+        // "bullion" → record revises from Abandoned → CorrectedToOther.
+        let changes = r.tick(350, anchors.anchors(), &line, &ledger);
+        assert_eq!(changes, vec![(rid, Outcome::CorrectedToOther)]);
     }
 
     // ---- Position shift vs content edit --------------------------------
