@@ -747,22 +747,126 @@ struct CandidatesPayload {
     score_version: u32,
 }
 
-pub fn spawn<R: Runtime>(
+/// Max hard-restart attempts allowed within [`RESPAWN_WINDOW`]. Beyond
+/// this the engine gives up auto-respawning and goes terminal
+/// `Stopped`. The user can still recover via manual "Restart capture",
+/// which resets this counter (per the design contract — they're
+/// signaling fresh start).
+const MAX_RESPAWN_ATTEMPTS: usize = 3;
+/// Sliding window for [`MAX_RESPAWN_ATTEMPTS`]. Old attempts age out so
+/// a sidecar that crashed once last hour but is fine now doesn't
+/// count toward the cap.
+const RESPAWN_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+/// Heartbeat ≥ this many ms old → Unhealthy. Sidecar emits every 2s,
+/// so 6s = 3 missed heartbeats — meaningful staleness without
+/// false-flagging brief stalls.
+const HEARTBEAT_STALE_MS: u128 = 6_000;
+/// Heartbeat ≥ this many ms old → Stopped + auto-respawn. 15s = 7
+/// missed heartbeats; if we haven't heard from the sidecar in that
+/// long it's not coming back on its own.
+const HEARTBEAT_STOPPED_MS: u128 = 15_000;
+/// How often the watchdog re-emits the current health state even
+/// when nothing has changed — so a panel that just mounted converges
+/// to truth without waiting for a transition.
+const HEALTH_REPEAT_TICKS: u64 = 5;
+
+/// Spawn (or respawn) the Swift sidecar — `app.shell().sidecar()` plus
+/// the `TYPEASSIST_AX_PROMPT=1` env that opts into the macOS
+/// Accessibility dialog when the permission is missing. Factored out
+/// so commit O's hard-restart path uses the SAME spawn shape as the
+/// initial boot — divergence here would be a fertile source of "works
+/// the first time, then dies on restart" bugs.
+fn spawn_sidecar<R: Runtime>(
     app: &AppHandle<R>,
-) -> Result<EngineControlSender, Box<dyn std::error::Error>> {
-    // TYPEASSIST_AX_PROMPT=1 asks the sidecar to pop the macOS Accessibility
-    // dialog if the permission is missing — appropriate now that the Tauri app
-    // is the engine's host (CLAUDE.md: "leaves the prompt to L5").
-    let sidecar = app
+) -> Result<
+    (
+        tokio::sync::mpsc::Receiver<CommandEvent>,
+        tauri_plugin_shell::process::CommandChild,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let cmd = app
         .shell()
         .sidecar("typeassist-input-macos")?
         .env("TYPEASSIST_AX_PROMPT", "1");
+    Ok(cmd.spawn()?)
+}
 
+/// Try to respawn the sidecar, replacing the receiver and child handles
+/// in place. Returns `true` on success.
+///
+/// Caps total attempts via the sliding window — once
+/// [`MAX_RESPAWN_ATTEMPTS`] are recorded within [`RESPAWN_WINDOW`], the
+/// next call refuses ("we've tried enough"). Manual
+/// [`EngineControl::RestartCapture`] clears `attempts` before calling
+/// this, so the user always gets at least one fresh chance.
+///
+/// On failure (either cap hit OR spawn errored), the existing handles
+/// are left untouched — the caller should mark health Stopped and
+/// continue the loop so the control channel stays live.
+fn try_hard_restart<R: Runtime>(
+    app: &AppHandle<R>,
+    rx: &mut tokio::sync::mpsc::Receiver<CommandEvent>,
+    child: &mut tauri_plugin_shell::process::CommandChild,
+    attempts: &mut Vec<Instant>,
+) -> bool {
+    let now = Instant::now();
+    attempts.retain(|t| now.duration_since(*t) < RESPAWN_WINDOW);
+    if attempts.len() >= MAX_RESPAWN_ATTEMPTS {
+        tracing::error!(
+            "sidecar respawn refused — {}/{} attempts in last {}s",
+            attempts.len(),
+            MAX_RESPAWN_ATTEMPTS,
+            RESPAWN_WINDOW.as_secs()
+        );
+        return false;
+    }
+    attempts.push(now);
+    match spawn_sidecar(app) {
+        Ok((new_rx, new_child)) => {
+            *rx = new_rx;
+            *child = new_child;
+            tracing::info!(
+                "sidecar respawned ({}/{} attempts in window)",
+                attempts.len(),
+                MAX_RESPAWN_ATTEMPTS
+            );
+            true
+        }
+        Err(e) => {
+            tracing::error!("sidecar respawn failed: {e}");
+            false
+        }
+    }
+}
+
+/// Transition `current` to `new` if they differ, emitting the
+/// [`EVT_CAPTURE_HEALTH`] event on transition. Returns `true` iff a
+/// transition fired. Side-effect free apart from the emit + the
+/// mutation of `current`.
+fn transition_capture_health<R: Runtime>(
+    app: &AppHandle<R>,
+    current: &mut CaptureHealth,
+    new: CaptureHealth,
+) -> bool {
+    if *current != new {
+        *current = new;
+        let _ = app.emit(EVT_CAPTURE_HEALTH, CaptureHealthEvent { state: new });
+        tracing::info!("capture health -> {:?}", new);
+        true
+    } else {
+        false
+    }
+}
+
+pub fn spawn<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<EngineControlSender, Box<dyn std::error::Error>> {
     // `sidecar_child` owns the parent-side write-end of the sidecar's
     // stdin pipe. It is **moved into the async task below** and dropped
     // when that task ends — see the load-bearing comment at the bottom
     // of the closure for the lifetime contract.
-    let (mut rx, mut sidecar_child) = sidecar.spawn()?;
+    let (mut rx, mut sidecar_child) = spawn_sidecar(app)?;
     let app_handle = app.clone();
 
     // Control channel: Tauri commands → engine task. Unbounded so the
@@ -845,26 +949,79 @@ pub fn spawn<R: Runtime>(
         // commit M only emits transitions in response to incoming
         // heartbeats, so `Unknown` is the initial state (no heartbeat
         // seen yet) and only an explicit Heartbeat event can change it.
-        // `last_heartbeat_at` is written by the Heartbeat arm and
-        // read by the watchdog in commit O (heartbeat staleness →
-        // Stopped). The allows keep the build clean until that read
-        // site lands. Prefer this over an underscore prefix so the
-        // name + intent comment survive into the watchdog patch.
-        #[allow(unused_assignments, unused_variables)]
+        // **Capture-health watchdog state.** `last_heartbeat_at` is
+        // stamped each time the sidecar's Heartbeat event arrives;
+        // the periodic watchdog tick reads it to derive staleness.
+        // `respawn_attempts` is a sliding window of when we tried to
+        // hard-restart the sidecar — capped at MAX_RESPAWN_ATTEMPTS
+        // within RESPAWN_WINDOW so a crashing sidecar can't burn CPU
+        // forever. Manual RestartCapture clears the window (the user
+        // explicitly asked for a fresh start).
         let mut last_heartbeat_at: Option<Instant> = None;
         let mut current_capture_health: CaptureHealth = CaptureHealth::Unknown;
+        let mut respawn_attempts: Vec<Instant> = Vec::new();
 
-        // The receive loop selects between the sidecar event stream
-        // and the control channel so a Tauri command (e.g. Reset
-        // LEXICON button) is processed without waiting for the next
-        // keystroke. `biased` keeps sidecar events ahead of control
-        // commands when both are ready — keystroke ordering matters,
-        // control commands don't.
+        // **Capture-health watchdog** — ticks every 1s, reads
+        // `last_heartbeat_at` to derive freshness, and drives
+        // `current_capture_health` to Unhealthy / Stopped on
+        // staleness. Also auto-attempts hard restart when Stopped
+        // (within the attempt window) and re-emits health state
+        // every ~5s so panel reloads converge without waiting for
+        // the next transition.
+        let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(1));
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut watchdog_ticks: u64 = 0;
+
+        // The receive loop selects between the sidecar event stream,
+        // the control channel, and the capture-health watchdog so:
+        //   - keystroke events run fastest (biased ordering),
+        //   - Tauri commands are processed without waiting for the
+        //     next keystroke,
+        //   - the watchdog detects silent capture death even when
+        //     neither stream is active.
+        // `biased` keeps sidecar events ahead of the other arms when
+        // multiple are ready — input ordering matters, control and
+        // watchdog ticks don't.
         'engine_loop: loop {
             tokio::select! {
                 biased;
                 event = rx.recv() => {
-                    let Some(event) = event else { break 'engine_loop; };
+                    let Some(event) = event else {
+                        // rx is closed but no Terminated arm fired —
+                        // sidecar dropped its stdout / event stream
+                        // without a clean signal. Treat as termination
+                        // and try respawn through the same path.
+                        tracing::warn!(
+                            "sidecar event stream closed — attempting hard restart"
+                        );
+                        transition_capture_health(
+                            &app_handle,
+                            &mut current_capture_health,
+                            CaptureHealth::Stopped,
+                        );
+                        if try_hard_restart(
+                            &app_handle,
+                            &mut rx,
+                            &mut sidecar_child,
+                            &mut respawn_attempts,
+                        ) {
+                            last_heartbeat_at = Some(Instant::now());
+                        } else {
+                            // Respawn refused or failed — rx is still
+                            // the old closed receiver. Sleep before
+                            // the next loop iteration so we don't
+                            // tight-loop on `rx.recv() -> None`. The
+                            // attempt window keeps sliding; once 30s
+                            // pass since the oldest attempt, the cap
+                            // releases and we can try again. The
+                            // control channel stays live throughout
+                            // so manual Restart capture works.
+                            tokio::time::sleep(
+                                std::time::Duration::from_secs(5),
+                            ).await;
+                        }
+                        continue;
+                    };
                     match event {
                 CommandEvent::Stdout(bytes) => {
                     // Plugin already splits on newline; one event = one line.
@@ -977,41 +1134,24 @@ pub fn spawn<R: Runtime>(
                         }
                         InputEvent::Heartbeat { tap_enabled, .. } => {
                             // Capture-health proof-of-life. Stamp the
-                            // arrival time + tap_enabled flag, derive
-                            // the new health state, and emit only on
-                            // transition (not every heartbeat — that'd
-                            // be 30 noisy events per minute). Don't
-                            // touch the FEED; heartbeats aren't input.
-                            // Log inter-heartbeat gap at trace level so
-                            // the read site of `last_heartbeat_at`
-                            // exists until the watchdog wires up — and
-                            // the gap is genuinely useful for diagnosing
-                            // sidecar pauses against expectations.
-                            let now = Instant::now();
-                            let elapsed = last_heartbeat_at
-                                .map(|prev| now.duration_since(prev));
-                            last_heartbeat_at = Some(now);
-                            tracing::trace!(
-                                "heartbeat tap_enabled={} elapsed={:?}",
-                                tap_enabled,
-                                elapsed
-                            );
+                            // arrival time + tap_enabled flag and
+                            // transition health via the shared helper
+                            // (which only emits on actual transitions).
+                            // Don't touch the FEED; heartbeats aren't
+                            // input. The watchdog tick uses
+                            // last_heartbeat_at to drive staleness
+                            // transitions when this arm isn't firing.
+                            last_heartbeat_at = Some(Instant::now());
                             let new_health = if tap_enabled {
                                 CaptureHealth::Live
                             } else {
                                 CaptureHealth::Unhealthy
                             };
-                            if new_health != current_capture_health {
-                                current_capture_health = new_health;
-                                let _ = app_handle.emit(
-                                    EVT_CAPTURE_HEALTH,
-                                    CaptureHealthEvent { state: new_health },
-                                );
-                                tracing::info!(
-                                    "capture health -> {:?}",
-                                    new_health
-                                );
-                            }
+                            transition_capture_health(
+                                &app_handle,
+                                &mut current_capture_health,
+                                new_health,
+                            );
                         }
                         InputEvent::Shutdown => break 'engine_loop,
                         InputEvent::Backspace { .. } => {
@@ -1331,11 +1471,45 @@ pub fn spawn<R: Runtime>(
                 }
                 CommandEvent::Terminated(payload) => {
                     tracing::warn!(
-                        "sidecar terminated (code={:?}, signal={:?})",
+                        "sidecar terminated (code={:?}, signal={:?}) — attempting hard restart",
                         payload.code,
                         payload.signal
                     );
-                    break 'engine_loop;
+                    // Always mark Stopped first so the panel reflects
+                    // truth even if the respawn succeeds quickly —
+                    // the user momentarily sees red, then green when
+                    // the new sidecar's first heartbeat arrives.
+                    transition_capture_health(
+                        &app_handle,
+                        &mut current_capture_health,
+                        CaptureHealth::Stopped,
+                    );
+                    if try_hard_restart(
+                        &app_handle,
+                        &mut rx,
+                        &mut sidecar_child,
+                        &mut respawn_attempts,
+                    ) {
+                        // Reset heartbeat clock so the watchdog
+                        // doesn't immediately fire on staleness while
+                        // the new sidecar is booting.
+                        last_heartbeat_at = Some(Instant::now());
+                    } else {
+                        // Respawn refused (cap hit) or failed —
+                        // terminal Stopped. Engine task LIVES so the
+                        // control channel stays open; manual
+                        // RestartCapture clears the attempt window
+                        // and tries again. Sleep before the next
+                        // loop iteration so the now-closed rx doesn't
+                        // immediately tight-loop on .recv() → None.
+                        tracing::error!(
+                            "sidecar respawn unavailable — capture is terminal Stopped \
+                             until manual Restart capture"
+                        );
+                        tokio::time::sleep(
+                            std::time::Duration::from_secs(5),
+                        ).await;
+                    }
                 }
                 _ => {}
                     }
@@ -1370,27 +1544,47 @@ pub fn spawn<R: Runtime>(
                             );
                         }
                         EngineControl::RestartCapture => {
-                            // Soft capture restart — write the
-                            // OutboundCommand to the sidecar's stdin.
-                            // The newline terminator matches the
-                            // line-delimited JSON protocol; the Swift
-                            // Bridge reads one command per line.
-                            //
-                            // On failure (sidecar's stdin closed, etc)
-                            // we log + drop. Commit O's hard-restart
-                            // path escalates: if no heartbeat arrives
-                            // within the soft-restart timeout the
-                            // watchdog respawns the sidecar.
+                            // Manual recovery path. Per the design
+                            // contract: clear the respawn attempt
+                            // window FIRST — the user explicitly
+                            // asked, so this is a fresh start signal
+                            // even if we were terminal-Stopped.
+                            respawn_attempts.clear();
+                            // Try soft restart by writing to the
+                            // sidecar's stdin. Common case: sidecar
+                            // alive but tap stuck. Soft is enough.
                             const RESTART_LINE: &[u8] =
                                 b"{\"type\":\"restart_tap\"}\n";
-                            if let Err(e) = sidecar_child.write(RESTART_LINE) {
-                                tracing::warn!(
-                                    "failed to write restart_tap to sidecar: {e}"
-                                );
-                            } else {
-                                tracing::info!(
-                                    "soft capture restart requested"
-                                );
+                            match sidecar_child.write(RESTART_LINE) {
+                                Ok(_) => {
+                                    tracing::info!(
+                                        "soft capture restart requested"
+                                    );
+                                }
+                                Err(e) => {
+                                    // Soft restart failed — sidecar's
+                                    // stdin is closed, which means
+                                    // the sidecar process is dead.
+                                    // Escalate to hard restart
+                                    // immediately rather than waiting
+                                    // for the watchdog.
+                                    tracing::warn!(
+                                        "soft restart failed ({e}) — escalating to hard restart"
+                                    );
+                                    transition_capture_health(
+                                        &app_handle,
+                                        &mut current_capture_health,
+                                        CaptureHealth::Stopped,
+                                    );
+                                    if try_hard_restart(
+                                        &app_handle,
+                                        &mut rx,
+                                        &mut sidecar_child,
+                                        &mut respawn_attempts,
+                                    ) {
+                                        last_heartbeat_at = Some(Instant::now());
+                                    }
+                                }
                             }
                         }
                         EngineControl::SetInputPaused(paused) => {
@@ -1426,6 +1620,73 @@ pub fn spawn<R: Runtime>(
                         }
                     }
                 }
+                _ = watchdog.tick() => {
+                    // Capture-health watchdog. Reads
+                    // `last_heartbeat_at` to derive heartbeat
+                    // staleness, transitions health state, attempts
+                    // hard restart when Stopped, and re-emits current
+                    // state every HEALTH_REPEAT_TICKS so panel
+                    // reloads converge to truth without waiting for a
+                    // transition.
+                    watchdog_ticks = watchdog_ticks.wrapping_add(1);
+
+                    // Compute desired state from heartbeat freshness.
+                    let desired_health = match last_heartbeat_at {
+                        // Still cold-start — no heartbeat yet. Leave
+                        // current state (typically Unknown) alone.
+                        None => current_capture_health,
+                        Some(prev) => {
+                            let elapsed_ms = Instant::now()
+                                .duration_since(prev)
+                                .as_millis();
+                            if elapsed_ms >= HEARTBEAT_STOPPED_MS {
+                                CaptureHealth::Stopped
+                            } else if elapsed_ms >= HEARTBEAT_STALE_MS {
+                                CaptureHealth::Unhealthy
+                            } else {
+                                // Fresh heartbeat. Don't override the
+                                // heartbeat-driven state — that arm
+                                // already set Live or Unhealthy
+                                // correctly based on tap_enabled.
+                                current_capture_health
+                            }
+                        }
+                    };
+
+                    let transitioned = transition_capture_health(
+                        &app_handle,
+                        &mut current_capture_health,
+                        desired_health,
+                    );
+
+                    // Auto-respawn on Stopped. The respawn helper
+                    // throttles via the attempt window so a crashing
+                    // sidecar can't churn forever. If the cap is hit,
+                    // we stay Stopped and wait for the user to click
+                    // Restart capture (which clears the window).
+                    if matches!(current_capture_health, CaptureHealth::Stopped)
+                        && transitioned
+                    {
+                        if try_hard_restart(
+                            &app_handle,
+                            &mut rx,
+                            &mut sidecar_child,
+                            &mut respawn_attempts,
+                        ) {
+                            last_heartbeat_at = Some(Instant::now());
+                        }
+                    }
+
+                    // Periodic re-emit so a freshly-mounted panel
+                    // sees the current state within seconds even if
+                    // no transition has fired since it mounted.
+                    if watchdog_ticks % HEALTH_REPEAT_TICKS == 0 {
+                        let _ = app_handle.emit(
+                            EVT_CAPTURE_HEALTH,
+                            CaptureHealthEvent { state: current_capture_health },
+                        );
+                    }
+                }
             }
         }
 
@@ -1442,8 +1703,20 @@ pub fn spawn<R: Runtime>(
         // and the sidecar exits cleanly via `EventTap::handleCommand`
         // → `exit(0)`. That EOF-as-shutdown path IS the intended
         // graceful teardown — firing it here when the loop ends (Tauri
-        // quitting, `CommandEvent::Terminated`, panic unwind) means the
-        // sidecar dies with us instead of leaking.
+        // quitting, panic unwind) means the sidecar dies with us
+        // instead of leaking.
+        //
+        // **C5 commit O update.** The engine task now SURVIVES
+        // CommandEvent::Terminated (it respawns the sidecar via
+        // try_hard_restart). The loop end is no longer the ordinary
+        // path — it's only reached on Tauri app shutdown / panic
+        // unwind. The drop's job is unchanged, but now it ONLY runs
+        // at app shutdown rather than mid-session. The respawn path
+        // overwrites `sidecar_child` in place — the OLD CommandChild's
+        // Drop runs at that point and closes the old stdin pipe (the
+        // sidecar may already be dead, in which case the close is a
+        // no-op). Net effect: NO orphaned sidecars on shutdown, NO
+        // mid-session shutdown of a still-working sidecar.
         //
         // Why this can't move earlier or disappear:
         //   * Drop it before the loop runs (e.g. let it fall out of the
