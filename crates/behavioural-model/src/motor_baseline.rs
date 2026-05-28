@@ -72,8 +72,9 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use volatility_map::{finger_for, Finger, Hand};
+use volatility_map::{anatomical_order, finger_for, Finger, Hand};
 
+use crate::events::InputEvent;
 use crate::MAX_TYPING_INTERVAL_MS;
 
 /// **Recency half-life in keystrokes.** A bucket's "effective sample
@@ -758,6 +759,91 @@ impl MotorBaseline {
     pub fn hand_cell(&self, hand: Hand) -> Option<EwmaCell> {
         self.hands.get(&hand).copied()
     }
+
+    /// Observe-or-ignore — dispatch an [`InputEvent`] from L2's main
+    /// ingest loop. Only `Key` events update the baseline; other
+    /// variants are no-ops. This is the entry point
+    /// `BehaviouralModel::ingest` calls.
+    pub fn observe(&mut self, event: &InputEvent) {
+        if let InputEvent::Key {
+            key,
+            timestamp_ms,
+            dwell_ms,
+            ..
+        } = event
+        {
+            self.observe_key(key, *timestamp_ms, *dwell_ms);
+        }
+    }
+
+    /// Diagnostic per-finger snapshot for the debug panel. Rows are
+    /// emitted in anatomical order (left pinky → left thumb → right
+    /// thumb → right pinky). Fingers with zero samples are still
+    /// included (with `n_eff = 0` and `iki_mean = None`) so the panel
+    /// shows the full hand outline rather than gappy rows that
+    /// reshuffle as data arrives.
+    pub fn snapshot(&self) -> MotorBaselineSnapshot {
+        use Finger::{Index, Middle, Pinky, Ring, Thumb};
+        use Hand::{Left, Right};
+        let all_fingers: &[(Hand, Finger)] = &[
+            (Left, Pinky),
+            (Left, Ring),
+            (Left, Middle),
+            (Left, Index),
+            (Left, Thumb),
+            (Right, Thumb),
+            (Right, Index),
+            (Right, Middle),
+            (Right, Ring),
+            (Right, Pinky),
+        ];
+        let mut rows: Vec<MotorFingerRow> = all_fingers
+            .iter()
+            .map(|&(hand, finger)| {
+                let reliability = self.per_finger_reliability(hand, finger);
+                let dwell = self.finger_cell(hand, finger).unwrap_or_default();
+                let iki_cell = self.iki_fingers.get(&(hand, finger)).copied();
+                MotorFingerRow {
+                    hand,
+                    finger,
+                    reliability_score: reliability.score,
+                    n_eff: reliability.n_eff,
+                    dwell_mean_ms: if reliability.n_eff > 0.0 {
+                        Some(dwell.mean)
+                    } else {
+                        None
+                    },
+                    iki_mean_ms: iki_cell
+                        .filter(|c| c.n_eff > 0.0)
+                        .map(|c| c.mean),
+                }
+            })
+            .collect();
+        rows.sort_by_key(|r| anatomical_order(r.hand, r.finger));
+        MotorBaselineSnapshot { per_finger: rows }
+    }
+}
+
+/// Diagnostic snapshot — what the debug panel renders. One row per
+/// `(hand, finger)` in anatomical order; fingers with no samples
+/// still appear so the table shape is stable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MotorBaselineSnapshot {
+    pub per_finger: Vec<MotorFingerRow>,
+}
+
+/// One row of [`MotorBaselineSnapshot::per_finger`]. `dwell_mean_ms`
+/// and `iki_mean_ms` are `None` when no samples have been observed
+/// for that finger; the panel renders those as dashes rather than
+/// fabricating a zero.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MotorFingerRow {
+    pub hand: Hand,
+    pub finger: Finger,
+    pub reliability_score: f64,
+    pub n_eff: f64,
+    pub dwell_mean_ms: Option<f64>,
+    pub iki_mean_ms: Option<f64>,
 }
 
 /// Lowercased single-character "leaf key" used to index the per-key
