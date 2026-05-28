@@ -12,6 +12,7 @@ pub mod asymmetry;
 pub mod events;
 pub mod fatigue;
 pub mod ghost_keys;
+pub mod motor_baseline;
 pub mod slip_detector;
 pub mod temporal;
 pub mod timing;
