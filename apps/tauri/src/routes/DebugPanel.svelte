@@ -443,17 +443,17 @@
   /// `top_candidate` targets a learned word.
   let learnedSet: Set<string> = new Set();
 
-  /// **Meta-context pause** (Phase 2 follow-up). Two signals combine:
-  /// `manualPaused` (user clicked the LEXICON-header toggle), and
-  /// `windowFocused` (TypeAssist's debug window has DOM focus — i.e.
-  /// the user is typing INTO TypeAssist itself). Either one suppresses
-  /// learning. `engineReportedPaused` mirrors what the engine actually
-  /// applied — it should track `(manualPaused || windowFocused)` once
-  /// the latest set_learning_paused round-trips, and is what the UI
-  /// indicator reads (so the indicator can never drift from the
-  /// engine's real flag).
+  /// **Meta-context pause** — manual only. An earlier prototype also
+  /// auto-paused on debug-window focus, but that mechanism guarded
+  /// the wrong thing: it fired while the user was merely WATCHING the
+  /// panel (the panel has no text input — keystrokes don't go INTO
+  /// it) and never fired in the actual pollution case (typing about
+  /// TypeAssist in another app's chat). Recency-reclaim is robust
+  /// enough as a backstop; this leaves one explicit knob the user
+  /// owns. `engineReportedPaused` mirrors what the engine actually
+  /// applied (echo from `engine://learning-paused`), so the indicator
+  /// can never silently drift from the engine's real flag.
   let manualPaused = false;
-  let windowFocused = false;
   let engineReportedPaused = false;
 
   let feedEl: HTMLDivElement;
@@ -556,43 +556,19 @@
     }
   }
 
-  /// Derived pause bit — manual toggle OR debug-window focus. This
-  /// is the SINGLE boolean that leaves the panel for the engine via
-  /// `set_learning_paused`. Privacy: only a boolean leaves. The
-  /// engine never learns which app the user is in (the DOM gives
-  /// the panel the focus signal locally; the panel translates it to
-  /// one bit).
-  $: pauseBit = manualPaused || windowFocused;
-
-  /// Whenever the derived bit changes, post it to the engine. The
-  /// engine's echo on `engine://learning-paused` then drives the
-  /// indicator — keeping the UI honest about the engine's actual
-  /// flag rather than the panel's optimistic guess. Reactive
-  /// statement tracks `pauseBit` so Svelte re-fires on every change.
+  /// Whenever the manual toggle flips, post the new state to the
+  /// engine. The engine's echo on `engine://learning-paused` then
+  /// drives the indicator — keeping the UI honest about the engine's
+  /// actual flag rather than the panel's optimistic guess.
   $: {
-    void pauseBit;
-    void invoke("set_learning_paused", { paused: pauseBit }).catch((err) =>
+    void manualPaused;
+    void invoke("set_learning_paused", { paused: manualPaused }).catch((err) =>
       console.error("set_learning_paused failed:", err),
     );
   }
 
   function togglePauseLearning() {
     manualPaused = !manualPaused;
-  }
-
-  // Window focus listeners — drives the auto-pause for "user typing
-  // INTO TypeAssist's own window." DOM blur/focus on `window` fire
-  // exactly when the OS hands focus to / takes it from the webview,
-  // which (since the only thing in the webview right now is the debug
-  // panel) is the right signal for self-exclusion. The OS never tells
-  // us about other apps — only when our own window gains or loses
-  // focus, which is the non-invasive native capability every app has.
-  // No NSWorkspace, no bundle-ID denylist.
-  function onWindowFocus() {
-    windowFocused = true;
-  }
-  function onWindowBlur() {
-    windowFocused = false;
   }
 
   onMount(async () => {
@@ -608,14 +584,6 @@
       // ignore
     }
     panelHeight = clampHeight(initial ?? Math.round(window.innerHeight * 0.6));
-
-    // Seed the focus state from the current DOM and subscribe to
-    // future changes. Order matters: the initial `windowFocused = …`
-    // here triggers the reactive pause-bit, so the engine receives
-    // the right starting state on first paint.
-    windowFocused = document.hasFocus();
-    window.addEventListener("focus", onWindowFocus);
-    window.addEventListener("blur", onWindowBlur);
 
     unlistens.push(
       await listen<KeystrokePayload>("engine://keystroke", (e) => {
@@ -787,8 +755,6 @@
   onDestroy(() => {
     for (const u of unlistens) u();
     unlistens = [];
-    window.removeEventListener("focus", onWindowFocus);
-    window.removeEventListener("blur", onWindowBlur);
   });
 
   // Render-helpers — keep templates terse.
@@ -1354,13 +1320,9 @@
             {#if engineReportedPaused}
               <span
                 class="lex-paused-tag"
-                title={manualPaused && windowFocused
-                  ? "paused — manual toggle ON, and TypeAssist's debug window is focused"
-                  : manualPaused
-                    ? "paused — manual toggle ON"
-                    : "auto-paused — TypeAssist's debug window is focused (typing here counts as meta-context, not learning data)"}
+                title="learning paused — note_record short-circuits. Records still appear in FEED/LOG but contribute nothing to the lexicon."
               >
-                · learning paused{manualPaused ? " (manual)" : " (debug-window focus)"}
+                · learning paused
               </span>
             {/if}
           </span>
@@ -2303,8 +2265,7 @@
   }
   .lex-pause-on:hover { background: #4a352a; }
   /* Quiet inline tag rendered next to the casing baseline when the
-     engine reports learning is currently paused — distinguishes
-     manual-paused from auto-paused via the embedded text. */
+     engine reports learning is currently paused. */
   .lex-paused-tag {
     color: #d2885d;
     font-weight: 600;
