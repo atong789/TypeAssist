@@ -24,4 +24,24 @@ guard tap.start() else {
 bridge.emit(.ready)
 bridge.runInputLoop(commandHandler: tap.handleCommand(_:))
 
+// Capture-health heartbeat — fires on the main run loop every
+// `HEARTBEAT_INTERVAL_SECONDS`, reporting the tap's current enabled
+// state to the engine. The engine's watchdog uses these to detect
+// silent capture death (tap dead OR sidecar wedged) independent of
+// whether the user is currently typing.
+let HEARTBEAT_INTERVAL_SECONDS: TimeInterval = 2.0
+let heartbeatTimer = Timer.scheduledTimer(withTimeInterval: HEARTBEAT_INTERVAL_SECONDS, repeats: true) { _ in
+    let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+    bridge.emit(.heartbeat(timestampMs: nowMs, tapEnabled: tap.isTapEnabled()))
+}
+// Schedule on `.common` modes so the timer fires while modal panels
+// (rare in a sidecar, but defensive) don't pause it.
+RunLoop.current.add(heartbeatTimer, forMode: .common)
+// Emit one immediately so the engine doesn't wait the full interval
+// to see its first proof of life.
+bridge.emit(.heartbeat(
+    timestampMs: UInt64(Date().timeIntervalSince1970 * 1000),
+    tapEnabled: tap.isTapEnabled()
+))
+
 RunLoop.current.run()

@@ -909,6 +909,12 @@ pub fn spawn<R: Runtime>(
                                  grant in System Settings › Privacy & Security › Accessibility"
                             );
                         }
+                        InputEvent::Heartbeat { .. } => {
+                            // Capture-health proof-of-life — surfaced in
+                            // commit M (CaptureHealth state + panel pill).
+                            // For now: parsed cleanly and dropped. Don't
+                            // FEED it; not user input.
+                        }
                         InputEvent::Shutdown => break 'engine_loop,
                         InputEvent::Backspace { .. } => {
                             // Emit so the debug feed shows backspaces — they're
