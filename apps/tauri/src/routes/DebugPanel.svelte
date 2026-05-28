@@ -456,6 +456,17 @@
   let manualPaused = false;
   let engineReportedPaused = false;
 
+  /// **Hard pause** — distinct from `manualPaused` above. When set,
+  /// the engine drops Key/Backspace events at its task boundary, so
+  /// the FEED freezes and the engine effectively sleeps. Used when
+  /// the user is talking ABOUT the system and wants the engine
+  /// quiet, not just suppressing the credit step. `engineReportedInputPaused`
+  /// mirrors what the engine applied (echo from
+  /// `engine://input-paused`), same drift-prevention rationale as
+  /// the learning-paused echo.
+  let inputPaused = false;
+  let engineReportedInputPaused = false;
+
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
 
@@ -567,8 +578,23 @@
     );
   }
 
+  /// Same shape for hard pause. Posted on every toggle; engine echoes
+  /// back via `engine://input-paused`. On transition to true, the
+  /// engine flushes its line state and emits `engine://line-reset` —
+  /// the panel's existing line-reset listener already handles that.
+  $: {
+    void inputPaused;
+    void invoke("set_input_paused", { paused: inputPaused }).catch((err) =>
+      console.error("set_input_paused failed:", err),
+    );
+  }
+
   function togglePauseLearning() {
     manualPaused = !manualPaused;
+  }
+
+  function togglePauseInput() {
+    inputPaused = !inputPaused;
   }
 
   onMount(async () => {
@@ -730,6 +756,16 @@
       // the engine left it rather than where the panel guessed).
       await listen<{ paused: boolean }>("engine://learning-paused", (e) => {
         engineReportedPaused = e.payload.paused;
+      }),
+    );
+    unlistens.push(
+      // Same echo for hard input-pause — drives the "input paused"
+      // indicator state. The engine's emitted line-reset that
+      // accompanies a pause-on transition is handled by the existing
+      // engine://line-reset listener, which already wipes the
+      // current-line panel state.
+      await listen<{ paused: boolean }>("engine://input-paused", (e) => {
+        engineReportedInputPaused = e.payload.paused;
       }),
     );
     unlistens.push(
@@ -1317,7 +1353,14 @@
               <span class="casing-rescue-off">rescue OFF</span>
             {/if}
             <span class="casing-samples">(n={casingBaseline.sample_count.toFixed(0)})</span>
-            {#if engineReportedPaused}
+            {#if engineReportedInputPaused}
+              <span
+                class="lex-input-paused-tag"
+                title="input paused — engine drops Key/Backspace events at its task boundary. FEED is frozen; nothing observes."
+              >
+                · input paused
+              </span>
+            {:else if engineReportedPaused}
               <span
                 class="lex-paused-tag"
                 title="learning paused — note_record short-circuits. Records still appear in FEED/LOG but contribute nothing to the lexicon."
@@ -1330,10 +1373,19 @@
             type="button"
             class="lex-pause"
             class:lex-pause-on={manualPaused}
-            title="Manually suppress LEXICON credit. Use before typing about TypeAssist into any context the auto-pause doesn't cover (e.g. Claude chat). Auto-pause for the debug window itself is always on."
+            title="Soft pause — suppress LEXICON credit but keep observing. FEED and decisions keep flowing; the lexicon just doesn't update. Use when watching the engine work without polluting vocabulary."
             on:click={togglePauseLearning}
           >
             {manualPaused ? "Resume learning" : "Pause learning"}
+          </button>
+          <button
+            type="button"
+            class="lex-pause lex-pause-input"
+            class:lex-pause-on={inputPaused}
+            title="Hard pause — engine drops Key/Backspace events at its task boundary. FEED freezes; engine effectively sleeps. Use when typing about the system in chat. Toggling triggers a line-reset on the engine so resume starts on a clean boundary."
+            on:click={togglePauseInput}
+          >
+            {inputPaused ? "Resume input" : "Pause input"}
           </button>
           <button
             type="button"
@@ -2269,6 +2321,12 @@
   .lex-paused-tag {
     color: #d2885d;
     font-weight: 600;
+  }
+  /* Stronger tone — hard pause (engine asleep) is more severe than
+     soft pause (engine watching but not crediting). */
+  .lex-input-paused-tag {
+    color: #c8553d;
+    font-weight: 700;
   }
 
   /* C5b Phase 2 — LIVE indicator on confirmed proposals + star

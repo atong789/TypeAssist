@@ -45,6 +45,22 @@ fn set_learning_paused(
         .map_err(|e| format!("engine control channel closed: {e}"))
 }
 
+/// Tauri command: hard-pause the engine. While true, Key/Backspace
+/// events from the sidecar are dropped at the engine task boundary —
+/// before model.ingest, before tokenization, before any emission.
+/// The FEED freezes, the engine effectively sleeps. Used by the
+/// "Pause input" toggle when the user is talking ABOUT the system
+/// and wants the engine quiet (rather than just suppressing learning).
+#[tauri::command]
+fn set_input_paused(
+    paused: bool,
+    sender: tauri::State<EngineControlSender>,
+) -> Result<(), String> {
+    sender
+        .send(EngineControl::SetInputPaused(paused))
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -55,7 +71,11 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![reset_lexicon, set_learning_paused])
+        .invoke_handler(tauri::generate_handler![
+            reset_lexicon,
+            set_learning_paused,
+            set_input_paused
+        ])
         .setup(|app| {
             match engine::spawn(&app.handle()) {
                 Ok(control_tx) => {

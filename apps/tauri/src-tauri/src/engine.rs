@@ -121,6 +121,13 @@ pub const EVT_LEXICON_RESET: &str = "engine://lexicon-reset";
 /// engine's actual flag (not just the panel's optimistic state).
 /// Payload: `{ paused: bool }`. See [`EngineControl::SetLearningPaused`].
 pub const EVT_LEARNING_PAUSED: &str = "engine://learning-paused";
+/// Fired whenever the engine's HARD-pause flag changes. Hard pause
+/// drops Key/Backspace events at the engine task boundary — before
+/// model.ingest, before tokenization, before any emission. The FEED
+/// freezes, the engine effectively sleeps. Distinct from learning
+/// pause (which still observes). Payload: `{ paused: bool }`.
+/// See [`EngineControl::SetInputPaused`].
+pub const EVT_INPUT_PAUSED: &str = "engine://input-paused";
 
 /// Control commands the engine task accepts from Tauri commands. Sent
 /// through an unbounded mpsc channel whose sender lives in Tauri's
@@ -141,11 +148,29 @@ pub enum EngineControl {
     /// `note_record` call is a no-op (see
     /// [`correction_engine::LexiconProposer::set_credit_paused`]) —
     /// records ingested while paused leave no proposer trace and are
-    /// NOT retroactively credited on resume. Used by the panel to
-    /// (a) self-exclude the debug window via DOM focus events, and
-    /// (b) honor a manual pause toggle for any other meta-context.
-    /// Emits [`EVT_LEARNING_PAUSED`] echoing the new state.
+    /// NOT retroactively credited on resume. Used by the panel's
+    /// manual "Pause learning" toggle. Emits [`EVT_LEARNING_PAUSED`]
+    /// echoing the new state.
     SetLearningPaused(bool),
+    /// **Hard pause** — drop every Key/Backspace event at the engine
+    /// task boundary, before [`BehaviouralModel::ingest`]. The engine
+    /// effectively sleeps: no L2 ingest, no tokenization, no
+    /// decisions, no events. Used by the panel's "Pause input" toggle
+    /// when the user is talking ABOUT the system and wants the engine
+    /// quiet (rather than just observing without learning).
+    ///
+    /// Transition to paused-on triggers a line-state flush (same as a
+    /// newline reset): line_buf, line_dwells, caret, anchors,
+    /// tokenizer — so the engine wakes on a clean boundary when input
+    /// resumes. Pending ledger records without anchors linger but
+    /// can't resolve (same as any unmonitored typing gap).
+    ///
+    /// Hard implies soft for learning purposes — paused input means
+    /// no records flow, so the proposer never gets called regardless
+    /// of `credit_paused`. The two flags stay independent at the
+    /// engine; the panel surfaces them as separate indicators.
+    /// Emits [`EVT_INPUT_PAUSED`] echoing the new state.
+    SetInputPaused(bool),
 }
 
 /// Tauri-managed handle for sending [`EngineControl`] messages to
@@ -336,6 +361,14 @@ struct LexiconProposalEvent {
 /// added (e.g. a reason string for "auto-paused" vs "manual").
 #[derive(Serialize, Clone)]
 struct LearningPausedEvent {
+    paused: bool,
+}
+
+/// Payload for [`EVT_INPUT_PAUSED`]. Same shape as learning-paused so
+/// the panel can treat the two echoes identically (different stores,
+/// same listener style).
+#[derive(Serialize, Clone)]
+struct InputPausedEvent {
     paused: bool,
 }
 
@@ -703,6 +736,15 @@ pub fn spawn<R: Runtime>(
         // and Left / Right / Home / End nav keys; mouse-click moves and
         // paste are intentionally out of scope (Component 5 AX backstop).
         let mut caret: usize = 0;
+        // **Hard pause** — when true, Key/Backspace events from the
+        // sidecar are dropped before model.ingest and never reach
+        // tokenizer / decision / ledger / proposer. Lifecycle events
+        // (Ready/PermissionRequired/Shutdown) flow through unchanged.
+        // Toggled by [`EngineControl::SetInputPaused`]; transition to
+        // true flushes line state (line_buf / line_dwells / caret /
+        // anchors / tokenizer) so the engine wakes on a clean
+        // boundary when input resumes.
+        let mut input_paused: bool = false;
 
         // The receive loop selects between the sidecar event stream
         // and the control channel so a Tauri command (e.g. Reset
@@ -728,6 +770,21 @@ pub fn spawn<R: Runtime>(
                     let Ok(parsed) = serde_json::from_str::<InputEvent>(line) else {
                         continue;
                     };
+
+                    // Hard pause: drop keystrokes at the engine boundary.
+                    // Lifecycle events (Ready/PermissionRequired/Shutdown)
+                    // still flow — those aren't input, they're the sidecar
+                    // telling us what state it's in. Continues the outer
+                    // 'engine_loop so the next sidecar event (or control
+                    // command) is awaited.
+                    if input_paused
+                        && matches!(
+                            parsed,
+                            InputEvent::Key { .. } | InputEvent::Backspace { .. }
+                        )
+                    {
+                        continue;
+                    }
 
                     // Observe-only L2 dispatch. Only Key/Backspace flow into
                     // the model — sidecar lifecycle events (Ready/Shutdown/…)
@@ -1118,6 +1175,37 @@ pub fn spawn<R: Runtime>(
                             let _ = app_handle.emit(
                                 EVT_LEARNING_PAUSED,
                                 LearningPausedEvent { paused: proposer.credit_paused() },
+                            );
+                        }
+                        EngineControl::SetInputPaused(paused) => {
+                            let was_paused = input_paused;
+                            input_paused = paused;
+                            if !was_paused && paused {
+                                // Pause-on transition: flush line state
+                                // so the engine wakes on a clean boundary
+                                // when input resumes. Same shape as the
+                                // multi-char/paste reset path elsewhere
+                                // in the loop. Ledger pendings are left
+                                // alone — they'd just linger without
+                                // anchors, same as any unmonitored gap.
+                                tokenizer.reset_line();
+                                line_buf.clear();
+                                line_dwells.clear();
+                                caret = 0;
+                                anchors.clear();
+                                let _ = app_handle.emit(EVT_LINE_RESET, ());
+                                let snap = anchors.snapshot();
+                                let _ = app_handle.emit(
+                                    EVT_ANCHOR_SNAPSHOT,
+                                    anchor_emit_payload(&snap, &line_buf),
+                                );
+                            }
+                            let _ = app_handle.emit(
+                                EVT_INPUT_PAUSED,
+                                InputPausedEvent { paused: input_paused },
+                            );
+                            tracing::info!(
+                                "engine input pause set to {input_paused}"
                             );
                         }
                     }
