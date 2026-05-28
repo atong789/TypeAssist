@@ -688,6 +688,33 @@ impl LexiconProposer {
         self.record_contributions.clear();
     }
 
+    /// **Reset LEXICON — true engine-side wipe.** Forgets every
+    /// proposal, every per-record contribution, and every
+    /// learned-at-ms entry, **and** clears the lex's learned set so
+    /// `is_known` falls back to the bundled clean dict + seeds. After
+    /// this returns:
+    ///
+    ///   * `snapshot()` is empty.
+    ///   * `learned_snapshot()` is empty.
+    ///   * Any previously-confirmed word is no longer known.
+    ///
+    /// Distinct from [`Self::clear`] (which only touches proposer
+    /// state, leaving any words that were already in `lex.learned`
+    /// in place). This is the operation the debug panel's "Reset
+    /// LEXICON" button needs: a Confirmed word's state lives in BOTH
+    /// the proposer (so the next re-eval syncs back) AND the lex —
+    /// resetting one without the other re-pollutes immediately.
+    ///
+    /// Casing baseline is intentionally NOT reset — it's a property
+    /// of the user's typing rhythm, not their learned vocabulary, and
+    /// is rebuilt from a wider rolling window anyway.
+    pub fn reset_all(&mut self) {
+        self.proposals.clear();
+        self.record_contributions.clear();
+        self.learned_at_ms.clear();
+        self.lex.clear_learned();
+    }
+
     // ---- Internal helpers --------------------------------------------
 
     fn credit_kept_contribution(&mut self, record: &LogRecord) {
@@ -2253,6 +2280,54 @@ mod tests {
             },
             "re-eval should have demoted Klorvex to Held when Klorvox joined is_known"
         );
+    }
+
+    // ---- Reset LEXICON (true engine-side wipe) -------------------------
+
+    #[test]
+    fn reset_all_wipes_proposer_state_and_learned_set() {
+        // C5b Phase 2 follow-up: the "Reset LEXICON" command's test
+        // prerequisite. Two failure modes it must rule out:
+        //   1. Proposer state survives → next re-eval re-adds the word
+        //      to the lex's learned set (state-based sync).
+        //   2. Lex's learned set survives → `is_known` still true.
+        // After reset_all both must be empty and is_known must return
+        // to the bundled-only baseline.
+        let mut ledger = DecisionLedger::new();
+        let _g = serial_setup();
+        let mut p = LexiconProposer::new();
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
+            let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+        assert!(Lexicon::shared().is_known("Soumyo"));
+        assert!(matches!(
+            p.get("Soumyo").unwrap().tier,
+            ProposalTier::Confirmed
+        ));
+        assert!(!p.learned_snapshot().is_empty());
+
+        p.reset_all();
+
+        assert_eq!(p.len(), 0, "proposals should be empty after reset_all");
+        assert!(p.get("Soumyo").is_none());
+        assert!(
+            p.learned_snapshot().is_empty(),
+            "learned snapshot should be empty after reset_all"
+        );
+        assert!(
+            !Lexicon::shared().is_known("Soumyo"),
+            "is_known must fall back to bundled-only after reset_all"
+        );
+
+        // After reset_all, re-noting the SAME LogRecord must rebuild
+        // cleanly (no idempotency cache poisoning from before).
+        let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+        p.note_record(&kept);
+        let prop = p.get("Soumyo").unwrap();
+        assert_eq!(prop.occasions, 1, "fresh credit must start from 1");
     }
 
     // ---- snapshot ordering ---------------------------------------------

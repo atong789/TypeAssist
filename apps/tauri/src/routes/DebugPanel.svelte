@@ -28,6 +28,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { invoke } from "@tauri-apps/api/core";
 
   type KeystrokePayload = {
     key: string;
@@ -526,6 +527,22 @@
     // its own counts — modelRows/fingerRows will repopulate on the next keystroke.
   }
 
+  /// Engine-side LEXICON wipe. Distinct from `clear()` (panel mirrors
+  /// only): asks the Rust engine to drop every proposal, every per-
+  /// record contribution, every learned-at-ms entry, AND the lex's
+  /// learned set. The engine emits `engine://lexicon-reset` +
+  /// `engine://learned-snapshot` in response; the listeners above wipe
+  /// the local mirrors. Used to validate recency reclamation: confirm
+  /// a slip, reset, re-type the canonical, watch the cascade demote
+  /// the slip when the canonical confirms.
+  async function resetLexicon() {
+    try {
+      await invoke("reset_lexicon");
+    } catch (err) {
+      console.error("reset_lexicon failed:", err);
+    }
+  }
+
   onMount(async () => {
     // Restore height: stored value if present, otherwise a tall 60% default.
     let initial: number | null = null;
@@ -663,6 +680,18 @@
         } else {
           lexiconProposals = { ...lexiconProposals, [word]: proposal };
         }
+      }),
+    );
+    unlistens.push(
+      // Component 5b Phase 2 follow-up — engine-side LEXICON wipe.
+      // Distinct from a panel-side Clear: the engine's proposer state
+      // and lex.learned have both been cleared (see Reset LEXICON
+      // button). The accompanying learned-snapshot will also fire and
+      // empty `learnedSet`; this listener wipes the per-word proposal
+      // mirror so the table doesn't keep ghost rows. Empty payload.
+      await listen("engine://lexicon-reset", () => {
+        lexiconProposals = {};
+        learnedSet = new Set();
       }),
     );
     unlistens.push(
@@ -1240,15 +1269,25 @@
           {/if}
         </div>
 
-        <div class="model-sub model-sub-sticky">
-          LEXICON · 5b proposals · observe-only · is_known untouched ·
-          all-caps <span class="num">{(casingBaseline.all_caps_share * 100).toFixed(0)}%</span>
-          {#if casingBaseline.rescue_active}
-            <span class="casing-rescue-on">rescue ✓</span>
-          {:else}
-            <span class="casing-rescue-off">rescue OFF</span>
-          {/if}
-          <span class="casing-samples">(n={casingBaseline.sample_count.toFixed(0)})</span>
+        <div class="model-sub model-sub-sticky lex-sub">
+          <span class="lex-sub-label">
+            LEXICON · 5b proposals · observe-only · is_known untouched ·
+            all-caps <span class="num">{(casingBaseline.all_caps_share * 100).toFixed(0)}%</span>
+            {#if casingBaseline.rescue_active}
+              <span class="casing-rescue-on">rescue ✓</span>
+            {:else}
+              <span class="casing-rescue-off">rescue OFF</span>
+            {/if}
+            <span class="casing-samples">(n={casingBaseline.sample_count.toFixed(0)})</span>
+          </span>
+          <button
+            type="button"
+            class="lex-reset"
+            title="Engine-side wipe: drops every proposal AND every learned word. Distinct from the global Clear button (panel mirrors only)."
+            on:click={resetLexicon}
+          >
+            Reset LEXICON
+          </button>
         </div>
         <div class="lex-block">
           {#if lexiconProposalList.length === 0}
@@ -2126,6 +2165,29 @@
   .casing-rescue-on  { color: #6ea76e; font-weight: 600; }
   .casing-rescue-off { color: #d2885d; font-weight: 600; }
   .casing-samples    { color: #7f8a96; }
+
+  /* LEXICON sub-header lays out as label + right-aligned Reset button. */
+  .lex-sub {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .lex-sub-label { flex: 1; min-width: 0; }
+  /* Reset LEXICON button — engine-side wipe. Sized like other buttons in
+     the strip but flagged amber so it's not confused with the panel-side
+     Clear (different semantics: this kills learned vocabulary). */
+  .lex-reset {
+    font: inherit;
+    font-size: 11px;
+    color: #e6e6e6;
+    background: #3a2b22;
+    border: 1px solid #5a3a2a;
+    border-radius: 4px;
+    padding: 0.2rem 0.6rem;
+    cursor: pointer;
+  }
+  .lex-reset:hover { background: #4a352a; }
+  .lex-reset:focus { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
 
   /* C5b Phase 2 — LIVE indicator on confirmed proposals + star
      marker on LOG records targeting learned words. */

@@ -109,6 +109,35 @@ pub const EVT_CASING_BASELINE: &str = "engine://casing-baseline";
 /// target), but no injection runs — this phase is the validation
 /// gate.
 pub const EVT_LEARNED_SNAPSHOT: &str = "engine://learned-snapshot";
+/// Fired once when the engine processes a "Reset LEXICON" control
+/// command. Tells the panel to wipe its mirror of `lexiconProposals`
+/// (which is keyed by word and only ever updated in-place by per-word
+/// proposal events — no implicit "clear all" signal otherwise).
+/// Accompanied by a fresh empty `engine://learned-snapshot`. Payload
+/// is empty.
+pub const EVT_LEXICON_RESET: &str = "engine://lexicon-reset";
+
+/// Control commands the engine task accepts from Tauri commands. Sent
+/// through an unbounded mpsc channel whose sender lives in Tauri's
+/// managed state. The engine task selects between sidecar events and
+/// control commands so a button press is processed without waiting
+/// for the next keystroke.
+///
+/// Kept deliberately small: the engine owns proposer / ledger /
+/// anchors exclusively, so the only thing a control command does is
+/// mutate that local state and emit the corresponding panel events.
+#[derive(Debug)]
+pub enum EngineControl {
+    /// True engine-side LEXICON wipe — clears the proposer's state
+    /// AND the lex's learned set. Emits [`EVT_LEXICON_RESET`] and a
+    /// fresh empty [`EVT_LEARNED_SNAPSHOT`].
+    ResetLexicon,
+}
+
+/// Tauri-managed handle for sending [`EngineControl`] messages to
+/// the engine task. Cloned by Tauri commands; the underlying channel
+/// is unbounded so a button press never blocks the UI thread.
+pub type EngineControlSender = tokio::sync::mpsc::UnboundedSender<EngineControl>;
 
 /// Top-N candidates the engine surfaces per unknown word. Keep small so the
 /// debug panel and any future spatial-scorer aren't paying for a long tail.
@@ -569,7 +598,9 @@ struct CandidatesPayload {
     score_version: u32,
 }
 
-pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn spawn<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<EngineControlSender, Box<dyn std::error::Error>> {
     // TYPEASSIST_AX_PROMPT=1 asks the sidecar to pop the macOS Accessibility
     // dialog if the permission is missing — appropriate now that the Tauri app
     // is the engine's host (CLAUDE.md: "leaves the prompt to L5").
@@ -584,6 +615,12 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
     // of the closure for the lifetime contract.
     let (mut rx, sidecar_child) = sidecar.spawn()?;
     let app_handle = app.clone();
+
+    // Control channel: Tauri commands → engine task. Unbounded so the
+    // UI thread is never blocked. The returned sender is `manage`d by
+    // Tauri and cloned per command invocation.
+    let (control_tx, mut control_rx) =
+        tokio::sync::mpsc::unbounded_channel::<EngineControl>();
 
     tauri::async_runtime::spawn(async move {
         // L2 lives here for the life of the engine. Single owner, single async
@@ -645,8 +682,18 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
         // paste are intentionally out of scope (Component 5 AX backstop).
         let mut caret: usize = 0;
 
-        while let Some(event) = rx.recv().await {
-            match event {
+        // The receive loop selects between the sidecar event stream
+        // and the control channel so a Tauri command (e.g. Reset
+        // LEXICON button) is processed without waiting for the next
+        // keystroke. `biased` keeps sidecar events ahead of control
+        // commands when both are ready — keystroke ordering matters,
+        // control commands don't.
+        'engine_loop: loop {
+            tokio::select! {
+                biased;
+                event = rx.recv() => {
+                    let Some(event) = event else { break 'engine_loop; };
+                    match event {
                 CommandEvent::Stdout(bytes) => {
                     // Plugin already splits on newline; one event = one line.
                     let line = match std::str::from_utf8(&bytes) {
@@ -695,7 +742,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                                  grant in System Settings › Privacy & Security › Accessibility"
                             );
                         }
-                        InputEvent::Shutdown => break,
+                        InputEvent::Shutdown => break 'engine_loop,
                         InputEvent::Backspace { .. } => {
                             // Emit so the debug feed shows backspaces — they're
                             // signal, not noise (CLAUDE.md: self-corrections).
@@ -1017,9 +1064,30 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
                         payload.code,
                         payload.signal
                     );
-                    break;
+                    break 'engine_loop;
                 }
                 _ => {}
+                    }
+                }
+                cmd = control_rx.recv() => {
+                    let Some(cmd) = cmd else { break 'engine_loop; };
+                    match cmd {
+                        EngineControl::ResetLexicon => {
+                            // True engine-side wipe — distinct from a
+                            // panel-side "Clear" (panel mirrors only,
+                            // engine retained the truth). After this:
+                            // proposer state empty, lex.learned empty,
+                            // is_known back to bundled-only.
+                            proposer.reset_all();
+                            let _ = app_handle.emit(EVT_LEXICON_RESET, ());
+                            let _ = app_handle.emit(
+                                EVT_LEARNED_SNAPSHOT,
+                                proposer.learned_snapshot(),
+                            );
+                            tracing::info!("LEXICON reset by Tauri command");
+                        }
+                    }
+                }
             }
         }
 
@@ -1055,7 +1123,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::E
         drop(sidecar_child);
     });
 
-    Ok(())
+    Ok(control_tx)
 }
 
 // ---- Tests -----------------------------------------------------------------

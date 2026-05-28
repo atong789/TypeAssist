@@ -15,6 +15,12 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
+# tokio is already pulled in transitively via tauri/tauri-plugin-shell;
+# declared directly here because the engine loop uses `tokio::select!`
+# (Tauri's `async_runtime::spawn` wrapper does not re-export the macro)
+# and `tokio::sync::mpsc` for the control channel between Tauri
+# commands and the engine task.
+tokio = { version = "1", features = ["sync", "macros"] }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
