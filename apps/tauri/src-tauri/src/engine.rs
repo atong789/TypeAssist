@@ -128,6 +128,20 @@ pub const EVT_LEARNING_PAUSED: &str = "engine://learning-paused";
 /// pause (which still observes). Payload: `{ paused: bool }`.
 /// See [`EngineControl::SetInputPaused`].
 pub const EVT_INPUT_PAUSED: &str = "engine://input-paused";
+/// **C5c Layer A.** Per-finger motor baseline snapshot, emitted on
+/// every keystroke. Payload is `MotorBaselineSnapshot` — 10 rows in
+/// anatomical order, each with reliability + n_eff + dwell/IKI
+/// means. The panel renders a stable per-finger table; rows with
+/// n_eff == 0 render as dashes. Observe-only; no consumer reads
+/// this for correction yet.
+pub const EVT_MOTOR_BASELINE: &str = "engine://motor-baseline";
+/// **C5c Layer A.** Per-keystroke anomaly probe, emitted before the
+/// keystroke is ingested (so the anomaly reflects what the baseline
+/// thought BEFORE this keystroke updated it). Payload includes the
+/// key, its (hand, finger), and the full `KeystrokeAnomaly` with
+/// dwell + IKI + co-activation dimensions. Skipped for non-typing
+/// keys (`finger_for` returned `None`) — no anomaly to compute.
+pub const EVT_MOTOR_KEYSTROKE: &str = "engine://motor-keystroke";
 
 /// Control commands the engine task accepts from Tauri commands. Sent
 /// through an unbounded mpsc channel whose sender lives in Tauri's
@@ -370,6 +384,22 @@ struct LearningPausedEvent {
 #[derive(Serialize, Clone)]
 struct InputPausedEvent {
     paused: bool,
+}
+
+/// Payload for [`EVT_MOTOR_KEYSTROKE`]. Carries the per-keystroke
+/// motor anomaly probe alongside identifying metadata so the panel
+/// can render "what just happened" without needing to re-parse the
+/// key event stream. `hand` / `finger` are `None` for keys outside
+/// the touch-typing map (in which case `anomaly` is `None` too —
+/// nothing to score).
+#[derive(Serialize, Clone)]
+struct MotorKeystrokeEvent {
+    key: String,
+    timestamp_ms: u64,
+    dwell_ms: u32,
+    hand: Option<volatility_map::Hand>,
+    finger: Option<volatility_map::Finger>,
+    anomaly: Option<behavioural_model::motor_baseline::KeystrokeAnomaly>,
 }
 
 /// Run one [`OutcomeResolver`] pass and surface every transition,
@@ -798,6 +828,41 @@ pub fn spawn<R: Runtime>(
                         continue;
                     }
 
+                    // **C5c Layer A** — probe the motor baseline for this
+                    // keystroke's anomaly BEFORE ingest mutates the
+                    // baseline (otherwise the score reflects "the user
+                    // including this keystroke," not "the user's prior
+                    // model"). Lifecycle/Backspace events have no key
+                    // to score → no event emitted.
+                    let motor_keystroke_event: Option<MotorKeystrokeEvent> =
+                        if let InputEvent::Key {
+                            key,
+                            timestamp_ms,
+                            dwell_ms,
+                            ..
+                        } = &parsed
+                        {
+                            let (hand, finger) = match volatility_map::finger_for(key) {
+                                Some((h, f)) => (Some(h), Some(f)),
+                                None => (None, None),
+                            };
+                            let anomaly = model.motor_baseline.keystroke_anomaly(
+                                key,
+                                *timestamp_ms,
+                                *dwell_ms,
+                            );
+                            Some(MotorKeystrokeEvent {
+                                key: key.clone(),
+                                timestamp_ms: *timestamp_ms,
+                                dwell_ms: *dwell_ms,
+                                hand,
+                                finger,
+                                anomaly,
+                            })
+                        } else {
+                            None
+                        };
+
                     // Observe-only L2 dispatch. Only Key/Backspace flow into
                     // the model — sidecar lifecycle events (Ready/Shutdown/…)
                     // aren't keystrokes. Measured on its own so the debug view
@@ -818,6 +883,17 @@ pub fn spawn<R: Runtime>(
                         // Broadcast the new model state so the debug "Model
                         // state" tables update live as the user types.
                         let _ = app_handle.emit(EVT_MODEL_SNAPSHOT, model.snapshot());
+                        // C5c Layer A — separate, finer-grained events
+                        // for the motor section. Panels that don't care
+                        // about motor data can ignore these without
+                        // re-parsing the full model snapshot.
+                        if let Some(ev) = motor_keystroke_event {
+                            let _ = app_handle.emit(EVT_MOTOR_KEYSTROKE, ev);
+                        }
+                        let _ = app_handle.emit(
+                            EVT_MOTOR_BASELINE,
+                            model.motor_baseline.snapshot(),
+                        );
                         lat
                     } else {
                         0.0

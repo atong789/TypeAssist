@@ -352,11 +352,52 @@
     word: string;
     proposal: LexiconProposal | null;
   };
+  // ---- C5c Layer A — MotorBaseline types ------------------------------
+  /// One row of the per-finger motor baseline table.
+  type MotorFingerRow = {
+    hand: Hand;
+    finger: Finger;
+    reliability_score: number;
+    n_eff: number;
+    dwell_mean_ms: number | null;
+    iki_mean_ms: number | null;
+  };
+  type MotorBaselineSnapshot = {
+    per_finger: MotorFingerRow[];
+  };
+  /// Per-keystroke anomaly probe — the engine sends one of these per
+  /// keystroke (before the baseline absorbs it).
+  type DwellAnomaly = {
+    z: number;
+    anomaly: number;
+    mean_used: number;
+    sigma_used: number;
+    certainty: number;
+  };
+  type IkiAnomaly = DwellAnomaly;
+  type CoActivation = { overlap_ms: number; anomaly: number };
+  type KeystrokeAnomaly = {
+    dwell: DwellAnomaly;
+    iki: IkiAnomaly | null;
+    coactivation: CoActivation | null;
+    combined: number;
+    certainty: number;
+  };
+  type MotorKeystrokeEvent = {
+    key: string;
+    timestamp_ms: number;
+    dwell_ms: number;
+    hand: Hand | null;
+    finger: Finger | null;
+    anomaly: KeystrokeAnomaly | null;
+  };
+
   type ModelSnapshot = {
     timing: { per_key: KeyTimingRow[]; per_finger: FingerTimingRow[] };
     asymmetry: AsymmetrySnapshot;
     ghost_keys: GhostKeysSnapshot;
     slips: SlipsSnapshot;
+    motor_baseline: MotorBaselineSnapshot;
   };
 
   /// Cap on the per-key ghost list — keep the worst offenders visible,
@@ -450,6 +491,15 @@
   /// proposals with a "LIVE" indicator and to flag LOG records whose
   /// `top_candidate` targets a learned word.
   let learnedSet: Set<string> = new Set();
+
+  /// **C5c Layer A** — per-finger motor baseline snapshot, replaced
+  /// wholesale on each `engine://motor-baseline` event. Renders as a
+  /// stable 10-row table even before any data arrives.
+  let motorBaseline: MotorBaselineSnapshot = { per_finger: [] };
+  /// Rolling buffer of the last per-keystroke anomaly probes, newest
+  /// first. Capped so the panel doesn't grow unbounded.
+  const MOTOR_KEYSTROKE_HISTORY = 20;
+  let motorKeystrokes: MotorKeystrokeEvent[] = [];
 
   /// **Meta-context pause** — manual only. An earlier prototype also
   /// auto-paused on debug-window focus, but that mechanism guarded
@@ -658,6 +708,27 @@
         asymmetry = e.payload.asymmetry;
         ghostKeys = e.payload.ghost_keys;
         slips = e.payload.slips;
+      }),
+    );
+    unlistens.push(
+      // C5c Layer A — per-finger motor baseline snapshot. Replaces
+      // wholesale on each emission. (Same data flows in
+      // engine://model-snapshot too, but a separate event lets
+      // future panels listen for just the motor info without
+      // re-parsing the whole model snapshot.)
+      await listen<MotorBaselineSnapshot>("engine://motor-baseline", (e) => {
+        motorBaseline = e.payload;
+      }),
+    );
+    unlistens.push(
+      // C5c Layer A — per-keystroke anomaly probe. Prepended to a
+      // rolling buffer; the table renders newest first and the
+      // buffer is capped so the panel doesn't grow unbounded.
+      await listen<MotorKeystrokeEvent>("engine://motor-keystroke", (e) => {
+        motorKeystrokes = [e.payload, ...motorKeystrokes].slice(
+          0,
+          MOTOR_KEYSTROKE_HISTORY,
+        );
       }),
     );
     unlistens.push(
@@ -1614,6 +1685,80 @@
                 <span class="col-mi num">{fmtMs(r.avg_interval_ms)} ms</span>
               </div>
             {/each}
+          {/if}
+        </div>
+
+        <!-- C5c Layer A — MOTOR BASELINE. Per-finger reliability +
+             EWMA-pooled dwell/IKI means + rolling per-keystroke
+             anomaly probes. Observe-only this phase. -->
+        <div class="model-sub model-sub-sticky">
+          MOTOR BASELINE · 5c layer A · observe-only ·
+          <span class="motor-half-life">half-life ~5000 keystrokes</span>
+        </div>
+        <div class="motor-block">
+          <div class="motor-table">
+            <div class="motor-row motor-head">
+              <span class="col-mof">finger</span>
+              <span class="col-mor">reliability</span>
+              <span class="col-mon num">n_eff</span>
+              <span class="col-mod num">dwell μ</span>
+              <span class="col-moi num">IKI μ</span>
+            </div>
+            {#each motorBaseline.per_finger as f (`${f.hand}-${f.finger}`)}
+              <div
+                class="motor-row"
+                class:motor-left={f.hand === "left"}
+                class:motor-right={f.hand === "right"}
+                class:motor-cold={f.n_eff === 0}
+              >
+                <span class="col-mof">{fmtFinger(f.hand, f.finger)}</span>
+                <span class="col-mor">
+                  {#if f.n_eff > 0}
+                    <span
+                      class="motor-rel-bar"
+                      style:width="{(f.reliability_score * 100).toFixed(0)}%"
+                    ></span>
+                    <span class="motor-rel-num num">{(f.reliability_score * 100).toFixed(0)}%</span>
+                  {:else}
+                    <span class="motor-rel-dash">—</span>
+                  {/if}
+                </span>
+                <span class="col-mon num">{f.n_eff.toFixed(0)}</span>
+                <span class="col-mod num">
+                  {f.dwell_mean_ms === null ? "—" : `${fmtMs(f.dwell_mean_ms)} ms`}
+                </span>
+                <span class="col-moi num">
+                  {f.iki_mean_ms === null ? "—" : `${fmtMs(f.iki_mean_ms)} ms`}
+                </span>
+              </div>
+            {/each}
+          </div>
+
+          <!-- Rolling per-keystroke anomaly log. Newest first. -->
+          <div class="motor-recent">RECENT KEYSTROKES · newest first</div>
+          {#if motorKeystrokes.length === 0}
+            <div class="empty">no keystrokes scored yet…</div>
+          {:else}
+            <div class="motor-keys-table">
+              <div class="motor-keys-row motor-keys-head">
+                <span class="col-mkk">key</span>
+                <span class="col-mkc num" title="combined anomaly = max(dwell, IKI, co-activation)">combined</span>
+                <span class="col-mkd num" title="dwell anomaly: 1 - exp(-z²/2)">dwell</span>
+                <span class="col-mki num" title="IKI anomaly (null on first keystroke / after pause)">IKI</span>
+                <span class="col-mko num" title="co-activation overlap in ms (null if no overlap)">co-act</span>
+                <span class="col-mkr num" title="certainty: how much data backs this score">cert</span>
+              </div>
+              {#each motorKeystrokes as k (k.timestamp_ms)}
+                <div class="motor-keys-row" class:motor-anom={k.anomaly !== null && k.anomaly.combined > 0.5}>
+                  <span class="col-mkk">{fmtKey(k.key)}</span>
+                  <span class="col-mkc num">{k.anomaly === null ? "—" : k.anomaly.combined.toFixed(2)}</span>
+                  <span class="col-mkd num">{k.anomaly === null ? "—" : k.anomaly.dwell.anomaly.toFixed(2)}</span>
+                  <span class="col-mki num">{k.anomaly?.iki ? k.anomaly.iki.anomaly.toFixed(2) : "—"}</span>
+                  <span class="col-mko num">{k.anomaly?.coactivation ? `${k.anomaly.coactivation.overlap_ms}ms` : "—"}</span>
+                  <span class="col-mkr num">{k.anomaly === null ? "—" : k.anomaly.certainty.toFixed(2)}</span>
+                </div>
+              {/each}
+            </div>
           {/if}
         </div>
       </div>
@@ -2627,4 +2772,96 @@
     text-align: right;
     font-variant-numeric: tabular-nums;
   }
+
+  /* MOTOR BASELINE — C5c Layer A. Per-finger reliability + rolling
+     per-keystroke anomaly probes. Sticky sub-header matches the
+     other model sections; uses the same left/right hand tints as
+     PER FINGER so they read as a family. */
+  .motor-half-life {
+    color: #7f8a96;
+    font-weight: 400;
+  }
+  .motor-block {
+    padding: 0 0 0.6rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .motor-table { padding: 0 0 0.35rem; }
+  .motor-row {
+    display: grid;
+    grid-template-columns: 90px minmax(120px, 1fr) 50px 70px 70px;
+    column-gap: 0.6rem;
+    align-items: baseline;
+    padding: 0.22rem 0.75rem;
+    white-space: nowrap;
+  }
+  .motor-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.3rem;
+    margin-bottom: 0.15rem;
+  }
+  .motor-left:not(.motor-head)  { background: rgba(120, 160, 220, 0.045); }
+  .motor-right:not(.motor-head) { background: rgba(220, 160, 120, 0.045); }
+  .motor-cold { opacity: 0.55; }
+  .col-mof { color: #e6e6e6; font-weight: 600; }
+  .col-mod, .col-moi, .col-mon { color: #8aa1b8; }
+  .col-mor {
+    position: relative;
+    height: 12px;
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  /* Reliability bar — green when high, fading to amber via opacity
+     reduction handled by the .motor-cold row class. Width is set
+     inline from `style:width=...`. */
+  .motor-rel-bar {
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    background: #6ea76e;
+    border-radius: 2px;
+  }
+  .motor-rel-num {
+    position: absolute;
+    right: 0.4rem;
+    top: 0;
+    color: #d5d5d5;
+    font-size: 10px;
+    line-height: 12px;
+  }
+  .motor-rel-dash {
+    color: #7f8a96;
+    font-style: italic;
+  }
+
+  .motor-recent {
+    color: #7f8a96;
+    padding: 0.4rem 0.75rem 0.3rem;
+    border-top: 1px solid #1d2228;
+    margin-top: 0.4rem;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .motor-keys-table { padding: 0 0 0.35rem; }
+  .motor-keys-row {
+    display: grid;
+    grid-template-columns: 36px 70px 60px 60px 70px 50px;
+    column-gap: 0.55rem;
+    align-items: baseline;
+    padding: 0.2rem 0.75rem;
+    white-space: nowrap;
+  }
+  .motor-keys-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.3rem;
+  }
+  .motor-keys-row:not(.motor-keys-head):nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
+  }
+  /* Rows where the combined anomaly is high — visually flag them. */
+  .motor-anom .col-mkc { color: #c8553d; font-weight: 700; }
+  .col-mkk { color: #e6e6e6; font-weight: 600; }
+  .col-mkc, .col-mkd, .col-mki, .col-mko, .col-mkr { color: #8aa1b8; }
 </style>
