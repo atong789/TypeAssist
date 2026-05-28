@@ -116,6 +116,11 @@ pub const EVT_LEARNED_SNAPSHOT: &str = "engine://learned-snapshot";
 /// Accompanied by a fresh empty `engine://learned-snapshot`. Payload
 /// is empty.
 pub const EVT_LEXICON_RESET: &str = "engine://lexicon-reset";
+/// Fired whenever the proposer's meta-context pause flag changes. The
+/// payload echoes the new state so the panel indicator reflects the
+/// engine's actual flag (not just the panel's optimistic state).
+/// Payload: `{ paused: bool }`. See [`EngineControl::SetLearningPaused`].
+pub const EVT_LEARNING_PAUSED: &str = "engine://learning-paused";
 
 /// Control commands the engine task accepts from Tauri commands. Sent
 /// through an unbounded mpsc channel whose sender lives in Tauri's
@@ -132,6 +137,15 @@ pub enum EngineControl {
     /// AND the lex's learned set. Emits [`EVT_LEXICON_RESET`] and a
     /// fresh empty [`EVT_LEARNED_SNAPSHOT`].
     ResetLexicon,
+    /// Suppress / resume LEXICON credit. While paused, every
+    /// `note_record` call is a no-op (see
+    /// [`correction_engine::LexiconProposer::set_credit_paused`]) —
+    /// records ingested while paused leave no proposer trace and are
+    /// NOT retroactively credited on resume. Used by the panel to
+    /// (a) self-exclude the debug window via DOM focus events, and
+    /// (b) honor a manual pause toggle for any other meta-context.
+    /// Emits [`EVT_LEARNING_PAUSED`] echoing the new state.
+    SetLearningPaused(bool),
 }
 
 /// Tauri-managed handle for sending [`EngineControl`] messages to
@@ -315,6 +329,14 @@ fn now_ms() -> u64 {
 struct LexiconProposalEvent {
     word: String,
     proposal: Option<correction_engine::LexiconProposal>,
+}
+
+/// Payload for [`EVT_LEARNING_PAUSED`]. Single field rather than a
+/// bare bool so the JSON has a stable shape if future controls are
+/// added (e.g. a reason string for "auto-paused" vs "manual").
+#[derive(Serialize, Clone)]
+struct LearningPausedEvent {
+    paused: bool,
 }
 
 /// Run one [`OutcomeResolver`] pass and surface every transition,
@@ -1085,6 +1107,18 @@ pub fn spawn<R: Runtime>(
                                 proposer.learned_snapshot(),
                             );
                             tracing::info!("LEXICON reset by Tauri command");
+                        }
+                        EngineControl::SetLearningPaused(paused) => {
+                            // Echo the engine's actual flag back to
+                            // the panel after the set — covers the
+                            // case where the panel's optimistic state
+                            // diverges (e.g. webview reload restored
+                            // a stale view of the flag).
+                            proposer.set_credit_paused(paused);
+                            let _ = app_handle.emit(
+                                EVT_LEARNING_PAUSED,
+                                LearningPausedEvent { paused: proposer.credit_paused() },
+                            );
                         }
                     }
                 }

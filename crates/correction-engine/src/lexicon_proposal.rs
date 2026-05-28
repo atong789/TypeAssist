@@ -368,6 +368,20 @@ pub struct LexiconProposer {
     /// mutually-near-known words deadlock each other — neither can
     /// reach `Confirmed` because each holds the other.
     learned_at_ms: HashMap<String, u64>,
+    /// **Meta-context exclusion** — when true, [`Self::note_record`]
+    /// short-circuits and writes nothing. Used by the host to suppress
+    /// learning while the user is typing about the system itself
+    /// (debug-window focus, or the manual pause toggle) — the
+    /// canonical case is: typing the slip `soumyio` in a chat to
+    /// report a bug confirmed it over the real name `soumyo`.
+    ///
+    /// Scope is deliberately narrow: ONLY the credit step is gated.
+    /// All other observation (ledger, decisions, anchor tracking,
+    /// resolver, panel events for non-proposal updates) runs
+    /// unchanged. Records ingested while paused are NOT retroactively
+    /// credited on resume — the user wants them excluded, not
+    /// deferred. Default `false` (learning active).
+    credit_paused: bool,
 }
 
 impl std::fmt::Debug for LexiconProposer {
@@ -423,7 +437,24 @@ impl LexiconProposer {
             casing_acronym_weight: 0.0,
             casing_word_weight: 0.0,
             learned_at_ms: HashMap::new(),
+            credit_paused: false,
         }
+    }
+
+    /// Set the meta-context pause flag. While true, every
+    /// [`Self::note_record`] call returns [`ProposalUpdate::empty`]
+    /// without touching proposer state. Setter only — the host owns
+    /// the policy (manual toggle, debug-window-focus auto-pause).
+    pub fn set_credit_paused(&mut self, paused: bool) {
+        self.credit_paused = paused;
+    }
+
+    /// Whether `note_record` is currently suppressed. Exposed so the
+    /// host can echo the state back to the panel after a control
+    /// command (so the indicator reflects the actual engine flag,
+    /// not just the panel's optimistic state).
+    pub fn credit_paused(&self) -> bool {
+        self.credit_paused
     }
 
     /// Observe a sealed `Word` or `Acronym` token for the casing
@@ -503,6 +534,17 @@ impl LexiconProposer {
     ///      every resolver transition). This is where actual Kept
     ///      credits / retractions happen.
     pub fn note_record(&mut self, record: &LogRecord) -> ProposalUpdate {
+        // Meta-context pause — the host has signalled "we're in a
+        // context where the user types ABOUT TypeAssist, not in it"
+        // (debug window focused, or manual toggle). Short-circuit
+        // before any state mutation so records ingested while paused
+        // leave NO trace: no contribution, no idempotency entry, no
+        // re-eval. The rest of the engine (ledger, decisions,
+        // resolver) keeps running — only learning is suppressed.
+        if self.credit_paused {
+            return ProposalUpdate::empty();
+        }
+
         let word = record.original_text.clone();
 
         // Idempotency check.
@@ -2328,6 +2370,42 @@ mod tests {
         p.note_record(&kept);
         let prop = p.get("Soumyo").unwrap();
         assert_eq!(prop.occasions, 1, "fresh credit must start from 1");
+    }
+
+    // ---- Meta-context pause --------------------------------------------
+
+    #[test]
+    fn paused_credit_is_a_total_no_op_with_no_leaked_state() {
+        // While paused, three Kept occasions of a word that would
+        // otherwise Confirm leave NO trace: no proposal, no
+        // contribution entry, no learned_at_ms entry, no learned-set
+        // mutation. The next un-paused note creates a fresh
+        // first-occasion proposal (i.e. the paused records are NOT
+        // retroactively credited).
+        let mut ledger = DecisionLedger::new();
+        let _g = serial_setup();
+        let mut p = LexiconProposer::new();
+        p.set_credit_paused(true);
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
+            let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            let update = p.note_record(&kept);
+            assert!(update.changes.is_empty(), "paused note must emit no changes");
+            assert!(!update.learned_set_changed);
+        }
+        assert_eq!(p.len(), 0, "no proposal should have been recorded");
+        assert!(p.get("Soumyo").is_none());
+        assert!(!Lexicon::shared().is_known("Soumyo"));
+
+        p.set_credit_paused(false);
+        let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+        p.note_record(&kept);
+        let prop = p.get("Soumyo").unwrap();
+        assert_eq!(
+            prop.occasions, 1,
+            "post-resume credit must start from 1 — paused records are excluded, not deferred"
+        );
     }
 
     // ---- snapshot ordering ---------------------------------------------

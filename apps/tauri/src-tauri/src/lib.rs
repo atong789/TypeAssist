@@ -22,6 +22,29 @@ fn reset_lexicon(sender: tauri::State<EngineControlSender>) -> Result<(), String
         .map_err(|e| format!("engine control channel closed: {e}"))
 }
 
+/// Tauri command: suppress or resume LEXICON credit. The panel
+/// computes the combined pause state (manual toggle OR debug-window
+/// focus) and posts it here. Engine echoes back via
+/// `engine://learning-paused` so the indicator reflects the actual
+/// engine flag.
+///
+/// Privacy invariant: this is a **single bit** the engine receives.
+/// The host does NOT learn which app the user is typing into; the
+/// panel decides locally from its own DOM focus state and posts
+/// only the resulting boolean. Matches CLAUDE.md's "Do not track
+/// which app was focused" principle — TypeAssist's own window
+/// focus is a non-invasive native capability the OS provides any
+/// app, and no other app's identity is consulted.
+#[tauri::command]
+fn set_learning_paused(
+    paused: bool,
+    sender: tauri::State<EngineControlSender>,
+) -> Result<(), String> {
+    sender
+        .send(EngineControl::SetLearningPaused(paused))
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -32,7 +55,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![reset_lexicon])
+        .invoke_handler(tauri::generate_handler![reset_lexicon, set_learning_paused])
         .setup(|app| {
             match engine::spawn(&app.handle()) {
                 Ok(control_tx) => {
