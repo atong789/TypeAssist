@@ -74,6 +74,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use volatility_map::{finger_for, Finger, Hand};
 
+use crate::MAX_TYPING_INTERVAL_MS;
+
 /// **Recency half-life in keystrokes.** A bucket's "effective sample
 /// count" converges asymptotically to `1 / (1 - λ)` ≈
 /// `HALF_LIFE_SAMPLES / ln(2)` ≈ 7200 — i.e. about 7000 keystrokes of
@@ -102,6 +104,14 @@ fn decay_lambda_for(half_life: f64) -> f64 {
 /// the prior's exact value.
 const POP_DWELL_MEAN_MS: f64 = 100.0;
 const POP_DWELL_VAR_MS2: f64 = 1600.0;
+
+/// Population prior for inter-keystroke interval. μ = 200 ms, σ = 80 ms.
+/// IKIs vary more than dwells — bigram pairs differ widely (rolled
+/// "th" vs awkward "qp"), and the user's typing speed itself shifts —
+/// so the prior is wider. Same role as the dwell prior: bootstrap
+/// cold-start, shrink away as the user's data builds.
+const POP_IKI_MEAN_MS: f64 = 200.0;
+const POP_IKI_VAR_MS2: f64 = 6400.0;
 
 /// Shrinkage strengths — bigger means the parent prior holds on longer
 /// before the user's own data dominates. At `n_eff = K`, the child
@@ -180,6 +190,11 @@ pub const K_CERTAINTY: f64 = 30.0;
 /// that, real timing differences are dominated by sensor noise; the
 /// floor keeps z-scores meaningful.
 const MIN_VAR_MS2: f64 = 100.0;
+
+/// Variance floor for IKI — wider than dwell (σ = 20ms) since
+/// inter-keystroke timing is inherently noisier and "near-degenerate"
+/// IKI buckets are rarer in practice.
+const MIN_IKI_VAR_MS2: f64 = 400.0;
 
 /// Single EWMA cell — recency-weighted mean + variance for one
 /// `(hand, finger, key)`, `(hand, finger)`, or `(hand,)` bucket.
@@ -270,6 +285,46 @@ pub struct DwellAnomaly {
     pub certainty: f64,
 }
 
+/// Per-keystroke IKI anomaly — same shape as [`DwellAnomaly`] but
+/// for the inter-keystroke interval (current key-down minus previous
+/// key-down). Returned by [`MotorBaseline::iki_anomaly`].
+///
+/// Symmetric: too-short IKIs are anomalous (rolling/co-activation
+/// territory) and too-long IKIs are anomalous (pause within a word).
+/// The `MAX_TYPING_INTERVAL_MS` gate filters out true between-word
+/// pauses upstream, so the IKIs that reach this anomaly are within
+/// the user's typing rhythm.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct IkiAnomaly {
+    pub z: f64,
+    pub anomaly: f64,
+    pub mean_used: f64,
+    pub sigma_used: f64,
+    pub certainty: f64,
+}
+
+/// Per-keystroke combined anomaly — the headline number Phase 2 will
+/// read. Combines dwell and IKI (and, in commit I, co-activation) by
+/// **max**: any one dimension being dramatically off is enough to
+/// flag the keystroke. Conservative — matches the "look at this
+/// finger, something's wrong" intuition rather than letting many mild
+/// signals stack into a false alarm.
+///
+/// `dwell` is always present (every keystroke has a dwell). `iki` is
+/// `None` for the very first keystroke and for any keystroke
+/// following a pause longer than [`crate::MAX_TYPING_INTERVAL_MS`] —
+/// those are between-word boundaries, not within-rhythm typing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct KeystrokeAnomaly {
+    pub dwell: DwellAnomaly,
+    pub iki: Option<IkiAnomaly>,
+    /// `max(dwell.anomaly, iki.anomaly_or_0)` — the conservative combination.
+    pub combined: f64,
+    /// `min(dwell.certainty, iki.certainty_if_present)` — we should
+    /// only trust the anomaly to the weaker dimension's certainty.
+    pub certainty: f64,
+}
+
 /// Per-finger reliability — the Layer B seam. Higher score = more
 /// consistent timing on that finger → spatial slips are LESS likely
 /// (when a reliable finger produces a key, trust it). Lower score =
@@ -294,7 +349,7 @@ pub struct Reliability {
 /// Per-user motor baseline — Component 5c Layer A. See module docs.
 #[derive(Debug)]
 pub struct MotorBaseline {
-    /// `(hand, finger, key)` → dwell EWMA. Key is lowercased
+    /// `(hand, finger, key)` → **dwell** EWMA. Key is lowercased
     /// single-character string (matches the sidecar's `Key` events
     /// after lowercasing); multi-character key names are not modeled.
     keys: HashMap<(Hand, Finger, String), EwmaCell>,
@@ -302,6 +357,19 @@ pub struct MotorBaseline {
     fingers: HashMap<(Hand, Finger), EwmaCell>,
     /// `(hand,)` → dwell EWMA.
     hands: HashMap<Hand, EwmaCell>,
+    /// `(hand, finger, key)` → **IKI** (inter-keystroke interval)
+    /// EWMA, parallel to the dwell hierarchy. Updated when the gap
+    /// from the previous key-down is within
+    /// [`crate::MAX_TYPING_INTERVAL_MS`] — pause-length gaps are
+    /// dropped so a long think doesn't poison the next key's IKI
+    /// baseline (same gate as `TimingAggregator`).
+    iki_keys: HashMap<(Hand, Finger, String), EwmaCell>,
+    iki_fingers: HashMap<(Hand, Finger), EwmaCell>,
+    iki_hands: HashMap<Hand, EwmaCell>,
+    /// Timestamp of the last observed Key event, used to derive the
+    /// current keystroke's IKI. `None` until the first observe, and
+    /// reset after a pause-length gap drops the IKI.
+    last_key_timestamp_ms: Option<u64>,
     /// EWMA half-life in samples. Production uses
     /// [`HALF_LIFE_SAMPLES`] (≈5000 keystrokes). Tests use a much
     /// smaller value (e.g. 30) so the math converges within hundreds
@@ -346,36 +414,85 @@ impl MotorBaseline {
             keys: HashMap::new(),
             fingers: HashMap::new(),
             hands: HashMap::new(),
+            iki_keys: HashMap::new(),
+            iki_fingers: HashMap::new(),
+            iki_hands: HashMap::new(),
+            last_key_timestamp_ms: None,
             half_life,
             shrink,
         }
     }
 
-    /// Record a keystroke's dwell into all three levels. Keys without a
-    /// touch-typing assignment (function keys, arrows, multi-char names)
-    /// are silently ignored — `finger_for` returns `None` and the
-    /// baseline isn't updated. Shifted variants are normalised to the
-    /// lowercase letter: `A` and `a` share a cell (the physical key is
-    /// the same; shift overhead is a different signal we don't model
-    /// here).
-    pub fn observe_key(&mut self, key: &str, dwell_ms: u32) {
+    /// Record a keystroke's dwell + IKI into all three hierarchical
+    /// levels. Keys without a touch-typing assignment (function keys,
+    /// arrows, multi-char names) are silently ignored — `finger_for`
+    /// returns `None` and the baseline isn't updated. Shifted variants
+    /// are normalised to the lowercase letter: `A` and `a` share a
+    /// cell (the physical key is the same; shift overhead is a
+    /// different signal we don't model here).
+    ///
+    /// IKI is derived from `timestamp_ms` minus the previous observed
+    /// keystroke's timestamp, gated by [`crate::MAX_TYPING_INTERVAL_MS`]:
+    /// pause-length gaps are dropped so the next keystroke's IKI cell
+    /// isn't poisoned by a 5-second think. The first observe in a
+    /// fresh baseline has no IKI sample; only dwell is recorded.
+    pub fn observe_key(&mut self, key: &str, timestamp_ms: u64, dwell_ms: u32) {
         let Some((hand, finger)) = finger_for(key) else { return; };
         let leaf_id = match leaf_key(key) {
             Some(id) => id,
             None => return,
         };
-        let sample = f64::from(dwell_ms);
         let lambda = decay_lambda_for(self.half_life);
 
+        // Dwell — always recorded.
+        let dwell_sample = f64::from(dwell_ms);
         self.keys
-            .entry((hand, finger, leaf_id))
+            .entry((hand, finger, leaf_id.clone()))
             .or_default()
-            .observe(sample, lambda);
+            .observe(dwell_sample, lambda);
         self.fingers
             .entry((hand, finger))
             .or_default()
-            .observe(sample, lambda);
-        self.hands.entry(hand).or_default().observe(sample, lambda);
+            .observe(dwell_sample, lambda);
+        self.hands
+            .entry(hand)
+            .or_default()
+            .observe(dwell_sample, lambda);
+
+        // IKI — only recorded for keystrokes within typing rhythm. A
+        // pause-length gap is treated as a between-word boundary; the
+        // cells are not updated, and `last_key_timestamp_ms` advances
+        // so the NEXT keystroke's IKI is measured from THIS one (not
+        // from the pre-pause anchor — matches TimingAggregator).
+        if let Some(iki) = self.derive_iki(timestamp_ms) {
+            let iki_sample = f64::from(iki);
+            self.iki_keys
+                .entry((hand, finger, leaf_id))
+                .or_default()
+                .observe(iki_sample, lambda);
+            self.iki_fingers
+                .entry((hand, finger))
+                .or_default()
+                .observe(iki_sample, lambda);
+            self.iki_hands
+                .entry(hand)
+                .or_default()
+                .observe(iki_sample, lambda);
+        }
+        self.last_key_timestamp_ms = Some(timestamp_ms);
+    }
+
+    /// IKI for the current keystroke if and only if the gap from the
+    /// previous observed keystroke is within typing-rhythm bounds. The
+    /// pause-gap filter is the same one [`crate::timing`] uses, so the
+    /// two aggregators see consistent IKIs.
+    fn derive_iki(&self, current_ts: u64) -> Option<u32> {
+        let prev = self.last_key_timestamp_ms?;
+        let gap = current_ts.saturating_sub(prev);
+        if gap > MAX_TYPING_INTERVAL_MS {
+            return None;
+        }
+        Some(gap.min(u64::from(u32::MAX)) as u32)
     }
 
     /// Score a single keystroke's dwell against the pooled baseline.
@@ -408,6 +525,74 @@ impl MotorBaseline {
         })
     }
 
+    /// Score a keystroke's IKI against the pooled IKI baseline.
+    /// Returns `None` for keys outside the touch-typing map. Unlike
+    /// dwell, IKI scoring takes the IKI value directly rather than
+    /// computing it — the caller may want to query "what would the
+    /// IKI anomaly be if this were the next keystroke" without
+    /// disturbing the baseline.
+    pub fn iki_anomaly(&self, key: &str, iki_ms: u32) -> Option<IkiAnomaly> {
+        let (hand, finger) = finger_for(key)?;
+        let leaf_id = leaf_key(key)?;
+
+        let est = self.estimate_iki(hand, finger, &leaf_id);
+        let sigma = est.var.max(MIN_IKI_VAR_MS2).sqrt();
+        let z = (f64::from(iki_ms) - est.mean) / sigma;
+        let anomaly = 1.0 - (-0.5 * z * z).exp();
+        let certainty = est.n_eff / (est.n_eff + self.shrink.k_certainty);
+
+        Some(IkiAnomaly {
+            z,
+            anomaly,
+            mean_used: est.mean,
+            sigma_used: sigma,
+            certainty,
+        })
+    }
+
+    /// Combined per-keystroke anomaly — dwell + IKI scored against the
+    /// current baseline. **`timestamp_ms` must match what would later
+    /// be passed to `observe_key`**: the IKI is derived from the gap
+    /// between `timestamp_ms` and `last_key_timestamp_ms`. Call this
+    /// BEFORE `observe_key` for the same event so the previous
+    /// keystroke's timestamp is the IKI anchor.
+    ///
+    /// `iki` is `None` on the first keystroke and on any keystroke
+    /// following a `MAX_TYPING_INTERVAL_MS`-or-greater gap — those
+    /// are between-word boundaries with no within-rhythm IKI.
+    ///
+    /// `combined` is `max(dwell.anomaly, iki.anomaly_or_0)` —
+    /// conservative; one dimension dramatically off is enough.
+    /// `certainty` is the weaker of the two dimensions when both
+    /// present, else dwell's certainty alone — we should never trust
+    /// the combined score beyond the certainty of its weakest input.
+    pub fn keystroke_anomaly(
+        &self,
+        key: &str,
+        timestamp_ms: u64,
+        dwell_ms: u32,
+    ) -> Option<KeystrokeAnomaly> {
+        let dwell = self.dwell_anomaly(key, dwell_ms)?;
+        let iki = self
+            .derive_iki(timestamp_ms)
+            .and_then(|iki_val| self.iki_anomaly(key, iki_val));
+
+        let combined = match iki {
+            Some(i) => dwell.anomaly.max(i.anomaly),
+            None => dwell.anomaly,
+        };
+        let certainty = match iki {
+            Some(i) => dwell.certainty.min(i.certainty),
+            None => dwell.certainty,
+        };
+        Some(KeystrokeAnomaly {
+            dwell,
+            iki,
+            combined,
+            certainty,
+        })
+    }
+
     /// Pool the three levels into a single estimate for `(hand, finger,
     /// key)`. Population prior sits above the hand level so even a
     /// brand-new user gets a meaningful (if uncertain) score.
@@ -429,6 +614,32 @@ impl MotorBaseline {
 
         let key_cell = self
             .keys
+            .get(&(hand, finger, leaf_id.to_string()))
+            .copied()
+            .unwrap_or_default();
+        shrunk_with(key_cell, finger_est, self.shrink.k_finger)
+    }
+
+    /// Pool the three IKI levels — same shape as `estimate_dwell` but
+    /// reads from the IKI cells and uses the wider IKI population prior.
+    fn estimate_iki(&self, hand: Hand, finger: Finger, leaf_id: &str) -> EwmaCell {
+        let pop = EwmaCell {
+            mean: POP_IKI_MEAN_MS,
+            var: POP_IKI_VAR_MS2,
+            n_eff: 0.0,
+        };
+        let hand_cell = self.iki_hands.get(&hand).copied().unwrap_or_default();
+        let hand_est = shrunk_with(hand_cell, pop, self.shrink.k_pop);
+
+        let finger_cell = self
+            .iki_fingers
+            .get(&(hand, finger))
+            .copied()
+            .unwrap_or_default();
+        let finger_est = shrunk_with(finger_cell, hand_est, self.shrink.k_hand);
+
+        let key_cell = self
+            .iki_keys
             .get(&(hand, finger, leaf_id.to_string()))
             .copied()
             .unwrap_or_default();
@@ -515,6 +726,21 @@ mod tests {
 
     fn fresh() -> MotorBaseline {
         MotorBaseline::with_half_life(TEST_HALF_LIFE)
+    }
+
+    /// Feed `n` keystrokes of `key` with the given `dwell`. Each
+    /// observe is spaced 150ms apart (well within
+    /// [`MAX_TYPING_INTERVAL_MS`]) so the IKI baseline trains
+    /// alongside the dwell. Caller can pass a starting timestamp;
+    /// `train` returns the next free timestamp so multiple training
+    /// runs can be stitched together.
+    fn train(mb: &mut MotorBaseline, key: &str, dwell_ms: u32, n: usize, start_ts: u64) -> u64 {
+        let mut ts = start_ts;
+        for _ in 0..n {
+            mb.observe_key(key, ts, dwell_ms);
+            ts += 150;
+        }
+        ts
     }
 
     // ---- EWMA cell — the core math ---------------------------------------
@@ -678,9 +904,7 @@ mod tests {
         // 200ms keystroke should then score AS NORMAL (anomaly ~0),
         // not anomalous against the 100ms population prior.
         let mut mb = fresh();
-        for _ in 0..1000 {
-            mb.observe_key("a", 200);
-        }
+        train(&mut mb, "a", 200, 1000, 0);
         let a = mb.dwell_anomaly("a", 200).unwrap();
         // 1000 samples = ~33 test-half-lives → the user's mean should
         // dominate completely.
@@ -710,9 +934,7 @@ mod tests {
         let mut prev_certainty = -1.0;
         for n in [1, 5, 30, 100, 1000].iter() {
             let mut local = fresh();
-            for _ in 0..*n {
-                local.observe_key("a", 100);
-            }
+            train(&mut local, "a", 100, *n, 0);
             let c = local.dwell_anomaly("a", 100).unwrap().certainty;
             assert!(
                 c > prev_certainty,
@@ -733,9 +955,7 @@ mod tests {
         // pool says "left pinky dwells around 200ms." A 200ms `q`
         // should therefore read as nearly-normal, NOT anomalous.
         let mut mb = fresh();
-        for _ in 0..1000 {
-            mb.observe_key("a", 200);
-        }
+        train(&mut mb, "a", 200, 1000, 0);
         // `q` has no per-key cell, but it borrows from the finger.
         let q = mb.dwell_anomaly("q", 200).unwrap();
         assert!(
@@ -752,9 +972,7 @@ mod tests {
         // Heavy training on left pinky should NOT pull right-pinky's
         // baseline along — the hand-level pool is per-hand.
         let mut mb = fresh();
-        for _ in 0..1000 {
-            mb.observe_key("a", 200);
-        }
+        train(&mut mb, "a", 200, 1000, 0);
         // Right pinky has zero samples. Anomaly for `;` (right pinky)
         // at the population mean (100ms) should be ≈ 0, NOT
         // ≈ "anomalous because the LEFT-pinky baseline is 200ms".
@@ -769,8 +987,8 @@ mod tests {
     #[test]
     fn non_letter_keys_silently_skip() {
         let mut mb = fresh();
-        mb.observe_key("Escape", 50);
-        mb.observe_key("ArrowLeft", 50);
+        mb.observe_key("Escape", 0, 50);
+        mb.observe_key("ArrowLeft", 150, 50);
         // Nothing was recorded — no cells exist.
         assert!(mb.hand_cell(Hand::Left).is_none());
         assert!(mb.hand_cell(Hand::Right).is_none());
@@ -782,9 +1000,7 @@ mod tests {
         // `A` (shifted) and `a` should share the same per-key cell
         // because they're the same physical key.
         let mut mb = fresh();
-        for _ in 0..200 {
-            mb.observe_key("a", 200);
-        }
+        train(&mut mb, "a", 200, 200, 0);
         // Now ask about `A` — it should see the cell trained on `a`.
         let a_lower = mb.dwell_anomaly("a", 200).unwrap();
         let a_upper = mb.dwell_anomaly("A", 200).unwrap();
@@ -808,9 +1024,7 @@ mod tests {
     fn reliability_is_high_for_consistent_finger() {
         // Same dwell every time → variance → 0 → CV → 0 → score → 1.
         let mut mb = fresh();
-        for _ in 0..1000 {
-            mb.observe_key("a", 120);
-        }
+        train(&mut mb, "a", 120, 1000, 0);
         let r = mb.per_finger_reliability(Hand::Left, Finger::Pinky);
         assert!(
             r.score > 0.7,
@@ -820,13 +1034,169 @@ mod tests {
         assert!(r.n_eff > 30.0);
     }
 
+    // ---- IKI baseline + combined anomaly (commit H) ---------------------
+
+    #[test]
+    fn cold_start_iki_uses_population_prior() {
+        let mb = fresh();
+        // 200ms IKI against the 200ms pop prior → z = 0 → anomaly = 0.
+        // (Can't go through keystroke_anomaly here — no prior keystroke
+        // → no IKI is derived. iki_anomaly takes the value directly.)
+        let i = mb.iki_anomaly("a", 200).unwrap();
+        assert!(approx(i.mean_used, POP_IKI_MEAN_MS, 1e-9));
+        assert!(approx(i.anomaly, 0.0, 1e-12));
+        assert_eq!(i.certainty, 0.0);
+    }
+
+    #[test]
+    fn iki_outlier_against_population_prior_is_anomalous() {
+        // A 50ms IKI is z ≈ -1.875 vs the 200±80 prior → anomaly ~0.83.
+        let mb = fresh();
+        let fast = mb.iki_anomaly("a", 50).unwrap();
+        assert!(fast.anomaly > 0.5, "fast IKI should be anomalous; got {}", fast.anomaly);
+        assert!(fast.z < 0.0, "fast IKI z should be negative");
+
+        // 1000ms IKI is way out: z = 10 → anomaly ≈ 1.
+        let slow = mb.iki_anomaly("a", 1000).unwrap();
+        assert!(slow.anomaly > 0.99);
+    }
+
+    #[test]
+    fn iki_training_shifts_baseline_to_user_rhythm() {
+        // Train at 100ms IKIs — fast typist. A 100ms IKI should then
+        // score normal, and the original "200ms typical" reads as
+        // anomalous.
+        let mut mb = fresh();
+        let mut ts: u64 = 0;
+        for _ in 0..1000 {
+            mb.observe_key("a", ts, 80);
+            ts += 100; // 100ms spacing → IKI samples of 100ms
+        }
+        let normal = mb.iki_anomaly("a", 100).unwrap();
+        assert!(
+            normal.anomaly < 0.1,
+            "100ms IKI against 100ms-trained baseline should be ≈normal; got {}",
+            normal.anomaly
+        );
+        let slow = mb.iki_anomaly("a", 200).unwrap();
+        assert!(
+            slow.anomaly > 0.1,
+            "200ms IKI against 100ms-trained baseline should be anomalous; got {}",
+            slow.anomaly
+        );
+    }
+
+    #[test]
+    fn iki_pause_gap_is_dropped_and_does_not_poison_baseline() {
+        // Train at 100ms IKIs. Then a 5-second gap, then resume.
+        // The 5-second gap MUST NOT enter the IKI baseline — that
+        // would poison every subsequent normal-rhythm keystroke.
+        let mut mb = fresh();
+        let mut ts: u64 = 0;
+        for _ in 0..500 {
+            mb.observe_key("a", ts, 80);
+            ts += 100;
+        }
+        let before_pause = mb.iki_anomaly("a", 100).unwrap();
+        assert!(before_pause.anomaly < 0.1);
+
+        // Pause: 5-second gap. The next observe_key sees a 5000ms gap
+        // → derive_iki returns None → IKI cells unchanged.
+        let pause_ts = ts + 5_000;
+        mb.observe_key("a", pause_ts, 80);
+        // After the pause, the baseline should look identical to
+        // before — 100ms IKI still scores normal.
+        let after_pause = mb.iki_anomaly("a", 100).unwrap();
+        assert!(
+            approx(after_pause.mean_used, before_pause.mean_used, 1.0),
+            "5-second gap must not shift the IKI baseline; before={}, after={}",
+            before_pause.mean_used,
+            after_pause.mean_used
+        );
+    }
+
+    #[test]
+    fn keystroke_anomaly_combines_dwell_and_iki_by_max() {
+        // Two scenarios trained at 100ms-dwell, 100ms-IKI:
+        //   1. 100ms dwell, 100ms IKI  → both normal, combined ≈ 0.
+        //   2. 100ms dwell, 50ms IKI   → IKI fires, combined ≈ iki.anomaly.
+        //   3. 400ms dwell, 100ms IKI  → dwell fires, combined ≈ dwell.anomaly.
+        let mut mb = fresh();
+        let mut ts: u64 = 0;
+        for _ in 0..1000 {
+            mb.observe_key("a", ts, 100);
+            ts += 100;
+        }
+        // Probe AT the next slot — IKI from last train timestamp is
+        // 100ms (normal).
+        let normal = mb.keystroke_anomaly("a", ts, 100).unwrap();
+        assert!(normal.combined < 0.1, "all-normal combined should be ≈0; got {}", normal.combined);
+        assert!(normal.iki.is_some());
+
+        // Now probe with a 50ms IKI (fast roll) — IKI fires.
+        let fast = mb.keystroke_anomaly("a", ts + 50, 100).unwrap();
+        let fast_iki_anom = fast.iki.unwrap().anomaly;
+        assert!(approx(fast.combined, fast_iki_anom.max(fast.dwell.anomaly), 1e-12));
+        assert!(fast_iki_anom > 0.1, "50ms IKI should fire; got {}", fast_iki_anom);
+
+        // Probe with a 400ms dwell (slow press) — dwell fires.
+        let slow = mb.keystroke_anomaly("a", ts + 100, 400).unwrap();
+        assert!(slow.dwell.anomaly > 0.5, "400ms dwell should fire; got {}", slow.dwell.anomaly);
+        assert!(approx(
+            slow.combined,
+            slow.dwell.anomaly.max(slow.iki.map(|i| i.anomaly).unwrap_or(0.0)),
+            1e-12
+        ));
+    }
+
+    #[test]
+    fn keystroke_anomaly_certainty_is_min_of_dimensions() {
+        // After training dwell only — IKI cells get the same samples
+        // because they share the observe path. So this can only
+        // diverge on the FIRST keystroke (no prior IKI → iki = None
+        // → certainty = dwell.certainty alone, no min).
+        let mb = fresh();
+        let first = mb.keystroke_anomaly("a", 1000, 100).unwrap();
+        assert!(first.iki.is_none(), "no prior keystroke → no IKI on first probe");
+        // certainty == dwell.certainty, not min'd against anything.
+        assert!(approx(first.certainty, first.dwell.certainty, 1e-12));
+    }
+
+    #[test]
+    fn iki_is_none_on_first_keystroke() {
+        let mb = fresh();
+        let a = mb.keystroke_anomaly("a", 0, 100).unwrap();
+        assert!(a.iki.is_none());
+    }
+
+    #[test]
+    fn iki_is_none_immediately_after_pause_gap() {
+        let mut mb = fresh();
+        mb.observe_key("a", 0, 100);
+        // Pause length: gap exceeds MAX_TYPING_INTERVAL_MS.
+        let next_ts = MAX_TYPING_INTERVAL_MS + 2;
+        let probe = mb.keystroke_anomaly("a", next_ts, 100).unwrap();
+        assert!(probe.iki.is_none(), "between-pause keystroke must not have IKI");
+        // And actually observing this keystroke does NOT update the
+        // IKI cells. (The dwell did update — separate code path.)
+        let iki_finger_before = mb.iki_fingers.get(&(Hand::Left, Finger::Pinky)).copied();
+        mb.observe_key("a", next_ts, 100);
+        let iki_finger_after = mb.iki_fingers.get(&(Hand::Left, Finger::Pinky)).copied();
+        // No change — same Option<EwmaCell>.
+        match (iki_finger_before, iki_finger_after) {
+            (None, None) => {} // never had any IKI to begin with
+            (Some(b), Some(a)) => assert!(approx(b.mean, a.mean, 1e-12)),
+            _ => panic!("IKI cell appeared after a pause-gap keystroke"),
+        }
+    }
+
     #[test]
     fn reliability_is_low_for_jittery_finger() {
         // Alternating 60ms and 180ms → high variance → CV ≈ 0.5 → score low.
         let mut mb = fresh();
         for i in 0..2000 {
             let dwell = if i % 2 == 0 { 60 } else { 180 };
-            mb.observe_key("a", dwell);
+            mb.observe_key("a", i as u64 * 150, dwell);
         }
         let r = mb.per_finger_reliability(Hand::Left, Finger::Pinky);
         assert!(
