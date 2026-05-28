@@ -196,6 +196,15 @@ const MIN_VAR_MS2: f64 = 100.0;
 /// IKI buckets are rarer in practice.
 const MIN_IKI_VAR_MS2: f64 = 400.0;
 
+/// Co-activation overlap "time constant" — the overlap in
+/// milliseconds at which the co-activation anomaly reaches `1 - 1/e`
+/// ≈ 0.63. At 60ms overlap the anomaly is ≈ 0.86, at 100ms ≈ 0.96.
+/// Picked so a brief brush past the boundary registers gently while
+/// a deliberate hold-while-pressing scores nearly saturated. The
+/// sidecar already filters tap-while-still-held events out at the
+/// OS level on macOS — we don't see "stuck key" patterns here.
+const CO_ACT_TAU_MS: f64 = 30.0;
+
 /// Single EWMA cell — recency-weighted mean + variance for one
 /// `(hand, finger, key)`, `(hand, finger)`, or `(hand,)` bucket.
 /// `n_eff` is the effective sample count under the recency weighting:
@@ -303,25 +312,57 @@ pub struct IkiAnomaly {
     pub certainty: f64,
 }
 
+/// Per-keystroke co-activation detection. `timestamp_ms` is the
+/// current key's key-UP time, `dwell_ms` is up − down, so the key's
+/// pressed-window is `[t - d, t]`. Co-activation occurs when the
+/// current key's down-time precedes the previous key's up-time —
+/// fingers overlapping on the keyboard.
+///
+/// `overlap_ms` is the duration of the overlap (`prev_up −
+/// current_down`); a clean serial typist with even a few ms of gap
+/// returns `None`. The anomaly is graded smoothly so a 1-2ms brush
+/// past the boundary scores near zero, while a deliberate
+/// hold-while-press scores near one.
+///
+/// Unlike dwell and IKI, co-activation is **not** baselined. It's a
+/// direct event — either the keys overlapped or they didn't — so
+/// there's no per-user "is this user's normal co-activation rate
+/// 10% or 50%?" question to model. Layer B (later) may aggregate
+/// co-activation frequency into per-finger reliability; this phase
+/// just reports the per-keystroke signal.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CoActivation {
+    /// `prev_up − current_down` in ms. Always positive (otherwise the
+    /// result is `None`).
+    pub overlap_ms: u32,
+    /// `1 - exp(-overlap_ms / CO_ACT_TAU_MS)` in `[0, 1]`. ~0.63 at
+    /// the τ value (30ms), saturating beyond.
+    pub anomaly: f64,
+}
+
 /// Per-keystroke combined anomaly — the headline number Phase 2 will
-/// read. Combines dwell and IKI (and, in commit I, co-activation) by
-/// **max**: any one dimension being dramatically off is enough to
-/// flag the keystroke. Conservative — matches the "look at this
-/// finger, something's wrong" intuition rather than letting many mild
-/// signals stack into a false alarm.
+/// read. Combines dwell, IKI, and co-activation by **max**: any one
+/// dimension being dramatically off is enough to flag the keystroke.
+/// Conservative — matches the "look at this finger, something's
+/// wrong" intuition rather than letting many mild signals stack into
+/// a false alarm.
 ///
 /// `dwell` is always present (every keystroke has a dwell). `iki` is
 /// `None` for the very first keystroke and for any keystroke
 /// following a pause longer than [`crate::MAX_TYPING_INTERVAL_MS`] —
 /// those are between-word boundaries, not within-rhythm typing.
+/// `coactivation` is `None` when the current key's down-time is at or
+/// after the previous key's up-time (a clean serial keystroke).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct KeystrokeAnomaly {
     pub dwell: DwellAnomaly,
     pub iki: Option<IkiAnomaly>,
-    /// `max(dwell.anomaly, iki.anomaly_or_0)` — the conservative combination.
+    pub coactivation: Option<CoActivation>,
+    /// `max` over all present dimensions — conservative combination.
     pub combined: f64,
-    /// `min(dwell.certainty, iki.certainty_if_present)` — we should
-    /// only trust the anomaly to the weaker dimension's certainty.
+    /// `min` of dwell and IKI certainty (when IKI present); else dwell
+    /// alone. Co-activation is a direct event with no certainty term —
+    /// it doesn't degrade the combined certainty.
     pub certainty: f64,
 }
 
@@ -495,6 +536,27 @@ impl MotorBaseline {
         Some(gap.min(u64::from(u32::MAX)) as u32)
     }
 
+    /// Co-activation between this keystroke and the previous one — see
+    /// [`CoActivation`]. Returns `None` if there's no previous
+    /// keystroke or if the current key's down-time is at or after the
+    /// previous key's up-time (a clean serial keystroke).
+    ///
+    /// `&self` — read-only; updating `last_key_timestamp_ms` is the
+    /// observe path's job.
+    pub fn coactivation(&self, timestamp_ms: u64, dwell_ms: u32) -> Option<CoActivation> {
+        let prev_up = self.last_key_timestamp_ms?;
+        let current_down = timestamp_ms.saturating_sub(u64::from(dwell_ms));
+        if current_down >= prev_up {
+            return None;
+        }
+        let overlap = (prev_up - current_down).min(u64::from(u32::MAX)) as u32;
+        let anomaly = 1.0 - (-f64::from(overlap) / CO_ACT_TAU_MS).exp();
+        Some(CoActivation {
+            overlap_ms: overlap,
+            anomaly,
+        })
+    }
+
     /// Score a single keystroke's dwell against the pooled baseline.
     /// Returns `None` only for keys outside the touch-typing map —
     /// same shape as `observe_key`. Pools through:
@@ -576,11 +638,18 @@ impl MotorBaseline {
         let iki = self
             .derive_iki(timestamp_ms)
             .and_then(|iki_val| self.iki_anomaly(key, iki_val));
+        let coactivation = self.coactivation(timestamp_ms, dwell_ms);
 
-        let combined = match iki {
-            Some(i) => dwell.anomaly.max(i.anomaly),
-            None => dwell.anomaly,
-        };
+        let mut combined = dwell.anomaly;
+        if let Some(i) = iki {
+            combined = combined.max(i.anomaly);
+        }
+        if let Some(c) = coactivation {
+            combined = combined.max(c.anomaly);
+        }
+        // Certainty: dwell baseline + IKI baseline have certainty terms
+        // (they're EWMA-pooled estimates); co-activation is a direct
+        // event with no certainty notion, so it doesn't enter this min.
         let certainty = match iki {
             Some(i) => dwell.certainty.min(i.certainty),
             None => dwell.certainty,
@@ -588,6 +657,7 @@ impl MotorBaseline {
         Some(KeystrokeAnomaly {
             dwell,
             iki,
+            coactivation,
             combined,
             certainty,
         })
@@ -1167,6 +1237,112 @@ mod tests {
         let mb = fresh();
         let a = mb.keystroke_anomaly("a", 0, 100).unwrap();
         assert!(a.iki.is_none());
+    }
+
+    // ---- Co-activation (commit I) ---------------------------------------
+
+    #[test]
+    fn coactivation_returns_none_with_no_prior_keystroke() {
+        let mb = fresh();
+        // First keystroke ever — nothing to overlap with.
+        assert!(mb.coactivation(100, 50).is_none());
+    }
+
+    #[test]
+    fn coactivation_returns_none_when_keys_are_serial() {
+        let mut mb = fresh();
+        // A pressed [50,100], released at 100.
+        mb.observe_key("a", 100, 50);
+        // S pressed [130,180], released at 180. current_down=130, prev_up=100.
+        // No overlap (130 ≥ 100).
+        assert!(mb.coactivation(180, 50).is_none());
+    }
+
+    #[test]
+    fn coactivation_fires_when_current_down_precedes_prev_up() {
+        let mut mb = fresh();
+        // A pressed [50,100], released at 100.
+        mb.observe_key("a", 100, 50);
+        // S pressed [80,130], released at 130. current_down=80, prev_up=100.
+        // Overlap = 100 - 80 = 20ms.
+        let co = mb.coactivation(130, 50).unwrap();
+        assert_eq!(co.overlap_ms, 20);
+        // anomaly = 1 - exp(-20/30) = 1 - 0.5134 ≈ 0.4866.
+        assert!(
+            approx(co.anomaly, 1.0 - (-20.0f64 / 30.0).exp(), 1e-9),
+            "co-activation anomaly = {}",
+            co.anomaly
+        );
+    }
+
+    #[test]
+    fn coactivation_anomaly_grows_with_overlap_duration() {
+        let mut mb = fresh();
+        mb.observe_key("a", 100, 50);
+        // Small overlap (5ms): anomaly modest.
+        let small = mb.coactivation(115, 20).unwrap();
+        // Large overlap (80ms): anomaly large.
+        let large = mb.coactivation(115, 95).unwrap();
+        assert!(large.overlap_ms > small.overlap_ms);
+        assert!(large.anomaly > small.anomaly);
+        assert!(large.anomaly > 0.9, "80ms overlap should saturate; got {}", large.anomaly);
+        assert!(small.anomaly < 0.2, "5ms overlap should be small; got {}", small.anomaly);
+    }
+
+    #[test]
+    fn coactivation_contributes_to_combined_anomaly_max() {
+        let mut mb = fresh();
+        // Train at 100ms IKI, 80ms dwell. Track the last actually-
+        // observed timestamp so the probe's overlap math is honest.
+        let mut last_ts: u64 = 0;
+        for i in 0..1000 {
+            last_ts = i * 100;
+            mb.observe_key("a", last_ts, 80);
+        }
+        // Probe: current_down = last_ts - 30 (30ms overlap into the
+        // previous key's [last_ts-80, last_ts] window). current_ts
+        // (up) = current_down + dwell.
+        let probe_dwell = 80;
+        let probe_ts = (last_ts - 30) + u64::from(probe_dwell);
+        let result = mb.keystroke_anomaly("a", probe_ts, probe_dwell).unwrap();
+        let co = result.coactivation.expect("should detect overlap");
+        assert_eq!(co.overlap_ms, 30);
+        assert!(
+            result.combined >= co.anomaly - 1e-9,
+            "combined should be ≥ co-activation anomaly; combined={}, co={}",
+            result.combined,
+            co.anomaly
+        );
+    }
+
+    #[test]
+    fn coactivation_does_not_degrade_certainty() {
+        // Certainty is a property of the EWMA-pooled estimates (dwell
+        // and IKI). Co-activation is a direct event with no baseline
+        // certainty term — its presence must not lower the combined
+        // certainty.
+        let mut mb = fresh();
+        let mut last_ts: u64 = 0;
+        for i in 0..1000 {
+            last_ts = i * 100;
+            mb.observe_key("a", last_ts, 80);
+        }
+        // No-overlap probe: well after last_ts.
+        let no_overlap = mb
+            .keystroke_anomaly("a", last_ts + 200, 80)
+            .unwrap();
+        // Overlap probe: down = last_ts - 30 → up = last_ts - 30 + 80.
+        let with_overlap = mb
+            .keystroke_anomaly("a", (last_ts - 30) + 80, 80)
+            .unwrap();
+        assert!(no_overlap.coactivation.is_none());
+        assert!(with_overlap.coactivation.is_some());
+        assert!(
+            approx(no_overlap.certainty, with_overlap.certainty, 1e-9),
+            "co-activation must not change certainty; no={}, with={}",
+            no_overlap.certainty,
+            with_overlap.certainty
+        );
     }
 
     #[test]
