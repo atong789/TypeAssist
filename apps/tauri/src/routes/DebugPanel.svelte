@@ -492,6 +492,15 @@
   /// `top_candidate` targets a learned word.
   let learnedSet: Set<string> = new Set();
 
+  /// **C5 capture-health** — engine-derived view of the sidecar's
+  /// event-tap state. Drives the header pill. Default `unknown` on
+  /// mount; first heartbeat from the sidecar (≤2s after engine
+  /// start) flips it to `live`. The shipped user surface needs this
+  /// silent-death warning to be impossible to miss — see commit M's
+  /// rationale.
+  type CaptureHealth = "unknown" | "live" | "unhealthy" | "stopped";
+  let captureHealth: CaptureHealth = "unknown";
+
   /// **C5c Layer A** — per-finger motor baseline snapshot, replaced
   /// wholesale on each `engine://motor-baseline` event. Renders as a
   /// stable 10-row table even before any data arrives.
@@ -708,6 +717,16 @@
         asymmetry = e.payload.asymmetry;
         ghostKeys = e.payload.ghost_keys;
         slips = e.payload.slips;
+      }),
+    );
+    unlistens.push(
+      // C5 capture-health — only emitted on TRANSITION (not every
+      // heartbeat), so the default `unknown` stays until the engine
+      // tells us otherwise. A panel reload may miss earlier
+      // transitions; commit O's watchdog will re-emit the current
+      // state on a timer so reloads converge to truth.
+      await listen<{ state: CaptureHealth }>("engine://capture-health", (e) => {
+        captureHealth = e.payload.state;
       }),
     );
     unlistens.push(
@@ -1107,6 +1126,15 @@
   </div>
 
   <header class="strip">
+    <!-- C5 capture-health pill. Leftmost in the strip so silent
+         capture death is impossible to miss while glancing at the
+         panel. Color + text — never color-only. -->
+    <div class="stat" title="Capture health — sidecar event-tap state. Live = events flowing. Unhealthy = sidecar alive but tap disabled. Stopped = no heartbeats; restart needed.">
+      <span class="stat-label">CAPTURE</span>
+      <span class="stat-val capture-pill capture-pill-{captureHealth}">
+        <span class="capture-dot"></span>{captureHealth}
+      </span>
+    </div>
     <div class="stat"><span class="stat-label">KEYS</span><span class="stat-val">{keystrokeCount}</span></div>
     <!-- MODE = active engine setting (Cautious / Balanced / Eager). Per
          3c-3, modes and per-candidate confidences use SEPARATE vocabularies
@@ -2235,6 +2263,56 @@
     color: #d6b69b;
     border: 1px solid #5a432e;
   }
+  /* Capture-health pill. Same chrome as the mode pill but its own
+     state palette (semantic colors so the dot's meaning is
+     readable). Each state ALSO carries text — never color-only. */
+  .capture-pill {
+    padding: 0 0.5rem;
+    border-radius: 3px;
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .capture-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 4px currentColor;
+  }
+  .capture-pill-unknown {
+    background: #2a2f36;
+    color: #7f8a96;
+    border: 1px solid #3a414a;
+  }
+  .capture-pill-live {
+    background: #1f2a23;
+    color: #6ea76e;
+    border: 1px solid #2e4a35;
+  }
+  .capture-pill-unhealthy {
+    background: #2f261f;
+    color: #d2885d;
+    border: 1px solid #5a3a2a;
+  }
+  .capture-pill-stopped {
+    background: #2f1f22;
+    color: #c8553d;
+    border: 1px solid #5a2a2e;
+    /* Stopped is the must-act state — gently pulse so a glance
+       catches it even if the user wasn't looking. */
+    animation: capture-stopped-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes capture-stopped-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(200, 85, 61, 0); }
+    50%      { box-shadow: 0 0 0 2px rgba(200, 85, 61, 0.25); }
+  }
+
   .mode-pill-none {
     background: #2a2f36;
     color: #7f8a96;

@@ -142,6 +142,48 @@ pub const EVT_MOTOR_BASELINE: &str = "engine://motor-baseline";
 /// dwell + IKI + co-activation dimensions. Skipped for non-typing
 /// keys (`finger_for` returned `None`) — no anomaly to compute.
 pub const EVT_MOTOR_KEYSTROKE: &str = "engine://motor-keystroke";
+/// **C5 capture-health.** Engine-derived view of the sidecar's
+/// capture state. Emitted whenever the state transitions — NOT on
+/// every heartbeat. Panel renders a header pill so silent capture
+/// death is visible mid-session (the long-session bug); a future
+/// menu-bar surface will subscribe to the same event without a panel
+/// rewrite. Payload is [`CaptureHealthEvent`].
+pub const EVT_CAPTURE_HEALTH: &str = "engine://capture-health";
+
+/// Engine-derived view of the sidecar's capture state. Transitions
+/// are observation-only this phase — driven by the Heartbeat
+/// InputEvent's `tap_enabled` flag. The watchdog (commit O) adds
+/// time-based transitions (heartbeat staleness → Stopped) so the
+/// enum carries the full state space here even though M's emitter
+/// only ever produces `Live` / `Unhealthy` (and the implicit
+/// `Unknown` initial).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // `Stopped` is constructed by the watchdog in commit O.
+pub enum CaptureHealth {
+    /// No heartbeat received yet — panel renders neutral pill.
+    Unknown,
+    /// Heartbeat fresh AND sidecar reports `tap_enabled: true`.
+    Live,
+    /// Heartbeat fresh BUT `tap_enabled: false` — sidecar is alive
+    /// but its event tap is disabled. Auto-re-enable in the sidecar
+    /// should recover this quickly; if it persists, the user can
+    /// soft-restart via the panel (commit N).
+    Unhealthy,
+    /// No heartbeat for an extended period — watchdog escalated
+    /// (commit O) or the sidecar's `CommandEvent::Terminated` arm
+    /// fired. Capture is dead; only manual recovery via "Restart
+    /// capture" can recover.
+    Stopped,
+}
+
+/// Payload for [`EVT_CAPTURE_HEALTH`]. Single field rather than a
+/// bare enum so future additions (reason text, retry count) don't
+/// break the wire shape.
+#[derive(Debug, Clone, Copy, Serialize)]
+struct CaptureHealthEvent {
+    state: CaptureHealth,
+}
 
 /// Control commands the engine task accepts from Tauri commands. Sent
 /// through an unbounded mpsc channel whose sender lives in Tauri's
@@ -787,6 +829,20 @@ pub fn spawn<R: Runtime>(
         // anchors / tokenizer) so the engine wakes on a clean
         // boundary when input resumes.
         let mut input_paused: bool = false;
+        // **C5 capture-health** — last heartbeat arrival from the
+        // sidecar + the tap_enabled flag it carried. The watchdog in
+        // commit O will read these on a timer to detect staleness;
+        // commit M only emits transitions in response to incoming
+        // heartbeats, so `Unknown` is the initial state (no heartbeat
+        // seen yet) and only an explicit Heartbeat event can change it.
+        // `last_heartbeat_at` is written by the Heartbeat arm and
+        // read by the watchdog in commit O (heartbeat staleness →
+        // Stopped). The allows keep the build clean until that read
+        // site lands. Prefer this over an underscore prefix so the
+        // name + intent comment survive into the watchdog patch.
+        #[allow(unused_assignments, unused_variables)]
+        let mut last_heartbeat_at: Option<Instant> = None;
+        let mut current_capture_health: CaptureHealth = CaptureHealth::Unknown;
 
         // The receive loop selects between the sidecar event stream
         // and the control channel so a Tauri command (e.g. Reset
@@ -909,11 +965,43 @@ pub fn spawn<R: Runtime>(
                                  grant in System Settings › Privacy & Security › Accessibility"
                             );
                         }
-                        InputEvent::Heartbeat { .. } => {
-                            // Capture-health proof-of-life — surfaced in
-                            // commit M (CaptureHealth state + panel pill).
-                            // For now: parsed cleanly and dropped. Don't
-                            // FEED it; not user input.
+                        InputEvent::Heartbeat { tap_enabled, .. } => {
+                            // Capture-health proof-of-life. Stamp the
+                            // arrival time + tap_enabled flag, derive
+                            // the new health state, and emit only on
+                            // transition (not every heartbeat — that'd
+                            // be 30 noisy events per minute). Don't
+                            // touch the FEED; heartbeats aren't input.
+                            // Log inter-heartbeat gap at trace level so
+                            // the read site of `last_heartbeat_at`
+                            // exists until the watchdog wires up — and
+                            // the gap is genuinely useful for diagnosing
+                            // sidecar pauses against expectations.
+                            let now = Instant::now();
+                            let elapsed = last_heartbeat_at
+                                .map(|prev| now.duration_since(prev));
+                            last_heartbeat_at = Some(now);
+                            tracing::trace!(
+                                "heartbeat tap_enabled={} elapsed={:?}",
+                                tap_enabled,
+                                elapsed
+                            );
+                            let new_health = if tap_enabled {
+                                CaptureHealth::Live
+                            } else {
+                                CaptureHealth::Unhealthy
+                            };
+                            if new_health != current_capture_health {
+                                current_capture_health = new_health;
+                                let _ = app_handle.emit(
+                                    EVT_CAPTURE_HEALTH,
+                                    CaptureHealthEvent { state: new_health },
+                                );
+                                tracing::info!(
+                                    "capture health -> {:?}",
+                                    new_health
+                                );
+                            }
                         }
                         InputEvent::Shutdown => break 'engine_loop,
                         InputEvent::Backspace { .. } => {
