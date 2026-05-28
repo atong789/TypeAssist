@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 let bridge = Bridge()
 
@@ -24,19 +25,30 @@ guard tap.start() else {
 bridge.emit(.ready)
 bridge.runInputLoop(commandHandler: tap.handleCommand(_:))
 
-// Capture-health heartbeat — fires on the main run loop every
-// `HEARTBEAT_INTERVAL_SECONDS`, reporting the tap's current enabled
-// state to the engine. The engine's watchdog uses these to detect
-// silent capture death (tap dead OR sidecar wedged) independent of
-// whether the user is currently typing.
-let HEARTBEAT_INTERVAL_SECONDS: TimeInterval = 2.0
-let heartbeatTimer = Timer.scheduledTimer(withTimeInterval: HEARTBEAT_INTERVAL_SECONDS, repeats: true) { _ in
+// Capture-health heartbeat — fires every HEARTBEAT_INTERVAL_SECONDS on
+// the main thread's CFRunLoop, alongside the EventTap's CFMachPort
+// source. Added in `.commonModes` so any common mode the run loop
+// happens to be in services it (matches how the EventTap source is
+// registered).
+//
+// **Why CFRunLoopTimer and not NSTimer / DispatchSourceTimer / GCD
+// asyncAfter / Thread+sleep.** All four of those silently fail to
+// re-fire in this binary: the immediate emit lands but no scheduled
+// fires execute. CFRunLoopTimer is the underlying primitive the
+// others wrap, and it works directly when added to the main run
+// loop with `.commonModes`. Verified empirically.
+let HEARTBEAT_INTERVAL_SECONDS: Double = 2.0
+let heartbeatTimer = CFRunLoopTimerCreateWithHandler(
+    kCFAllocatorDefault,
+    CFAbsoluteTimeGetCurrent() + HEARTBEAT_INTERVAL_SECONDS,
+    HEARTBEAT_INTERVAL_SECONDS,
+    0, 0
+) { _ in
     let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
     bridge.emit(.heartbeat(timestampMs: nowMs, tapEnabled: tap.isTapEnabled()))
 }
-// Schedule on `.common` modes so the timer fires while modal panels
-// (rare in a sidecar, but defensive) don't pause it.
-RunLoop.current.add(heartbeatTimer, forMode: .common)
+CFRunLoopAddTimer(CFRunLoopGetMain(), heartbeatTimer, .commonModes)
+
 // Emit one immediately so the engine doesn't wait the full interval
 // to see its first proof of life.
 bridge.emit(.heartbeat(
