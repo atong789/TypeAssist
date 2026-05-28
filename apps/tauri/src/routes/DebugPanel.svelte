@@ -634,6 +634,25 @@
     }
   }
 
+  /// Ask the engine to soft-restart capture — sidecar tears down its
+  /// current event tap and creates a fresh one. The primary recovery
+  /// path when the CAPTURE pill goes amber (Unhealthy) or red
+  /// (Stopped). Stays clickable in all states so it's never the case
+  /// that "the only way out is to restart the app."
+  async function restartCapture() {
+    try {
+      await invoke("restart_capture");
+    } catch (err) {
+      console.error("restart_capture failed:", err);
+    }
+  }
+
+  /// Pause controls become aria-disabled when capture is Stopped —
+  /// clicking them would post to an engine that may have lost contact
+  /// with the sidecar. The Restart capture button is the visible
+  /// recovery path; once capture comes back, Pause buttons re-enable.
+  $: pauseControlsDisabled = captureHealth === "stopped";
+
   /// Whenever the manual toggle flips, post the new state to the
   /// engine. The engine's echo on `engine://learning-paused` then
   /// drives the indicator — keeping the UI honest about the engine's
@@ -1135,6 +1154,20 @@
         <span class="capture-dot"></span>{captureHealth}
       </span>
     </div>
+    <!-- Restart capture — soft restart via OutboundCommand::RestartTap.
+         Always clickable; visually elevated (amber border) when the
+         pill is anything other than "live" so the recovery path is
+         obvious exactly when it's needed. Sits next to the pill so
+         the state + recovery action read as one unit. -->
+    <button
+      type="button"
+      class="restart-capture"
+      class:restart-capture-elevated={captureHealth !== "live"}
+      title="Tell the sidecar to tear down its current event tap and create a fresh one. Always available; use when CAPTURE pill is amber/red."
+      on:click={restartCapture}
+    >
+      Restart capture
+    </button>
     <div class="stat"><span class="stat-label">KEYS</span><span class="stat-val">{keystrokeCount}</span></div>
     <!-- MODE = active engine setting (Cautious / Balanced / Eager). Per
          3c-3, modes and per-candidate confidences use SEPARATE vocabularies
@@ -1485,7 +1518,12 @@
             type="button"
             class="lex-pause"
             class:lex-pause-on={manualPaused}
-            title="Soft pause — suppress LEXICON credit but keep observing. FEED and decisions keep flowing; the lexicon just doesn't update. Use when watching the engine work without polluting vocabulary."
+            class:lex-pause-stuck={pauseControlsDisabled}
+            disabled={pauseControlsDisabled}
+            aria-disabled={pauseControlsDisabled}
+            title={pauseControlsDisabled
+              ? "Capture is stopped — Pause is unavailable until capture is restored. Click 'Restart capture' in the header."
+              : "Soft pause — suppress LEXICON credit but keep observing. FEED and decisions keep flowing; the lexicon just doesn't update. Use when watching the engine work without polluting vocabulary."}
             on:click={togglePauseLearning}
           >
             {manualPaused ? "Resume learning" : "Pause learning"}
@@ -1494,7 +1532,12 @@
             type="button"
             class="lex-pause lex-pause-input"
             class:lex-pause-on={inputPaused}
-            title="Hard pause — engine drops Key/Backspace events at its task boundary. FEED freezes; engine effectively sleeps. Use when typing about the system in chat. Toggling triggers a line-reset on the engine so resume starts on a clean boundary."
+            class:lex-pause-stuck={pauseControlsDisabled}
+            disabled={pauseControlsDisabled}
+            aria-disabled={pauseControlsDisabled}
+            title={pauseControlsDisabled
+              ? "Capture is stopped — Pause is unavailable until capture is restored. Click 'Restart capture' in the header."
+              : "Hard pause — engine drops Key/Backspace events at its task boundary. FEED freezes; engine effectively sleeps. Use when typing about the system in chat. Toggling triggers a line-reset on the engine so resume starts on a clean boundary."}
             on:click={togglePauseInput}
           >
             {inputPaused ? "Resume input" : "Pause input"}
@@ -2313,6 +2356,35 @@
     50%      { box-shadow: 0 0 0 2px rgba(200, 85, 61, 0.25); }
   }
 
+  /* Restart capture button — always visible, always clickable. The
+     elevated variant (amber border) fires when CAPTURE is anything
+     other than "live" so the recovery path stands out exactly when
+     it's needed. Stays the same color even in Stopped state — never
+     dimmed, never disabled, by intent: when everything else looks
+     dead, this is the path forward. */
+  .restart-capture {
+    font: inherit;
+    font-size: 11px;
+    color: #e6e6e6;
+    background: #2a2f36;
+    border: 1px solid #3a414a;
+    border-radius: 4px;
+    padding: 0.2rem 0.6rem;
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
+  }
+  .restart-capture:hover { background: #353c45; }
+  .restart-capture:focus { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+  .restart-capture-elevated {
+    background: #3a2b22;
+    color: #f0c0a0;
+    border-color: #c8553d;
+    box-shadow: 0 0 0 1px rgba(200, 85, 61, 0.4);
+  }
+  .restart-capture-elevated:hover { background: #4a352a; }
+
   .mode-pill-none {
     background: #2a2f36;
     color: #7f8a96;
@@ -2552,6 +2624,15 @@
     border-color: #5a3a2a;
   }
   .lex-pause-on:hover { background: #4a352a; }
+  /* When capture is Stopped, the Pause buttons get the disabled
+     attribute + a visual de-emphasis so the user sees the difference
+     between "click did nothing" (pre-fix) and "this control is not
+     available right now; Restart capture is what you need." */
+  .lex-pause-stuck {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .lex-pause-stuck:hover { background: #2a2f36; }
   /* Quiet inline tag rendered next to the casing baseline when the
      engine reports learning is currently paused. */
   .lex-paused-tag {

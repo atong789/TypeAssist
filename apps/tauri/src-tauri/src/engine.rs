@@ -227,6 +227,16 @@ pub enum EngineControl {
     /// engine; the panel surfaces them as separate indicators.
     /// Emits [`EVT_INPUT_PAUSED`] echoing the new state.
     SetInputPaused(bool),
+    /// **Soft capture restart.** Writes
+    /// `OutboundCommand::RestartTap` to the sidecar's stdin so it
+    /// tears down its current CGEventTap and creates a fresh one.
+    /// Used by the panel's "Restart capture" button when the sidecar
+    /// is alive (heartbeats still arriving) but capture is unhealthy
+    /// — auto-re-enable hasn't recovered, or the user manually
+    /// triggered. Commit O escalates to a hard restart (respawn the
+    /// sidecar process) when no heartbeat arrives within the
+    /// soft-restart timeout.
+    RestartCapture,
 }
 
 /// Tauri-managed handle for sending [`EngineControl`] messages to
@@ -752,7 +762,7 @@ pub fn spawn<R: Runtime>(
     // stdin pipe. It is **moved into the async task below** and dropped
     // when that task ends — see the load-bearing comment at the bottom
     // of the closure for the lifetime contract.
-    let (mut rx, sidecar_child) = sidecar.spawn()?;
+    let (mut rx, mut sidecar_child) = sidecar.spawn()?;
     let app_handle = app.clone();
 
     // Control channel: Tauri commands → engine task. Unbounded so the
@@ -1358,6 +1368,30 @@ pub fn spawn<R: Runtime>(
                                 EVT_LEARNING_PAUSED,
                                 LearningPausedEvent { paused: proposer.credit_paused() },
                             );
+                        }
+                        EngineControl::RestartCapture => {
+                            // Soft capture restart — write the
+                            // OutboundCommand to the sidecar's stdin.
+                            // The newline terminator matches the
+                            // line-delimited JSON protocol; the Swift
+                            // Bridge reads one command per line.
+                            //
+                            // On failure (sidecar's stdin closed, etc)
+                            // we log + drop. Commit O's hard-restart
+                            // path escalates: if no heartbeat arrives
+                            // within the soft-restart timeout the
+                            // watchdog respawns the sidecar.
+                            const RESTART_LINE: &[u8] =
+                                b"{\"type\":\"restart_tap\"}\n";
+                            if let Err(e) = sidecar_child.write(RESTART_LINE) {
+                                tracing::warn!(
+                                    "failed to write restart_tap to sidecar: {e}"
+                                );
+                            } else {
+                                tracing::info!(
+                                    "soft capture restart requested"
+                                );
+                            }
                         }
                         EngineControl::SetInputPaused(paused) => {
                             let was_paused = input_paused;

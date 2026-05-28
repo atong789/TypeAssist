@@ -61,6 +61,18 @@ fn set_input_paused(
         .map_err(|e| format!("engine control channel closed: {e}"))
 }
 
+/// Tauri command: ask the engine to soft-restart capture. Writes
+/// the RestartTap OutboundCommand to the sidecar's stdin so it
+/// tears down its current event tap and creates a fresh one.
+/// Always available from the panel — when capture is the broken
+/// thing, this is the recovery path that must stay live.
+#[tauri::command]
+fn restart_capture(sender: tauri::State<EngineControlSender>) -> Result<(), String> {
+    sender
+        .send(EngineControl::RestartCapture)
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -74,7 +86,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             reset_lexicon,
             set_learning_paused,
-            set_input_paused
+            set_input_paused,
+            restart_capture
         ])
         .setup(|app| {
             match engine::spawn(&app.handle()) {
