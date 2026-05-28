@@ -255,25 +255,35 @@ pub fn is_well_formed(word: &str) -> bool {
 /// The order is "softer first → harder last" so the panel's hold
 /// reason reflects the most specific signal that fired. Edit-2 is
 /// computationally heaviest and most permissive.
-pub fn proximity_verdict(word: &str, lex: &Lexicon) -> ProximityVerdict {
+pub fn proximity_verdict(
+    word: &str,
+    lex: &Lexicon,
+    current_word_ts: u64,
+    learned_at: &std::collections::HashMap<String, u64>,
+) -> ProximityVerdict {
     if is_segmentable(word, lex) {
         return ProximityVerdict::Segmentable;
     }
     if is_prefix_merge(word, lex) {
         return ProximityVerdict::PrefixMerge;
     }
-    if has_known_at_edit_2(word, lex) {
+    if has_known_at_edit_2(word, lex, current_word_ts, learned_at) {
         return ProximityVerdict::NearKnownEdit2;
     }
     ProximityVerdict::FarFromKnown
 }
 
-pub fn linguistic_signal(word: &str, lex: &Lexicon) -> LinguisticSignal {
+pub fn linguistic_signal(
+    word: &str,
+    lex: &Lexicon,
+    current_word_ts: u64,
+    learned_at: &std::collections::HashMap<String, u64>,
+) -> LinguisticSignal {
     let plausibility = plausibility(word);
     LinguisticSignal {
         plausibility,
         well_formed: plausibility >= PLAUSIBILITY_FLOOR,
-        proximity: proximity_verdict(word, lex),
+        proximity: proximity_verdict(word, lex, current_word_ts, learned_at),
     }
 }
 
@@ -364,18 +374,46 @@ pub fn is_prefix_merge(word: &str, lex: &Lexicon) -> bool {
 /// has a few rare edit-2 neighbours in a 90k-word dictionary, but a
 /// match against a **common** word is a real "user mangled this"
 /// signal. Capped at [`MAX_PROXIMITY_LEN`] to bound the search cost.
-pub fn has_known_at_edit_2(word: &str, lex: &Lexicon) -> bool {
+pub fn has_known_at_edit_2(
+    word: &str,
+    lex: &Lexicon,
+    current_word_ts: u64,
+    learned_at: &std::collections::HashMap<String, u64>,
+) -> bool {
     let len = word.chars().count();
     if !(2..=MAX_PROXIMITY_LEN).contains(&len) {
         return false;
     }
+    // edit1(edit1(w)) cycles back through w; self-matches don't count
+    // (freshly-learned words must not re-classify themselves as
+    // near-known to themselves).
+    let self_lower = word.to_ascii_lowercase();
     let e1 = edit1(word);
     for w in &e1 {
         for e2_word in edit1(w) {
-            // is_known + freq gate: must be a real dictionary word
-            // (not just a Norvig typo with a count) AND common
-            // enough to plausibly be what the user meant.
-            if lex.is_known(&e2_word) && lex.frequency(&e2_word) >= NEAR_KNOWN_MIN_FREQ {
+            let e2_lower = e2_word.to_ascii_lowercase();
+            if e2_lower == self_lower {
+                continue;
+            }
+            // **Learned path FIRST** — use the passed-in `learned_at`
+            // map (no lock acquisition). The map IS the authority on
+            // learned membership (the proposer is the sole writer to
+            // both lex.learned and learned_at, kept in sync). This
+            // saves a per-iteration RwLock read on a HOT inner loop
+            // that runs ~120k iterations per call.
+            if let Some(&learned_ts) = learned_at.get(&e2_lower) {
+                // Newer-wins: only count learned anchors strictly
+                // newer than the word being evaluated.
+                if learned_ts > current_word_ts {
+                    return true;
+                }
+                continue;
+            }
+            // Not a learned word — check bundled via the LOCK-FREE
+            // path. `is_in_clean` only reads the immutable `clean`
+            // HashSet — no RwLock acquisition. Critical because this
+            // inner loop runs ~120k iterations per call.
+            if lex.is_in_clean(&e2_word) && lex.frequency(&e2_word) >= NEAR_KNOWN_MIN_FREQ {
                 return true;
             }
         }
@@ -388,12 +426,47 @@ pub fn has_known_at_edit_2(word: &str, lex: &Lexicon) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    /// Empty learned-at map for tests that don't exercise the
+    /// runtime-learning timestamp logic. All bundled-lexicon
+    /// behaviour is identical whether or not learned-at is empty.
+    fn no_learned() -> HashMap<String, u64> {
+        HashMap::new()
+    }
 
     // ---- Calibration corpus (diagnostic) -------------------------------
 
     /// Diagnostic: print which known word(s) match within edit-2 for
     /// a given input. Used to understand false positives in the
     /// proximity gate.
+    #[test]
+    #[ignore]
+    fn dump_edit_2_high_freq_matches_for_foobar_and_foobax() {
+        let lex = Lexicon::shared();
+        for w in ["foobar", "foobax", "klorvex", "klorvox", "Qwippex", "Qwippox", "Zylgrax", "Zylgrux"] {
+            let mut hits: Vec<(String, u64)> = Vec::new();
+            for e1 in edit1(w) {
+                for e2 in edit1(&e1) {
+                    if !lex.is_in_clean(&e2) {
+                        continue;
+                    }
+                    let f = lex.frequency(&e2);
+                    if f >= NEAR_KNOWN_MIN_FREQ && !hits.iter().any(|(s, _)| s == &e2) {
+                        hits.push((e2, f));
+                        if hits.len() >= 8 {
+                            break;
+                        }
+                    }
+                }
+                if hits.len() >= 8 {
+                    break;
+                }
+            }
+            eprintln!("{:>10} high-freq edit-2 hits: {:?}", w, hits);
+        }
+    }
+
     #[test]
     #[ignore]
     fn dump_edit_2_matches_for_calibration_words() {
@@ -442,7 +515,7 @@ mod tests {
             eprintln!(
                 "{:>15} → proximity={:?}  norvig={}",
                 w,
-                proximity_verdict(w, lex),
+                proximity_verdict(w, lex, 0, &no_learned()),
                 lex.frequency(w)
             );
         }
@@ -595,7 +668,7 @@ mod tests {
         // (1) = edit-2. Must be flagged.
         let lex = Lexicon::shared();
         assert!(
-            has_known_at_edit_2("imapc", lex),
+            has_known_at_edit_2("imapc", lex, 0, &no_learned()),
             "imapc must register as near-known (impact is edit-2 away)"
         );
     }
@@ -609,7 +682,7 @@ mod tests {
         // required.
         let lex = Lexicon::shared();
         assert!(
-            !has_known_at_edit_2("Soumyo", lex),
+            !has_known_at_edit_2("Soumyo", lex, 0, &no_learned()),
             "Soumyo: no edit-2 neighbour clears the {NEAR_KNOWN_MIN_FREQ}-freq gate"
         );
         // Krutrim and ZAMS are seed proper nouns — known upstream and
@@ -625,7 +698,7 @@ mod tests {
         let lex = Lexicon::shared();
         let long_mangle = "a".repeat(MAX_PROXIMITY_LEN + 1);
         assert!(
-            !has_known_at_edit_2(&long_mangle, lex),
+            !has_known_at_edit_2(&long_mangle, lex, 0, &no_learned()),
             "length cap must short-circuit before checking edit-2"
         );
     }
@@ -635,28 +708,28 @@ mod tests {
     #[test]
     fn novel_name_lands_far_from_known() {
         let lex = Lexicon::shared();
-        let v = proximity_verdict("Soumyo", lex);
+        let v = proximity_verdict("Soumyo", lex, 0, &no_learned());
         assert_eq!(v, ProximityVerdict::FarFromKnown);
     }
 
     #[test]
     fn dropped_space_merge_lands_segmentable() {
         let lex = Lexicon::shared();
-        let v = proximity_verdict("andthe", lex);
+        let v = proximity_verdict("andthe", lex, 0, &no_learned());
         assert_eq!(v, ProximityVerdict::Segmentable);
     }
 
     #[test]
     fn themach_lands_prefix_merge() {
         let lex = Lexicon::shared();
-        let v = proximity_verdict("themach", lex);
+        let v = proximity_verdict("themach", lex, 0, &no_learned());
         assert_eq!(v, ProximityVerdict::PrefixMerge);
     }
 
     #[test]
     fn spatial_mangle_lands_near_known_edit_2() {
         let lex = Lexicon::shared();
-        let v = proximity_verdict("imapc", lex);
+        let v = proximity_verdict("imapc", lex, 0, &no_learned());
         assert_eq!(v, ProximityVerdict::NearKnownEdit2);
     }
 }

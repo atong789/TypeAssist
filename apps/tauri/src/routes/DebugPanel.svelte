@@ -435,6 +435,13 @@
     rescue_active: true,
   };
 
+  /// **C5b Phase 2** — set of words currently live in `is_known` via
+  /// the runtime-learned set. Updated wholesale on each
+  /// `engine://learned-snapshot` event. Used to mark Confirmed
+  /// proposals with a "LIVE" indicator and to flag LOG records whose
+  /// `top_candidate` targets a learned word.
+  let learnedSet: Set<string> = new Set();
+
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
 
@@ -511,8 +518,10 @@
     logRows = [];
     // Same for LEXICON proposals: engine owns the truth, panel just
     // mirrors. Clear wipes the local copy; the next proposal event
-    // will repopulate.
+    // will repopulate. learnedSet is similarly mirrored — the engine
+    // will resend a snapshot on the next learning event.
     lexiconProposals = {};
+    learnedSet = new Set();
     // Note: Clear only resets the *view*. The L2 model in the backend keeps
     // its own counts — modelRows/fingerRows will repopulate on the next keystroke.
   }
@@ -632,6 +641,13 @@
       // time, so the panel just replaces wholesale.
       await listen<CasingBaseline>("engine://casing-baseline", (e) => {
         casingBaseline = e.payload;
+      }),
+    );
+    unlistens.push(
+      // Component 5b Phase 2 — runtime-learned-words snapshot.
+      // Lowercase keys; replace wholesale on each emission.
+      await listen<string[]>("engine://learned-snapshot", (e) => {
+        learnedSet = new Set(e.payload.map((w) => w.toLowerCase()));
       }),
     );
     unlistens.push(
@@ -1198,13 +1214,18 @@
                 <span class="col-lx">outcome</span>
               </div>
               {#each logRows as r (r.id)}
+                {@const targetsLearned = r.top_candidate !== null && learnedSet.has(r.top_candidate.toLowerCase())}
                 <div
                   class="log-row"
                   class:log-would={r.decision.kind === "would_correct"}
                   class:log-leave={r.decision.kind === "leave_alone"}
+                  class:log-learned-target={targetsLearned}
                 >
                   <span class="col-lo">{r.original_text}</span>
-                  <span class="col-ld">{fmtDecisionShort(r.decision)}</span>
+                  <span class="col-ld">
+                    {fmtDecisionShort(r.decision)}
+                    {#if targetsLearned}<span class="log-learned-marker" title="top_candidate is a runtime-learned word — would-correct against the learning lexicon, not bundled SCOWL.">★L</span>{/if}
+                  </span>
                   <span class="col-lc num">{fmtScore(r.top_score)}</span>
                   <span class="col-lb cand-conf cand-conf-{r.confidence === 'below_floor' ? 'none' : r.confidence}"
                     >{fmtLogConfidence(r.confidence)}</span
@@ -1252,6 +1273,7 @@
                 <span class="col-lxo num">×</span>
               </div>
               {#each lexiconProposalList as p (p.word)}
+                {@const live = learnedSet.has(p.word.toLowerCase())}
                 <div
                   class="lex-row"
                   class:lex-held={p.tier.kind === "held"}
@@ -1264,7 +1286,10 @@
                   <span class="col-lxp num">{fmtPlausibility(p.plausibility)}</span>
                   <span class="col-lxx lex-prox-{p.proximity}">{fmtProximity(p.proximity)}</span>
                   <span class="col-lxn num" class:lex-no-web={p.norvig_freq === 0}>{fmtNorvig(p.norvig_freq)}</span>
-                  <span class="col-lxt">{fmtProposalTier(p.tier)}</span>
+                  <span class="col-lxt">
+                    {fmtProposalTier(p.tier)}
+                    {#if live}<span class="lex-live" title="Live in is_known — stop-flagging + correction anchor.">LIVE</span>{/if}
+                  </span>
                   <span class="col-lxo num">{p.occasions}</span>
                 </div>
               {/each}
@@ -2101,6 +2126,26 @@
   .casing-rescue-on  { color: #6ea76e; font-weight: 600; }
   .casing-rescue-off { color: #d2885d; font-weight: 600; }
   .casing-samples    { color: #7f8a96; }
+
+  /* C5b Phase 2 — LIVE indicator on confirmed proposals + star
+     marker on LOG records targeting learned words. */
+  .lex-live {
+    color: #6ea76e;
+    font-weight: 600;
+    font-size: 10px;
+    margin-left: 0.35rem;
+    letter-spacing: 0.5px;
+  }
+  .log-learned-marker {
+    color: #d2c87b;
+    font-weight: 600;
+    font-size: 10px;
+    margin-left: 0.35rem;
+  }
+  .log-learned-target {
+    border-left: 2px solid #c89a3d;
+    padding-left: calc(0.75rem - 2px);
+  }
 
   /* SLIPS section header annotation for the C5b L3-map kill-switch.
      Bright when live, dim/warning when off. */

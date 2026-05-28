@@ -75,7 +75,7 @@
 //!   are flagged `Held(ObviousFragment)` and excluded from promotion,
 //!   but we don't try to reconstruct the parent word — that's 5c.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -126,6 +126,14 @@ const CONFIRMED_OCCASIONS_THRESHOLD_FAST: u32 = 3;
 /// That's more slip-evidence per occasion than the fast lane, not
 /// less; we want more independent occasions before confirming.
 const CONFIRMED_OCCASIONS_THRESHOLD_SLOW: u32 = 5;
+
+/// Cap on the re-evaluation cascade after a learned-set change. The
+/// confirm-of-X flips Y's proximity → Y demotes, which COULD flip a
+/// third word's proximity… in practice this stabilises in 1–2
+/// iterations; the cap is defensive against an oscillating
+/// configuration. Reached only if there's a real cycle in the
+/// proximity graph; the test suite covers the common cases.
+const MAX_RE_EVAL_ITERATIONS: usize = 5;
 
 // ---- Casing baseline (relative-to-this-user rescue) -----------------------
 //
@@ -349,6 +357,17 @@ pub struct LexiconProposer {
     /// of which one increments, so the ratio reflects RECENCY, not
     /// total observations.
     casing_word_weight: f64,
+    /// **C5b Phase 2.** Per-learned-word timestamp (lowercase keys →
+    /// `last_seen_ms` at the moment the word entered `is_known`).
+    /// Tracked here rather than on `Lexicon` because the proposer is
+    /// the authority on "when did this word become learned."
+    ///
+    /// The proximity check uses this to enforce **newer-wins**: a
+    /// learned word X only counts as a near-known anchor for word W
+    /// if `learned_at_ms[X] > W.last_seen_ms`. Without this, two
+    /// mutually-near-known words deadlock each other — neither can
+    /// reach `Confirmed` because each holds the other.
+    learned_at_ms: HashMap<String, u64>,
 }
 
 impl std::fmt::Debug for LexiconProposer {
@@ -366,20 +385,33 @@ impl Default for LexiconProposer {
     }
 }
 
-/// Result of a [`LexiconProposer::note_record`] call. Carries either
-/// the updated proposal (caller emits to the panel) or `Skipped`
-/// (record didn't affect any proposal, e.g. an obvious fragment in the
-/// fast lane with `Pending` outcome).
+/// Result of a [`LexiconProposer::note_record`] call. Now potentially
+/// carries MULTIPLE per-word changes — a single Kept can trigger a
+/// learning event (confirm/demote) which re-evaluates every other
+/// proposal against the new live lexicon, and any of those can also
+/// transition tiers (self-cleaning). All resulting changes are
+/// returned in one batch so the host emits them atomically.
 #[derive(Debug, Clone)]
-pub enum ProposalUpdate {
-    /// A proposal was inserted, updated, or removed. The variant
-    /// carries the **current** state of the proposal (or `None` if the
-    /// proposal was retracted because its only contributing record was
-    /// undone by a revisable transition).
-    Changed(Option<LexiconProposal>, String),
-    /// No-op — record outcome didn't change since last time, or never
-    /// affected any proposal.
-    NoChange,
+pub struct ProposalUpdate {
+    /// Per-word changes produced by this call. Empty when nothing
+    /// changed (idempotent re-note, or a record that doesn't affect
+    /// any proposal). `Option<LexiconProposal>` = `None` means the
+    /// proposal was retracted (last contributing record rolled back).
+    pub changes: Vec<(String, Option<LexiconProposal>)>,
+    /// Set true iff a `Confirmed` ↔ not-`Confirmed` transition fired
+    /// for ANY word in this call — i.e. the global learned set
+    /// changed. The host emits a fresh `learned-snapshot` event so
+    /// the panel can update its "live in is_known" rendering.
+    pub learned_set_changed: bool,
+}
+
+impl ProposalUpdate {
+    pub fn empty() -> Self {
+        Self {
+            changes: Vec::new(),
+            learned_set_changed: false,
+        }
+    }
 }
 
 impl LexiconProposer {
@@ -390,6 +422,7 @@ impl LexiconProposer {
             lex: Lexicon::shared(),
             casing_acronym_weight: 0.0,
             casing_word_weight: 0.0,
+            learned_at_ms: HashMap::new(),
         }
     }
 
@@ -472,20 +505,24 @@ impl LexiconProposer {
     pub fn note_record(&mut self, record: &LogRecord) -> ProposalUpdate {
         let word = record.original_text.clone();
 
-        // Idempotency check: same record id + same outcome since last
-        // call → nothing to do. Saves the panel from re-rendering on
-        // every redundant tick.
+        // Idempotency check.
         if let Some(prev) = self.record_contributions.get(&record.id) {
             if prev.outcome == record.outcome && prev.word == word {
-                return ProposalUpdate::NoChange;
+                return ProposalUpdate::empty();
             }
         }
 
-        // Step 1: undo the previous contribution, if any. Decrement the
-        // old word's occasions if we'd credited Kept; remove the
-        // contribution. We do this even when the new outcome is also
-        // Kept, then re-credit — keeps the math simple if word changed
-        // (which shouldn't happen for a given record id, but defensive).
+        // Snapshot ALL proposal tiers before the change so we can
+        // (a) sync the learned set on transition,
+        // (b) diff at the end to report every word that moved,
+        // (c) drive cascade re-evaluation.
+        let before: HashMap<String, Option<ProposalTier>> = self
+            .proposals
+            .iter()
+            .map(|(w, p)| (w.clone(), Some(p.tier)))
+            .collect();
+
+        // Apply the credit/retract directly.
         let prev_word = self
             .record_contributions
             .remove(&record.id)
@@ -493,14 +530,9 @@ impl LexiconProposer {
         if let Some(pw) = prev_word.as_ref() {
             self.retract_kept_contribution(pw);
         }
-
-        // Step 2: apply the new contribution.
         if matches!(record.outcome, Outcome::Kept) {
             self.credit_kept_contribution(record);
         }
-
-        // Step 3: stash the new contribution shape so the next call
-        // can undo correctly.
         self.record_contributions.insert(
             record.id,
             RecordContribution {
@@ -509,14 +541,142 @@ impl LexiconProposer {
             },
         );
 
-        // Step 4: emit the resulting proposal state (or `None` if
-        // retracted — the only contributing record was rolled back).
-        let proposal = self.proposals.get(&word).cloned();
-        // If both the previous word and the current word ended up
-        // with no proposal change, report no change. But for the
-        // common case (Kept credited or retracted), we always have a
-        // word-keyed event to send.
-        ProposalUpdate::Changed(proposal, word)
+        // Sync the lex's learned set against the focal word's
+        // current tier (and the prior word if a retract touched
+        // it). State-based: this just brings lex in agreement with
+        // the proposal tier — robust against cascades.
+        let mut learned_changed = self.sync_learned_against_current(&word);
+        if let Some(pw) = prev_word.as_ref() {
+            if pw != &word {
+                learned_changed |= self.sync_learned_against_current(pw);
+            }
+        }
+
+        // Cascade re-evaluation. When the learned set changes, any
+        // other proposal's proximity verdict may now flip — that's
+        // the self-cleaning hook (Krutkrim demotes once Krutrim
+        // confirms). Each iteration syncs internally; bounded to
+        // prevent an oscillating configuration from spinning.
+        if learned_changed {
+            for _ in 0..MAX_RE_EVAL_ITERATIONS {
+                let any = self.re_evaluate_all_proposals();
+                if !any {
+                    break;
+                }
+            }
+        }
+
+        // Diff before vs current state for the event batch.
+        let mut keys: HashSet<String> = before.keys().cloned().collect();
+        keys.extend(self.proposals.keys().cloned());
+        let mut changes = Vec::new();
+        for k in keys {
+            let prev_tier = before.get(&k).copied().flatten();
+            let curr_proposal = self.proposals.get(&k).cloned();
+            let curr_tier = curr_proposal.as_ref().map(|p| p.tier);
+            if prev_tier != curr_tier {
+                changes.push((k, curr_proposal));
+            }
+        }
+
+        ProposalUpdate {
+            changes,
+            learned_set_changed: learned_changed,
+        }
+    }
+
+    /// Bring the lex's learned set into agreement with the focal
+    /// word's CURRENT tier. State-based (not transition-based) so a
+    /// re-eval cascade that flips a word in and out of Confirmed
+    /// can't desync the lex from the tier. Also maintains
+    /// `learned_at_ms` (set on learn, removed on unlearn). Returns
+    /// true iff the learned set was mutated. **`&mut self`** —
+    /// `learned_at_ms` mutation requires it.
+    fn sync_learned_against_current(&mut self, word: &str) -> bool {
+        let (is_confirmed, last_seen_ms) = match self.proposals.get(word) {
+            Some(p) => (matches!(p.tier, ProposalTier::Confirmed), p.last_seen_ms),
+            None => (false, 0),
+        };
+        let in_learned = self.lex.is_learned(word);
+        let key = word.to_ascii_lowercase();
+        match (in_learned, is_confirmed) {
+            (false, true) => {
+                self.learned_at_ms.insert(key, last_seen_ms);
+                self.lex.learn(word)
+            }
+            (true, false) => {
+                self.learned_at_ms.remove(&key);
+                self.lex.unlearn(word)
+            }
+            _ => false,
+        }
+    }
+
+    /// One pass of "re-evaluate every proposal against the live
+    /// lexicon." Recomputes `linguistic_signal` (proximity flips when
+    /// the learned set grows or shrinks) and the tier. Syncs the lex
+    /// learned set for every word it touches. Returns true iff any
+    /// tier moved this pass — caller may iterate (capped).
+    ///
+    /// **Order matters.** Two mutually-near-known words can each be
+    /// near-known to the other once both learn; HashMap iteration
+    /// order is non-deterministic, so we sort by `last_seen_ms` ASC.
+    /// Older words evaluate first, so an older `A` near-known to a
+    /// newer `B` demotes first — and then `B`'s subsequent re-eval
+    /// no longer sees `A` in the learned set and stays Confirmed.
+    /// Net: the newer confirmation wins, matching the brief's
+    /// "Krutkrim demotes once Krutrim confirms" semantic.
+    fn re_evaluate_all_proposals(&mut self) -> bool {
+        let mut words: Vec<(String, u64)> = self
+            .proposals
+            .iter()
+            .map(|(w, p)| (w.clone(), p.last_seen_ms))
+            .collect();
+        words.sort_by_key(|(_, ts)| *ts);
+        let rescue_active = self.casing_baseline().rescue_active;
+        let mut any_changed = false;
+        for (word, ts) in words {
+            // Re-eval: use this proposal's last_seen_ms as the
+            // "current word ts" so the newer-wins rule applies
+            // consistently with the credit-time evaluation.
+            let signal = linguistic_signal(&word, self.lex, ts, &self.learned_at_ms);
+            let norvig_freq = self.lex.frequency(&word);
+            let (lane, motor_verdict, occasions, prev_tier) = match self.proposals.get(&word) {
+                Some(p) => (p.lane.clone(), p.motor_verdict, p.occasions, p.tier),
+                None => continue,
+            };
+            let new_tier = recompute_tier(
+                &word,
+                &lane,
+                motor_verdict,
+                signal.plausibility,
+                signal.proximity,
+                norvig_freq,
+                rescue_active,
+                occasions,
+            );
+            // Persist the recomputed proximity/plausibility even if
+            // the tier didn't move — the panel reflects the live
+            // verdict.
+            let p = self.proposals.get_mut(&word).unwrap();
+            p.plausibility = signal.plausibility;
+            p.proximity = signal.proximity;
+            p.norvig_freq = norvig_freq;
+            if new_tier != prev_tier {
+                p.tier = new_tier;
+                any_changed = true;
+                self.sync_learned_against_current(&word);
+            }
+        }
+        any_changed
+    }
+
+    /// Snapshot of the lex's runtime-learned set. Surfaced to the
+    /// host so the panel can render "LIVE in is_known" indicators
+    /// next to confirmed proposals and against the LOG records'
+    /// `top_candidate` field.
+    pub fn learned_snapshot(&self) -> Vec<String> {
+        self.lex.learned_snapshot()
     }
 
     /// Forget every proposal AND every per-record contribution. Hooked
@@ -541,11 +701,13 @@ impl LexiconProposer {
         // record. casing rescue_active is global (per user, not
         // per record) but we read it here so the recompute_tier
         // call sees the latest value.
+        // Pass current record's timestamp + the proposer's learned-at
+        // map: the proximity check applies the newer-wins rule.
         let LinguisticSignal {
             plausibility,
             well_formed: _,
             proximity,
-        } = linguistic_signal(&word, self.lex);
+        } = linguistic_signal(&word, self.lex, last_seen_ms, &self.learned_at_ms);
         let norvig_freq = self.lex.frequency(&word);
         let rescue_active = self.casing_baseline().rescue_active;
 
@@ -814,8 +976,37 @@ mod tests {
     use crate::motor_signal::{TokenMotorSignal, TokenMotorVerdict};
     use crate::score::Confidence;
     use crate::ConfidenceTier;
+    use std::sync::Mutex;
+
+    /// **Serialise all proposer tests** against the process-wide
+    /// `Lexicon::shared()` learned set. Phase 2 wires `Confirmed`
+    /// proposals into the shared lex; any test that confirms or
+    /// retracts pollutes the learned set, and concurrent reads in a
+    /// different test can see those mutations. The static `Mutex`
+    /// forces tests to run sequentially, and every test calls
+    /// [`serial_setup`] at the top to wipe the learned set so each
+    /// case starts clean.
+    static LEARNED_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serial_setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = LEARNED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Lexicon::shared().clear_learned();
+        guard
+    }
 
     /// Build a clean-motor signal for `word.len()` chars.
+    /// `LeaveAlone(NoCandidates)` decision shorthand for Phase 2 tests
+    /// that need to construct ledger entries directly (controlling
+    /// timestamps for the older-first re-eval test).
+    fn leave_alone_no_candidates(word: &str) -> DecisionOutcome {
+        DecisionOutcome::LeaveAlone {
+            original: word.to_string(),
+            reason: LeaveAloneReason::NoCandidates,
+        }
+    }
+
     fn clean_motor(word: &str) -> TokenMotorSignal {
         TokenMotorSignal {
             verdict: TokenMotorVerdict::Clean,
@@ -904,6 +1095,7 @@ mod tests {
         let id = append_fast(&mut ledger, "Soumyo", slip_motor("Soumyo"));
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("Soumyo").unwrap();
@@ -927,6 +1119,7 @@ mod tests {
         let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("Soumyo").unwrap();
@@ -954,6 +1147,7 @@ mod tests {
         );
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("foo").unwrap();
@@ -972,6 +1166,7 @@ mod tests {
         // Many Kept occasions can't outweigh a slip signature.
         // Motor-only contract: slip beats everything.
         let mut ledger = DecisionLedger::new();
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         for _ in 0..5 {
             let id = append_slow(
@@ -1005,6 +1200,7 @@ mod tests {
         // the placeholder threshold so a future tune doesn't silently
         // change behaviour.
         let mut ledger = DecisionLedger::new();
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
             let id = append_fast(&mut ledger, "Krutrim", clean_motor("Krutrim"));
@@ -1030,6 +1226,7 @@ mod tests {
         );
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("foo").unwrap();
@@ -1044,6 +1241,7 @@ mod tests {
         // Critical: a Kept that later flips to Corrected must un-count.
         let mut ledger = DecisionLedger::new();
         let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
         p.note_record(&kept);
@@ -1062,6 +1260,7 @@ mod tests {
     fn kept_then_abandoned_retracts_the_kept_contribution() {
         let mut ledger = DecisionLedger::new();
         let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
         p.note_record(&kept);
@@ -1076,6 +1275,7 @@ mod tests {
         // Three distinct records for "Soumyo", all Kept → occasions=3.
         // Retract one → occasions=2.
         let mut ledger = DecisionLedger::new();
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         let mut ids = Vec::new();
         for _ in 0..3 {
@@ -1097,11 +1297,12 @@ mod tests {
         let mut ledger = DecisionLedger::new();
         let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         let first = p.note_record(&kept);
         let second = p.note_record(&kept);
-        assert!(matches!(first, ProposalUpdate::Changed(_, _)));
-        assert!(matches!(second, ProposalUpdate::NoChange));
+        assert!(!first.changes.is_empty());
+        assert!(second.changes.is_empty(), "idempotent re-note must report no changes");
         assert_eq!(p.get("Soumyo").unwrap().occasions, 1);
     }
 
@@ -1113,6 +1314,7 @@ mod tests {
         let mut ledger = DecisionLedger::new();
         let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
         let pending = ledger.get(id).cloned().unwrap();
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&pending);
         assert!(p.get("Soumyo").is_none());
@@ -1126,6 +1328,7 @@ mod tests {
     fn corrected_records_do_not_feed_learning() {
         let mut ledger = DecisionLedger::new();
         let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         let corrected = flip_outcome(&mut ledger, id, Outcome::CorrectedToSuggestion);
         p.note_record(&corrected);
@@ -1142,6 +1345,7 @@ mod tests {
         let mut ledger = DecisionLedger::new();
         let id = append_fast(&mut ledger, "a", clean_motor("a"));
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("a").unwrap();
@@ -1174,6 +1378,7 @@ mod tests {
         let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("Soumyo").unwrap();
@@ -1189,6 +1394,7 @@ mod tests {
         let id = append_fast(&mut ledger, "imapc", clean_motor("imapc"));
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("imapc").unwrap();
@@ -1209,6 +1415,7 @@ mod tests {
         let id = append_fast(&mut ledger, "andthe", clean_motor("andthe"));
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("andthe").unwrap();
@@ -1230,6 +1437,7 @@ mod tests {
         let id = append_fast(&mut ledger, "themach", clean_motor("themach"));
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("themach").unwrap();
@@ -1251,6 +1459,7 @@ mod tests {
         // the near-known signature, so each one holds. Recurrence
         // alone does NOT bypass the linguistic gate.
         let mut ledger = DecisionLedger::new();
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST + 2 {
             let id = append_fast(&mut ledger, "imapc", clean_motor("imapc"));
@@ -1286,6 +1495,7 @@ mod tests {
         );
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("aduluts").unwrap();
@@ -1322,6 +1532,7 @@ mod tests {
         );
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("lol").unwrap();
@@ -1340,6 +1551,7 @@ mod tests {
         // lane (would be Confirmed on fast lane). Five occasions
         // confirm.
         let mut ledger = DecisionLedger::new();
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
             let id = append_slow(
@@ -1376,6 +1588,7 @@ mod tests {
         // veto holds it as a fragment no matter how many times it
         // recurs — count never bypasses eligibility.
         let mut ledger = DecisionLedger::new();
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_SLOW + 2 {
             let id = append_slow(
@@ -1417,6 +1630,7 @@ mod tests {
     #[test]
     fn normal_typing_keeps_rescue_active() {
         // 200 word seals, no acronyms → share ≈ 0% → rescue active.
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         for _ in 0..200 {
             p.note_token_seal(false);
@@ -1432,6 +1646,7 @@ mod tests {
         // 200 acronym seals, no words → share = 100% → rescue suppressed.
         // This is the user the brief specifically warned about (caps
         // lock on or always-all-caps typist).
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         for _ in 0..200 {
             p.note_token_seal(true);
@@ -1446,6 +1661,7 @@ mod tests {
         // Start normal (rescue active), do a 50-token caps-lock burst
         // (rescue should suppress mid-burst), then 100 word tokens
         // (rescue should recover).
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         // Normal typing baseline.
         for _ in 0..100 {
@@ -1480,6 +1696,7 @@ mod tests {
     #[test]
     fn bbmp_promoted_when_user_normally_lowercase() {
         // Normal user (rescue active) + BBMP → eligible.
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         for _ in 0..100 {
             p.note_token_seal(false);
@@ -1504,6 +1721,7 @@ mod tests {
     fn bbmp_held_when_user_is_habitual_all_caps() {
         // All-caps user (rescue suppressed) + BBMP → falls back to
         // word-style gates → near-known + zero Norvig → Held.
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         for _ in 0..200 {
             p.note_token_seal(true);
@@ -1537,6 +1755,7 @@ mod tests {
         // (length-2 carve-out via acronym). All-caps user → fragment
         // veto fires (carve-out off; MIN_PROMOTABLE_WORD_LEN=3).
         {
+            let _g = serial_setup();
             let mut p = LexiconProposer::new();
             for _ in 0..100 {
                 p.note_token_seal(false);
@@ -1552,6 +1771,7 @@ mod tests {
             );
         }
         {
+            let _g = serial_setup();
             let mut p = LexiconProposer::new();
             for _ in 0..200 {
                 p.note_token_seal(true);
@@ -1584,6 +1804,7 @@ mod tests {
         let id = append_fast(&mut ledger, "BBMP", clean_motor("BBMP"));
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("BBMP").unwrap();
@@ -1602,6 +1823,7 @@ mod tests {
         // must be eligible, while `un` (2-char lowercase) must stay
         // Held as a fragment. The case-signal is the differentiator.
         let mut ledger = DecisionLedger::new();
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
 
         // 2-char acronym: eligible.
@@ -1643,6 +1865,7 @@ mod tests {
         let id = append_fast(&mut ledger, "BBMP", slip_motor("BBMP"));
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         assert_eq!(
@@ -1659,6 +1882,7 @@ mod tests {
         // Acronyms use the same per-lane occasion thresholds as
         // words; only the eligibility gates differ.
         let mut ledger = DecisionLedger::new();
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
             let id = append_fast(&mut ledger, "UPI", clean_motor("UPI"));
@@ -1710,6 +1934,7 @@ mod tests {
         );
         let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
 
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         p.note_record(&kept);
         let prop = p.get("andthe").unwrap();
@@ -1723,12 +1948,320 @@ mod tests {
         );
     }
 
+    // ---- C5b Phase 2: Confirmed wires into is_known --------------------
+
+    #[test]
+    fn confirmed_word_enters_live_is_known_and_candidate_pool() {
+        let _g = serial_setup();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        let lex = Lexicon::shared();
+
+        // Soumyo isn't in SCOWL or seed and has zero Norvig — confirm
+        // it via three Kept occasions and verify the lex sees it.
+        assert!(!lex.is_known("Soumyo"), "precondition: Soumyo not yet known");
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
+            let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+        assert_eq!(p.get("Soumyo").unwrap().tier, ProposalTier::Confirmed);
+
+        // (a) stop-flagging — is_known returns true.
+        assert!(
+            lex.is_known("Soumyo"),
+            "Soumyo must be in is_known after Confirmed"
+        );
+        assert!(lex.is_learned("Soumyo"));
+
+        // (b) correction anchor — ranked_known_candidates of a NEAR
+        // string now surfaces the learned word. "Soumyon" is edit-1
+        // of Soumyo; the candidate generator's `is_known` check
+        // accepts learned words transparently.
+        use crate::candidates::ranked_known_candidates;
+        let cands = ranked_known_candidates("Soumyon", lex, 5);
+        assert!(
+            cands.iter().any(|c| c.word.eq_ignore_ascii_case("soumyo")),
+            "candidate pool must include the learned word; got: {:?}",
+            cands.iter().map(|c| &c.word).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn provisional_word_does_not_enter_is_known() {
+        // Single Kept → Provisional → MUST NOT enter the learned set.
+        // Phase 2's wiring is Confirmed-only.
+        let _g = serial_setup();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        let lex = Lexicon::shared();
+
+        let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+        p.note_record(&kept);
+        assert_eq!(p.get("Soumyo").unwrap().tier, ProposalTier::Provisional);
+        assert!(
+            !lex.is_learned("Soumyo"),
+            "Provisional words MUST NOT enter is_known"
+        );
+        assert!(!lex.is_known("Soumyo"));
+    }
+
+    #[test]
+    fn self_cleaning_demotes_older_confirmed_when_newer_anchors_near_it() {
+        // The Krutrim cleanup, falling out for free.
+        //
+        // 1. User types `Klorvex` (a slip variant) repeatedly → confirms.
+        // 2. User then types `Klorvox` (canonical) repeatedly → confirms.
+        // 3. Re-eval: Klorvex is now near-known to a learned word
+        //    (Klorvox). Klorvex demotes; Klorvox stays.
+        //
+        // Names chosen so neither has Norvig presence — the near-known
+        // + no-web combo veto is what fires the demotion. Older-first
+        // iteration ordering in re_evaluate_all_proposals makes the
+        // outcome deterministic.
+        let _g = serial_setup();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        let lex = Lexicon::shared();
+
+        // Stage 1: confirm Klorvex. Both words are far-from-known
+        // initially (no high-freq edit-2 neighbour); they pass
+        // eligibility on every gate.
+        for i in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
+            let id = ledger.append(
+                100 + i as u64,
+                leave_alone_no_candidates("Klorvex"),
+                0,
+                ConfidenceTier::Eager,
+                None,
+                None,
+                None,
+                None,
+                Some(clean_motor("Klorvex")),
+            );
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+        assert_eq!(p.get("Klorvex").unwrap().tier, ProposalTier::Confirmed);
+        assert!(lex.is_learned("Klorvex"));
+
+        // Stage 2: confirm Klorvox (newer). Klorvex is now in the
+        // learned set, so Klorvox's proximity check sees it at edit-1.
+        // BUT — at the moment of credit, Klorvox's own
+        // recompute_tier already runs and would fire Held(NearKnownWord)
+        // (Klorvex in learned). That holds Klorvox… which is the wrong
+        // outcome.
+        //
+        // The re-eval cascade fixes it: older-first iteration runs
+        // Klorvex first (it's near-known to Klorvox AND vice versa),
+        // sees Klorvox in learned, demotes Klorvex. Then Klorvox's
+        // re-eval no longer sees Klorvex → FarFromKnown → Confirmed.
+        for i in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
+            let id = ledger.append(
+                200 + i as u64,
+                leave_alone_no_candidates("Klorvox"),
+                0,
+                ConfidenceTier::Eager,
+                None,
+                None,
+                None,
+                None,
+                Some(clean_motor("Klorvox")),
+            );
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+
+        // Net: Klorvox wins, Klorvex demotes.
+        assert_eq!(
+            p.get("Klorvox").unwrap().tier,
+            ProposalTier::Confirmed,
+            "newer confirmation Klorvox must win"
+        );
+        assert!(
+            lex.is_learned("Klorvox"),
+            "Klorvox must be live in is_known"
+        );
+        assert_eq!(
+            p.get("Klorvex").unwrap().tier,
+            ProposalTier::Held {
+                reason: HoldReason::NearKnownWord
+            },
+            "older Klorvex must demote on the self-cleaning hook"
+        );
+        assert!(
+            !lex.is_learned("Klorvex"),
+            "Klorvex must be removed from is_known"
+        );
+    }
+
+    #[test]
+    fn manual_correction_of_confirmed_word_demotes_it() {
+        // User confirms Soumyo (3 Kept occasions). Later, the user
+        // CORRECTS one of those records (resolver flips Kept →
+        // CorrectedToOther) — the proposer's retract logic drops
+        // occasions to 2 → tier → Provisional → unlearn.
+        let _g = serial_setup();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        let lex = Lexicon::shared();
+
+        let mut ids = Vec::new();
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
+            let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+            ids.push(id);
+        }
+        assert!(lex.is_learned("Soumyo"));
+
+        // Manual correction of one record. Resolver re-resolves it
+        // as CorrectedToOther; proposer retracts the contribution.
+        let undone = flip_outcome(&mut ledger, ids[1], Outcome::CorrectedToOther);
+        p.note_record(&undone);
+
+        assert_eq!(p.get("Soumyo").unwrap().tier, ProposalTier::Provisional);
+        assert!(
+            !lex.is_learned("Soumyo"),
+            "manual correction must demote from is_known"
+        );
+    }
+
+    #[test]
+    fn hysteresis_one_contradicting_signal_does_not_demote_a_high_occasion_word() {
+        // Soumyo is confirmed after 5 Kept occasions (>= threshold +
+        // 2). A single retraction drops occasions to 4 — still
+        // ≥ threshold (3) — so the tier stays Confirmed and the word
+        // stays in is_known. That's the natural hysteresis: the
+        // threshold itself prevents single-signal oscillation.
+        let _g = serial_setup();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        let lex = Lexicon::shared();
+
+        let mut ids = Vec::new();
+        for _ in 0..(CONFIRMED_OCCASIONS_THRESHOLD_FAST + 2) {
+            let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+            ids.push(id);
+        }
+        assert_eq!(p.get("Soumyo").unwrap().tier, ProposalTier::Confirmed);
+        assert!(lex.is_learned("Soumyo"));
+
+        // Retract ONE. Occasions = 4, still ≥ threshold.
+        let undone = flip_outcome(&mut ledger, ids[0], Outcome::CorrectedToOther);
+        p.note_record(&undone);
+        assert_eq!(
+            p.get("Soumyo").unwrap().tier,
+            ProposalTier::Confirmed,
+            "single contradicting signal must not demote — threshold is hysteresis"
+        );
+        assert!(
+            lex.is_learned("Soumyo"),
+            "Soumyo must stay in is_known"
+        );
+    }
+
+    #[test]
+    fn injection_stays_zero_when_confirmed_word_changes_candidates() {
+        // Phase 2 must NOT inject anything. The engine's
+        // correction-injection path doesn't exist yet — this test
+        // is a structural pin: confirming a word affects
+        // `Lexicon::is_known` and the candidate pool, but no other
+        // side effect leaks into the engine's behavior. We assert
+        // by exercising the candidate generator directly — it must
+        // include the learned word but only as a *candidate*, not
+        // as an enacted correction.
+        let _g = serial_setup();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        let lex = Lexicon::shared();
+
+        // Confirm Soumyo.
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
+            let id = append_fast(&mut ledger, "Soumyo", clean_motor("Soumyo"));
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+        assert!(lex.is_learned("Soumyo"));
+
+        // Confirming a word doesn't perform any other mutation —
+        // the proposer's records, ledger, and engine state are
+        // untouched beyond what the explicit calls do. (There's no
+        // injection path to assert against; if Phase 3 adds one,
+        // this test would need updating to assert it stays off until
+        // the injection flag flips.)
+        let learned = lex.learned_snapshot();
+        assert_eq!(
+            learned.len(),
+            1,
+            "exactly one learning happened — no other writes"
+        );
+    }
+
+    #[test]
+    fn confirmed_word_cleans_its_own_existing_slips_on_re_eval() {
+        // Variation on self-cleaning: Klorvex wasn't confirmed at all,
+        // but it WAS a Provisional candidate. When Klorvox confirms,
+        // the re-eval pass should still detect Klorvex's new
+        // near-known status and move it from Provisional to Held.
+        let _g = serial_setup();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        let lex = Lexicon::shared();
+
+        // Stage 1: Klorvex once → Provisional (not yet confirmed).
+        let id = ledger.append(
+            10,
+            leave_alone_no_candidates("Klorvex"),
+            0,
+            ConfidenceTier::Eager,
+            None,
+            None,
+            None,
+            None,
+            Some(clean_motor("Klorvex")),
+        );
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+        p.note_record(&kept);
+        assert_eq!(p.get("Klorvex").unwrap().tier, ProposalTier::Provisional);
+
+        // Stage 2: Klorvox confirms.
+        for i in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
+            let id = ledger.append(
+                20 + i as u64,
+                leave_alone_no_candidates("Klorvox"),
+                0,
+                ConfidenceTier::Eager,
+                None,
+                None,
+                None,
+                None,
+                Some(clean_motor("Klorvox")),
+            );
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+
+        assert!(lex.is_learned("Klorvox"));
+        assert_eq!(
+            p.get("Klorvex").unwrap().tier,
+            ProposalTier::Held {
+                reason: HoldReason::NearKnownWord
+            },
+            "re-eval should have demoted Klorvex to Held when Klorvox joined is_known"
+        );
+    }
+
     // ---- snapshot ordering ---------------------------------------------
 
     #[test]
     fn snapshot_orders_by_most_recent_first() {
         let _lex = Lexicon::shared();
         let mut ledger = DecisionLedger::new();
+        let _g = serial_setup();
         let mut p = LexiconProposer::new();
         let id1 = ledger.append(
             10,

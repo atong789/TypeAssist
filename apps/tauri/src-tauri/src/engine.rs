@@ -37,7 +37,7 @@ use behavioural_model::{BehaviouralModel, InputEvent};
 use correction_engine::{
     decide, has_motor_evidence, measure_token_motor, ranked_known_candidates, score_candidates,
     should_log, AnchorTracker, Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome,
-    Lexicon, LexiconProposer, OutcomeResolver, ProposalUpdate, ScoredCandidate, Token,
+    Lexicon, LexiconProposer, OutcomeResolver, ScoredCandidate, Token,
     TokenKind, Tokenizer, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
     SCORE_VERSION,
 };
@@ -100,6 +100,15 @@ pub const EVT_LEXICON_PROPOSAL: &str = "engine://lexicon-proposal";
 /// whether the all-caps brand-name rescue is currently active. The
 /// signal is global, not per-word.
 pub const EVT_CASING_BASELINE: &str = "engine://casing-baseline";
+/// **Component 5b Phase 2.** Fired whenever the runtime-learned
+/// lexicon changes — a confirmed proposal entered `is_known`, or a
+/// previously-confirmed word demoted out. Payload is the full
+/// learned-words snapshot. **ZERO INJECTION:** the engine's
+/// correction decisions read this through `Lexicon::is_known`, so
+/// would-correct counts can rise (Krutrim becomes a correction
+/// target), but no injection runs — this phase is the validation
+/// gate.
+pub const EVT_LEARNED_SNAPSHOT: &str = "engine://learned-snapshot";
 
 /// Top-N candidates the engine surfaces per unknown word. Keep small so the
 /// debug panel and any future spatial-scorer aren't paying for a long tail.
@@ -309,23 +318,28 @@ fn tick_resolver<R: Runtime>(
     }
 }
 
-/// Note a record into the proposer and broadcast the result if the
-/// proposal changed. Called from `tick_resolver` after each C5a
-/// transition AND from the initial Pending append (so the proposer
-/// has a contribution slot to credit on the subsequent transition).
+/// Note a record into the proposer and broadcast every per-word
+/// change in the batch. A single Kept can ripple: the focal word's
+/// tier transitions to Confirmed → enters `is_known` → the
+/// proposer's re-eval flips OTHER proposals' proximity verdicts
+/// (the self-cleaning hook), each of which may transition tier too.
+/// All changes ship as separate `engine://lexicon-proposal` events;
+/// a `learned-set-changed` flag drives a fresh
+/// `engine://learned-snapshot`.
 fn emit_proposal_change<R: Runtime>(
     app: &AppHandle<R>,
     proposer: &mut LexiconProposer,
     record: &correction_engine::LogRecord,
 ) {
-    match proposer.note_record(record) {
-        ProposalUpdate::Changed(proposal, word) => {
-            let _ = app.emit(
-                EVT_LEXICON_PROPOSAL,
-                LexiconProposalEvent { word, proposal },
-            );
-        }
-        ProposalUpdate::NoChange => {}
+    let update = proposer.note_record(record);
+    for (word, proposal) in update.changes {
+        let _ = app.emit(
+            EVT_LEXICON_PROPOSAL,
+            LexiconProposalEvent { word, proposal },
+        );
+    }
+    if update.learned_set_changed {
+        let _ = app.emit(EVT_LEARNED_SNAPSHOT, proposer.learned_snapshot());
     }
 }
 
