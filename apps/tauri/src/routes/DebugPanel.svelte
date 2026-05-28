@@ -278,6 +278,14 @@
     anchor_id: number;
     active_tier: ConfidenceTier;
     outcome: Outcome;
+    /// LOG_VERSION v5 — was this Kept record actually credited to
+    /// the lexicon proposer, or did "Pause learning" suppress it?
+    ///   * null         — Pending OR resolved to a non-Kept outcome.
+    ///   * true         — Kept while learning was active.
+    ///   * false        — Kept while learning was paused (panel greys
+    ///                    the row + tags it "paused" to make the
+    ///                    distinction visible).
+    credited: boolean | null;
     log_version: number;
   };
 
@@ -1318,11 +1326,13 @@
               </div>
               {#each logRows as r (r.id)}
                 {@const targetsLearned = r.top_candidate !== null && learnedSet.has(r.top_candidate.toLowerCase())}
+                {@const wasPaused = r.credited === false}
                 <div
                   class="log-row"
                   class:log-would={r.decision.kind === "would_correct"}
                   class:log-leave={r.decision.kind === "leave_alone"}
                   class:log-learned-target={targetsLearned}
+                  class:log-paused={wasPaused}
                 >
                   <span class="col-lo">{r.original_text}</span>
                   <span class="col-ld">
@@ -1334,7 +1344,10 @@
                     >{fmtLogConfidence(r.confidence)}</span
                   >
                   <span class="col-la num">#{r.anchor_id}</span>
-                  <span class="col-lx">{fmtOutcome(r.outcome)}</span>
+                  <span class="col-lx">
+                    {fmtOutcome(r.outcome)}
+                    {#if wasPaused}<span class="log-paused-tag" title="Kept, but learning was paused — this record was OBSERVED but did NOT contribute to the lexicon.">paused</span>{/if}
+                  </span>
                 </div>
               {/each}
               <!-- Tail anchor so the listener can scrollIntoView on append. -->
@@ -2347,6 +2360,26 @@
   .log-learned-target {
     border-left: 2px solid #c89a3d;
     padding-left: calc(0.75rem - 2px);
+  }
+  /* LOG_VERSION v5 — Kept records that landed while learning was
+     paused. The row text dims to make it visually obvious the
+     record was OBSERVED but did NOT contribute; a small inline tag
+     in the outcome column carries the explicit "paused" label so
+     the dim isn't ambiguous. */
+  .log-paused {
+    opacity: 0.55;
+  }
+  .log-paused-tag {
+    margin-left: 0.4rem;
+    padding: 0 0.3rem;
+    background: #3a2b22;
+    color: #d2885d;
+    border: 1px solid #5a3a2a;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
   }
 
   /* SLIPS section header annotation for the C5b L3-map kill-switch.

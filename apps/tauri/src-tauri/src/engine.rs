@@ -394,6 +394,18 @@ fn tick_resolver<R: Runtime>(
     let changes = resolver.tick(now_ms(), anchors.anchors(), line_buf, ledger);
     for (record_id, outcome) in changes {
         if ledger.resolve_outcome(record_id, outcome) {
+            // Write the `credited` slot BEFORE the emit so the panel
+            // sees the right value on the same event. Kept → reflects
+            // the proposer's pause state at note-time (which is also
+            // what note_record itself will read inside
+            // emit_proposal_change). Non-Kept → None, since those
+            // outcomes never contribute regardless of pause.
+            let credited = if matches!(outcome, correction_engine::Outcome::Kept) {
+                Some(!proposer.credit_paused())
+            } else {
+                None
+            };
+            ledger.set_credited(record_id, credited);
             if let Some(rec) = ledger.get(record_id).cloned() {
                 let _ = app.emit(EVT_LOG_RECORD_UPDATED, rec.clone());
                 emit_proposal_change(app, proposer, &rec);

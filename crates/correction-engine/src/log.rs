@@ -66,7 +66,15 @@ use crate::ConfidenceTier;
 /// computed from `line_dwells`. Every loggable record now carries a
 /// motor verdict; the proposer reads `token_motor.verdict` rather
 /// than `top_motor_evidence` to decide hold vs promote.
-pub const LOG_VERSION: u32 = 4;
+///
+/// v5 — Component 5b Phase 2 follow-up: `credited: Option<bool>` — at
+/// Kept-resolution time the engine writes `Some(true)` if the
+/// proposer credited the contribution or `Some(false)` if learning
+/// was paused. `None` while Pending or for non-Kept resolutions
+/// (those never contribute, regardless of pause). The panel uses
+/// this to grey out + tag rows that were observed but not learned
+/// from — the missing signal in the original pause UX.
+pub const LOG_VERSION: u32 = 5;
 
 /// **PLACEHOLDER capacity.** A few hundred records — enough to span a
 /// typical writing session without growing unbounded. Tune from real
@@ -211,6 +219,28 @@ pub struct LogRecord {
     /// Outcome slot. C4 always writes [`Outcome::Pending`]; C5 calls
     /// [`DecisionLedger::resolve_outcome`] to transition.
     pub outcome: Outcome,
+    /// **C5b Phase 2 follow-up.** Was the proposer's credit step
+    /// active when this record's outcome was resolved?
+    ///
+    ///   * `None` — record is still `Pending`, OR resolved to a
+    ///     non-Kept outcome (`CorrectedToSuggestion` / `CorrectedToOther`
+    ///     / `Abandoned`). Non-Kept outcomes don't feed learning
+    ///     regardless of pause; the bit is "not applicable" rather
+    ///     than "not credited."
+    ///   * `Some(true)`  — outcome was `Kept` and learning was
+    ///     active at resolution time. The contribution counted.
+    ///   * `Some(false)` — outcome was `Kept` BUT the proposer was
+    ///     paused, so `note_record` short-circuited and the
+    ///     contribution did NOT count. The record still appears on
+    ///     the LOG so the user can see what the engine observed; the
+    ///     panel greys it + tags it "paused" so the difference from
+    ///     a credited Kept is visible.
+    ///
+    /// Filled by the engine in [`DecisionLedger::set_credited`] at
+    /// the same site that calls [`crate::LexiconProposer::note_record`],
+    /// reading [`crate::LexiconProposer::credit_paused`] for the
+    /// state-at-note-time.
+    pub credited: Option<bool>,
     /// Shape version — bump [`LOG_VERSION`] alongside any change to
     /// [`LogRecord`] / [`Outcome`] / [`LogConfidence`].
     pub log_version: u32,
@@ -326,6 +356,9 @@ impl DecisionLedger {
             anchor_id,
             active_tier,
             outcome: Outcome::Pending,
+            // Pending → no contribution yet → no credited verdict.
+            // Filled in by `set_credited` at Kept-resolution time.
+            credited: None,
             log_version: LOG_VERSION,
         };
 
@@ -361,6 +394,27 @@ impl DecisionLedger {
     /// transitioning.
     pub fn get(&self, id: u64) -> Option<&LogRecord> {
         self.records.iter().find(|r| r.id == id)
+    }
+
+    /// Write the `credited` slot of record `id`. Called by the engine
+    /// at the same site that drives [`crate::LexiconProposer::note_record`],
+    /// using the proposer's `credit_paused` state to compute the bit:
+    ///
+    ///   * `Some(true)`  — outcome is `Kept` AND proposer was active.
+    ///   * `Some(false)` — outcome is `Kept` BUT proposer was paused.
+    ///   * `None`        — outcome is non-Kept (no contribution
+    ///                     possible) or record still Pending.
+    ///
+    /// Returns `true` iff the record was found. O(n) scan, same as
+    /// [`Self::resolve_outcome`].
+    pub fn set_credited(&mut self, id: u64, credited: Option<bool>) -> bool {
+        for r in self.records.iter_mut() {
+            if r.id == id {
+                r.credited = credited;
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -785,5 +839,49 @@ mod tests {
             &mut ledger, 0, "c", "cat", 0.6, 3, ConfidenceTier::Eager, Confidence::Medium,
         );
         assert!(!ledger.resolve_outcome(id0, Outcome::Kept));
+    }
+
+    // ---- credited slot (LOG_VERSION v5) --------------------------------
+
+    #[test]
+    fn append_initialises_credited_to_none() {
+        // Pending records have no credited verdict yet — set_credited is
+        // called at outcome-resolution time, not at append time.
+        let mut ledger = DecisionLedger::new();
+        let id = append_would_correct(
+            &mut ledger, 0, "teh", "the", 0.8, 1, ConfidenceTier::Eager, Confidence::Medium,
+        );
+        assert_eq!(ledger.get(id).unwrap().credited, None);
+    }
+
+    #[test]
+    fn set_credited_records_kept_with_pause_state() {
+        // The two halves of the user-visible bit:
+        //   * Some(true)  — Kept while learning was active → contribution counted.
+        //   * Some(false) — Kept while learning was paused → contribution skipped.
+        // Both shapes are valid; the panel uses them to grey out the
+        // paused row and keep the credited row normal.
+        let mut ledger = DecisionLedger::new();
+        let id_credited = append_would_correct(
+            &mut ledger, 0, "alpha", "alphax", 0.6, 1, ConfidenceTier::Eager, Confidence::Medium,
+        );
+        let id_paused = append_would_correct(
+            &mut ledger, 0, "beta", "betax", 0.6, 2, ConfidenceTier::Eager, Confidence::Medium,
+        );
+
+        assert!(ledger.set_credited(id_credited, Some(true)));
+        assert!(ledger.set_credited(id_paused, Some(false)));
+
+        assert_eq!(ledger.get(id_credited).unwrap().credited, Some(true));
+        assert_eq!(ledger.get(id_paused).unwrap().credited, Some(false));
+    }
+
+    #[test]
+    fn set_credited_returns_false_for_unknown_id() {
+        let mut ledger = DecisionLedger::new();
+        append_would_correct(
+            &mut ledger, 0, "teh", "the", 0.8, 1, ConfidenceTier::Eager, Confidence::Medium,
+        );
+        assert!(!ledger.set_credited(9_999, Some(true)));
     }
 }
