@@ -475,6 +475,7 @@ fn tick_resolver<R: Runtime>(
 ) {
     let changes = resolver.tick(now_ms(), anchors.anchors(), line_buf, ledger);
     for (record_id, outcome) in changes {
+        tracing::info!("RESOLVE_OUTCOME rid={} -> {:?}", record_id, outcome);
         if ledger.resolve_outcome(record_id, outcome) {
             // Write the `credited` slot BEFORE the emit so the panel
             // sees the right value on the same event. Kept → reflects
@@ -624,6 +625,7 @@ fn emit_sealed_token<R: Runtime>(
         // DECISION fires for every Word token (known included — its reason
         // is `known`). The FEED needs one row per word so the builder can
         // see why each token did or didn't fire.
+        tracing::info!("EMIT_DECISION tok_core={:?}", tok.core);
         let _ = app.emit(
             EVT_DECISION,
             DecisionPayload {
@@ -657,6 +659,7 @@ fn emit_sealed_token<R: Runtime>(
                     &[][..]
                 };
                 let token_motor = Some(measure_token_motor(span_dwells));
+                tracing::info!("LEDGER_APPEND anchor_id={} core={:?}", anchor_id, tok.core);
                 let new_id = ledger.append(
                     ts,
                     outcome,
@@ -1048,6 +1051,7 @@ pub fn spawn<R: Runtime>(
                             InputEvent::Key { .. } | InputEvent::Backspace { .. }
                         )
                     {
+                        tracing::info!("PAUSED-DROP kind={:?} input_paused={}", parsed, input_paused);
                         continue;
                     }
 
@@ -1190,6 +1194,7 @@ pub fn spawn<R: Runtime>(
                             tokenizer.reset_line();
                             let _ = app_handle.emit(EVT_LINE_RESET, ());
                             let replay: Vec<char> = line_buf.clone();
+                            tracing::info!("REPLAY-BACKSPACE input_paused={} tokens_to_replay={}", input_paused, replay.len());
                             for c in replay {
                                 if let Some(tok) = tokenizer.observe_char(c) {
                                     emit_sealed_token(
@@ -1386,6 +1391,7 @@ pub fn spawn<R: Runtime>(
                                                 tokenizer.reset_line();
                                                 let _ = app_handle.emit(EVT_LINE_RESET, ());
                                                 let replay: Vec<char> = line_buf.clone();
+                                                tracing::info!("REPLAY-MIDLINE input_paused={} tokens_to_replay={}", input_paused, replay.len());
                                                 for c in replay {
                                                     if let Some(tok) = tokenizer.observe_char(c) {
                                                         emit_sealed_token(
@@ -1598,11 +1604,25 @@ pub fn spawn<R: Runtime>(
                                 // in the loop. Ledger pendings are left
                                 // alone — they'd just linger without
                                 // anchors, same as any unmonitored gap.
+                                tracing::info!(
+                                    "PAUSE-ON-PRE line_buf.len={} line_dwells.len={} anchors.count={} caret={}",
+                                    line_buf.len(),
+                                    line_dwells.len(),
+                                    anchors.anchors().len(),
+                                    caret,
+                                );
                                 tokenizer.reset_line();
                                 line_buf.clear();
                                 line_dwells.clear();
                                 caret = 0;
                                 anchors.clear();
+                                tracing::info!(
+                                    "PAUSE-ON-POST line_buf.len={} line_dwells.len={} anchors.count={} caret={}",
+                                    line_buf.len(),
+                                    line_dwells.len(),
+                                    anchors.anchors().len(),
+                                    caret,
+                                );
                                 let _ = app_handle.emit(EVT_LINE_RESET, ());
                                 let snap = anchors.snapshot();
                                 let _ = app_handle.emit(
