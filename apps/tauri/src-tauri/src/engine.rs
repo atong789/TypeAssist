@@ -1302,6 +1302,34 @@ pub fn spawn<R: Runtime>(
                                 }
                                 // Anchor positions don't move on pure
                                 // navigation, so no snapshot emit needed.
+                            } else if modifiers.command || modifiers.control {
+                                // System shortcut (Cmd+X, Ctrl+X, Cmd+Shift+D,
+                                // etc.) — the key's character is the shortcut
+                                // letter, not text the user means to type.
+                                // Drop before the tokenizer / line_buf /
+                                // anchor path so it can't seal as a literal
+                                // character (the original bug: Cmd+Shift+D
+                                // toggling the panel produced `tok_core =
+                                // "dalpha"` because the "d" reached the
+                                // line buffer).
+                                //
+                                // Scope: line_buf / tokenizer / anchors only.
+                                // EVT_KEYSTROKE was already emitted upstream
+                                // so the FEED still reflects the press with
+                                // its modifier flags. The motor baseline
+                                // probe also ran upstream and continues to
+                                // observe the dwell — the press IS real
+                                // biomechanical data, just not text. Option
+                                // (Alt) is NOT filtered: on macOS,
+                                // Option+letter is a text-producing dead-key
+                                // sequence (Option+e then a → á). Shift and
+                                // Caps Lock are text modifiers and stay.
+                                tracing::info!(
+                                    "SHORTCUT-DROP key={:?} cmd={} ctrl={}",
+                                    key,
+                                    modifiers.command,
+                                    modifiers.control,
+                                );
                             } else {
                                 // Feed the tokenizer + drive the anchor tracker.
                                 // Component 1 (token) and Component 2 (anchor)
