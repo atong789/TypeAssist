@@ -557,24 +557,41 @@ fn emit_sealed_token<R: Runtime>(
     // if it produces a `WouldCorrect` arm for an acronym, nothing
     // injects; the panel just sees it.
     if matches!(tok.kind, TokenKind::Word | TokenKind::Acronym) {
-        // Resolve the anchor id BEFORE running the pipeline so a missing
-        // id (a real bug, not a normal outcome) shows up next to the
-        // decision in the log. Fresh registrations return Some(id);
-        // replays of the same span/core return None from try_register
-        // and we follow up with find_tracking_id.
-        let fresh_id = anchors.try_register(tok.start, tok.end, &tok.core);
-        let anchor_id = fresh_id
-            .or_else(|| anchors.find_tracking_id(tok.start, tok.end, &tok.core));
+        // Anchor registration is the dedupe signal. `try_register`
+        // returns `Some(id)` only on a FRESH seal — replays from the
+        // backspace and mid-line-insert rebuild loops re-walk the
+        // tokenizer over an unchanged `line_buf`, and `try_register`
+        // returns `None` for every token whose `(start, end, core)`
+        // tuple is already in the tracker.
+        //
+        // Everything below — casing baseline, LEXICON / CANDIDATES /
+        // DECISION emissions, ledger append, proposer note — fires
+        // ONCE per real seal. On replay we log and fall through to
+        // `EVT_TOKEN` (the panel's tokens-list refresh) at the bottom.
+        //
+        // Without this gate, every backspace re-appends a fresh
+        // `LogRecord` per unknown word in the line (each with a new
+        // monotonic record id pointing at the same anchor id), and
+        // each one triggers `proposer.note_record` which credits a
+        // fresh occasion via `credit_kept_contribution` — inflating
+        // the proposer's `occasions` count and poisoning the
+        // tier-promotion signal that C5b reads. Observed in the
+        // 2026-05-29 trace as N×LEDGER_APPEND + N×EMIT_DECISION
+        // bursts on every backspace, with the same N anchor ids
+        // repeating across three back-to-back backspace replays.
+        let Some(anchor_id) = anchors.try_register(tok.start, tok.end, &tok.core) else {
+            tracing::info!("REPLAY-SKIP-EMIT tok_core={:?}", tok.core);
+            let _ = app.emit(EVT_TOKEN, tok);
+            return;
+        };
 
         // C5b casing baseline. Count only fresh seals so backspace
         // replays don't double-count. Includes known-word seals — the
         // baseline reflects ALL of the user's real typing, which is
         // exactly the signal we need to decide if all-caps is rare
         // for them (rescue active) or routine (rescue suppressed).
-        if fresh_id.is_some() {
-            proposer.note_token_seal(matches!(tok.kind, TokenKind::Acronym));
-            let _ = app.emit(EVT_CASING_BASELINE, proposer.casing_baseline());
-        }
+        proposer.note_token_seal(matches!(tok.kind, TokenKind::Acronym));
+        let _ = app.emit(EVT_CASING_BASELINE, proposer.casing_baseline());
 
         let row = lexicon_row_for(&tok.core, lexicon);
         let known = row.known;
@@ -638,62 +655,45 @@ fn emit_sealed_token<R: Runtime>(
 
         // Component 4 — append to the decision ledger if the gates pass.
         // Two gates: (a) UNKNOWN-word filter via `should_log`; (b) motor
-        // evidence via per-char dwells in this token's span. The anchor
-        // id is required — if we couldn't resolve it (shouldn't happen
-        // for Word tokens that just registered), we skip the append
-        // rather than fabricate a link. The privacy guarantee is
-        // structural: no motor evidence → no ledger entry.
+        // evidence via per-char dwells in this token's span. The privacy
+        // guarantee is structural: no motor evidence → no ledger entry.
         let has_motor = has_motor_evidence(line_dwells, tok.start, tok.end);
         if should_log(&outcome, has_motor) {
-            if let Some(anchor_id) = anchor_id {
-                let ts = now_ms();
-                // C5b fix: candidate-INDEPENDENT motor signal computed
-                // from the dwell slice on the token's own keystrokes.
-                // Populated for every loggable record so the fast
-                // lane (no candidate) has a real motor verdict.
-                let span_dwells = if tok.end <= line_dwells.len() {
-                    &line_dwells[tok.start..tok.end]
-                } else {
-                    // Defensive — should be unreachable given C4's
-                    // motor-evidence gate above.
-                    &[][..]
-                };
-                let token_motor = Some(measure_token_motor(span_dwells));
-                tracing::info!("LEDGER_APPEND anchor_id={} core={:?}", anchor_id, tok.core);
-                let new_id = ledger.append(
-                    ts,
-                    outcome,
-                    anchor_id,
-                    ACTIVE_TIER,
-                    top_candidate_word,
-                    top_score_for_log,
-                    top_motor_for_log,
-                    top_confidence_for_log,
-                    token_motor,
-                );
-                // Emit the just-appended record. The ledger owns it and
-                // may evict later, but the panel keeps its own copy in
-                // its own bounded list.
-                if let Some(rec) = ledger.get(new_id).cloned() {
-                    let _ = app.emit(EVT_LOG_RECORD, rec.clone());
-                    // Seed the proposer with the Pending record so a
-                    // subsequent resolver transition has a contribution
-                    // slot to credit. Pending notes are no-credit but
-                    // they cache the per-record state.
-                    emit_proposal_change(app, proposer, &rec);
-                }
+            let ts = now_ms();
+            // C5b fix: candidate-INDEPENDENT motor signal computed
+            // from the dwell slice on the token's own keystrokes.
+            // Populated for every loggable record so the fast
+            // lane (no candidate) has a real motor verdict.
+            let span_dwells = if tok.end <= line_dwells.len() {
+                &line_dwells[tok.start..tok.end]
             } else {
-                // Decision passed the gates but the anchor id wasn't
-                // resolvable. Surface the bug rather than silently
-                // dropping the record; C5 needs the anchor link to
-                // attribute outcomes at all.
-                tracing::warn!(
-                    "C4 ledger skipped a loggable decision: anchor id unresolved \
-                     for word {:?} at [{}, {})",
-                    tok.core,
-                    tok.start,
-                    tok.end
-                );
+                // Defensive — should be unreachable given C4's
+                // motor-evidence gate above.
+                &[][..]
+            };
+            let token_motor = Some(measure_token_motor(span_dwells));
+            tracing::info!("LEDGER_APPEND anchor_id={} core={:?}", anchor_id, tok.core);
+            let new_id = ledger.append(
+                ts,
+                outcome,
+                anchor_id,
+                ACTIVE_TIER,
+                top_candidate_word,
+                top_score_for_log,
+                top_motor_for_log,
+                top_confidence_for_log,
+                token_motor,
+            );
+            // Emit the just-appended record. The ledger owns it and
+            // may evict later, but the panel keeps its own copy in
+            // its own bounded list.
+            if let Some(rec) = ledger.get(new_id).cloned() {
+                let _ = app.emit(EVT_LOG_RECORD, rec.clone());
+                // Seed the proposer with the Pending record so a
+                // subsequent resolver transition has a contribution
+                // slot to credit. Pending notes are no-credit but
+                // they cache the per-record state.
+                emit_proposal_change(app, proposer, &rec);
             }
         }
     }
