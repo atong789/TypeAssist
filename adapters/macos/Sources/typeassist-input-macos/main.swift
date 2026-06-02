@@ -56,4 +56,26 @@ bridge.emit(.heartbeat(
     tapEnabled: tap.isTapEnabled()
 ))
 
+// Phase 0 / M3 overlay feasibility probe (opt-in via TYPEASSIST_AX_PROBE=1).
+// Mirrors the throwaway spike (`adapters/macos/spike/ax_probe.swift`) but runs
+// inside the sidecar so it inherits the *working* Accessibility grant. Logs a
+// content-blind geometry line to stderr every interval; click into a text field
+// in each target app and watch the stderr stream. NSTimer/Timer silently fail
+// to re-fire in this binary (see the heartbeat note above) — CFRunLoopTimer is
+// the primitive that works.
+if ProcessInfo.processInfo.environment["TYPEASSIST_AX_PROBE"] == "1" {
+    FileHandle.standardError.write(Data("AXPROBE mode ON — content-blind geometry probe every 0.5s\n".utf8))
+    var lastProbeLine = ""
+    let probeTimer = CFRunLoopTimerCreateWithHandler(
+        kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 0.5, 0.5, 0, 0
+    ) { _ in
+        let line = Accessibility.probeFocusedGeometry()
+        if line != lastProbeLine {  // de-dupe: one line per capability change, like the spike
+            lastProbeLine = line
+            FileHandle.standardError.write(Data((line + "\n").utf8))
+        }
+    }
+    CFRunLoopAddTimer(CFRunLoopGetMain(), probeTimer, .commonModes)
+}
+
 RunLoop.current.run()

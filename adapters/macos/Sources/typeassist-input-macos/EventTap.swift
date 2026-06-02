@@ -53,6 +53,11 @@ final class EventTap {
             if !start() {
                 FileHandle.standardError.write(Data("CGEventTap restart failed\n".utf8))
             }
+        case .axProbe:
+            // Phase 0 / M3 feasibility — content-blind geometry probe of the
+            // focused element, reported on stderr (stdout is the JSON event
+            // contract). Runs through the sidecar's working AX grant.
+            FileHandle.standardError.write(Data((Accessibility.probeFocusedGeometry() + "\n").utf8))
         }
     }
 

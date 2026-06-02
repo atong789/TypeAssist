@@ -1242,10 +1242,19 @@ fn spawn_sidecar<R: Runtime>(
     ),
     Box<dyn std::error::Error>,
 > {
-    let cmd = app
+    let mut cmd = app
         .shell()
         .sidecar("typeassist-input-macos")?
         .env("TYPEASSIST_AX_PROMPT", "1");
+    // Phase 0 / M3 debug: propagate the AX-geometry probe flag to the
+    // sidecar so it runs the feasibility probe under the app's *working*
+    // Accessibility grant (a Terminal launch of the same binary hits
+    // kAXErrorCannotComplete (-25204) — the grant is attributed to the
+    // launch context, not the binary). Launch with `TYPEASSIST_AX_PROBE=1
+    // just dev` and watch the sidecar's stderr in the dev console.
+    if std::env::var("TYPEASSIST_AX_PROBE").as_deref() == Ok("1") {
+        cmd = cmd.env("TYPEASSIST_AX_PROBE", "1");
+    }
     Ok(cmd.spawn()?)
 }
 

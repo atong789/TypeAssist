@@ -36,6 +36,11 @@ enum OutboundCommand {
     /// (e.g. the tap port itself is in a bad state); the engine's
     /// "Restart capture" button drives this.
     case restartTap
+    /// Phase 0 / M3 debug: run one content-blind text-geometry probe of the
+    /// currently focused element and report the result on stderr. Rides the
+    /// same proven command path as `injectCorrection`, so it exercises AX
+    /// through the sidecar's working Accessibility grant.
+    case axProbe
 }
 
 /// Line-delimited JSON over stdout (events) and stdin (commands).
@@ -125,6 +130,8 @@ final class Bridge {
             return .shutdown
         case "restart_tap":
             return .restartTap
+        case "ax_probe":
+            return .axProbe
         default:
             return nil
         }
