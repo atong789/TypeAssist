@@ -40,8 +40,9 @@ use correction_engine::{
     decide, has_motor_evidence, measure_token_motor, ranked_known_candidates, score_candidates,
     should_log, AnchorTracker, Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome,
     Lexicon, LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver,
-    ScoredCandidate, StabilityReport, Token, TokenKind, Tokenizer, WordPatternStore, ACTIVE_TIER,
-    CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION, SCORE_VERSION,
+    PatternReadiness, ScoredCandidate, StabilityReport, Token, TokenKind, Tokenizer,
+    WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
+    SCORE_VERSION,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
@@ -904,6 +905,23 @@ fn tick_resolver<R: Runtime>(
                                     .recorded
                                 {
                                     funnel.word_patterns_observed += 1;
+                                    // Read-only (kill-switch OFF): log what this
+                                    // just-updated pattern WOULD be classified as,
+                                    // so the M3 decision is observable as evidence
+                                    // accrues (e.g. the flip to Tier1Ready when
+                                    // weight crosses the threshold). No injection.
+                                    let readiness = correction_engine::classify(
+                                        &rec.original_text,
+                                        c,
+                                        word_patterns,
+                                        Lexicon::shared(),
+                                    );
+                                    tracing::info!(
+                                        "KILL_SWITCH_CLASSIFY typed={:?} target={:?} -> {:?}",
+                                        rec.original_text,
+                                        c,
+                                        readiness
+                                    );
                                 } else {
                                     funnel.word_pattern_skipped += 1;
                                 }
@@ -1007,6 +1025,48 @@ fn flush_word_patterns(
             false
         }
     }
+}
+
+/// Read-only (kill-switch OFF): classify every learned pattern and log a
+/// summary, so the M3 decision is observable against real accumulating data
+/// BEFORE anything is ever injected. Counts by readiness and lists the
+/// patterns that WOULD act (Tier-1) or suggest (Tier-2), with their reason and
+/// decayed weight. Emitted alongside the 60s funnel dump. No injection — this
+/// only surfaces what the classifier *would* decide. No-op on an empty store.
+fn dump_classifications(store: &WordPatternStore) {
+    if store.is_empty() {
+        return;
+    }
+    let lexicon = Lexicon::shared();
+    let (mut tier1, mut tier2, mut silent) = (0u32, 0u32, 0u32);
+    let mut actionable: Vec<String> = Vec::new();
+    for snap in store.snapshots() {
+        match correction_engine::classify(&snap.typed, &snap.target, store, lexicon) {
+            PatternReadiness::Tier1Ready => {
+                tier1 += 1;
+                actionable.push(format!(
+                    "{}→{} TIER1 w={:.1}",
+                    snap.typed, snap.target, snap.weight
+                ));
+            }
+            PatternReadiness::Tier2Only { reason } => {
+                tier2 += 1;
+                actionable.push(format!(
+                    "{}→{} TIER2({:?}) w={:.1}",
+                    snap.typed, snap.target, reason, snap.weight
+                ));
+            }
+            PatternReadiness::Silent { .. } => silent += 1,
+        }
+    }
+    tracing::info!(
+        "KILL_SWITCH_DUMP patterns={} tier1={} tier2={} silent={} actionable={:?}",
+        store.len(),
+        tier1,
+        tier2,
+        silent,
+        actionable
+    );
 }
 
 /// Note a record into the proposer and broadcast every per-word
@@ -1952,6 +2012,7 @@ pub fn spawn<R: Runtime>(
                             if modifiers.command && modifiers.shift {
                                 if matches!(single_char, Some('f') | Some('F')) {
                                     funnel.dump();
+                                    dump_classifications(&word_patterns);
                                     funnel.reset(now_ms());
                                     continue;
                                 }
@@ -2449,6 +2510,8 @@ pub fn spawn<R: Runtime>(
                     // to the on-demand Cmd+Shift+F chord.
                     if watchdog_ticks % 60 == 0 {
                         funnel.dump();
+                        // Read-only kill-switch observability (no injection).
+                        dump_classifications(&word_patterns);
                     }
 
                     // C5c motor stability: periodic read-model emit so a
