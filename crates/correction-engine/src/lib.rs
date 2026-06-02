@@ -28,6 +28,7 @@ pub mod motor_signal;
 pub mod resolver;
 pub mod score;
 pub mod tokenizer;
+pub mod word_pattern;
 pub use anchor::{AnchorState, AnchorTracker, AnchorsSnapshot, SpanAnchor, VoidReason};
 pub use candidates::{ranked_known_candidates, KnownCandidate, CANDIDATES_VERSION};
 pub use decision::{
@@ -64,6 +65,11 @@ pub use score::{
     CONFIDENCE_HIGH_FLOOR, CONFIDENCE_LOW_FLOOR, CONFIDENCE_MEDIUM_FLOOR, SCORE_VERSION,
 };
 pub use tokenizer::{Token, TokenKind, Tokenizer, TOKENIZER_VERSION};
+pub use word_pattern::{
+    PatternObserveReport, PatternSnapshot, PatternStat, WordPatternStore, MAX_PATTERN_EDIT_DISTANCE,
+    MAX_PATTERN_LENGTH_DIFF, PATTERN_PERSIST_EVERY, TIER1_MIN_OBSERVATIONS, UNDO_BRAKE_STRIKES,
+    WORD_PATTERN_VERSION,
+};
 
 /// **Engine MODE.** Names how aggressive the user wants the engine to be.
 /// The mode gates whether a candidate's confidence is high enough to fire
