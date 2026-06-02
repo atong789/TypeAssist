@@ -18,6 +18,7 @@ pub mod anchor;
 pub mod candidates;
 pub mod decision;
 pub mod keyboard;
+pub mod kill_switch;
 pub mod lexicon;
 pub mod lexicon_proposal;
 pub mod linguistic;
@@ -34,6 +35,10 @@ pub use candidates::{ranked_known_candidates, KnownCandidate, CANDIDATES_VERSION
 pub use decision::{
     decide, mode_min_confidence, DecisionOutcome, LeaveAloneReason, ACTIVE_TIER, DECISION_VERSION,
     SEPARATION_MARGIN,
+};
+pub use kill_switch::{
+    classify, classify_pattern, PatternFacts, PatternReadiness, SilentReason, Tier2Reason,
+    COMMON_TARGET_MIN_FREQUENCY, KILL_SWITCH_VERSION, STALE_AFTER_MS,
 };
 pub use lexicon::{Lexicon, LEXICON_VERSION};
 pub use lexicon_proposal::{
