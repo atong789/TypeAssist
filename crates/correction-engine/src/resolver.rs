@@ -36,69 +36,88 @@
 //! tracks shifts independently of resize/void; C5a doesn't pay for
 //! that complexity. Revisit if real usage shows the workflow.
 //!
-//! ## Classification
+//! ## Verdict state machine — event + idle, never mid-edit
 //!
-//! Given the post-edit observation:
+//! Each Pending record waits for one of **four definitive triggers** in
+//! [`decide_verdict`]. The load-bearing principle: **never fire a verdict
+//! mid-edit.** If chars are landing in or near a token's region, the user
+//! is correcting — hold `Pending` until they seal a successor or go idle.
 //!
-//! | post-edit observation                          | Outcome                 |
-//! |------------------------------------------------|-------------------------|
-//! | `Resolved(empty)`                              | `Abandoned`             |
-//! | `Resolved(text) == record.original_text`        | `Kept`                  |
-//! | `Resolved(text) == record.top_candidate`        | `CorrectedToSuggestion` |
-//! | `Resolved(other non-empty word)`                | `CorrectedToOther`      |
-//! | `Incomplete(_)` (mid-edit truncation)           | no transition           |
+//! | trigger | condition | when it fires |
+//! |---|---|---|
+//! | `CorrectedToOther` / `CorrectedToSuggestion` | a successor token sealed at X's `start` with content ≠ `original_text` (≠/= `top_candidate`) | **immediately** — a seal is unambiguous, no idle wait |
+//! | `Kept` | X still `Tracking`, slice == `original_text`, caret not in/at X's span, region idle ≥ [`KEPT_IDLE_THRESHOLD_MS`] | on the tick (keystroke **or watchdog**) that crosses the idle bar |
+//! | `Abandoned` | X `Void`, no successor, caret moved away from X's `start`, region idle ≥ [`ABANDONED_IDLE_THRESHOLD_MS`] | on the tick that crosses the idle bar |
+//! | (none) | a successor hasn't sealed, the caret is working in X's region, or not enough idle has passed | stays `Pending` |
 //!
-//! `Incomplete` is the load-bearing addition for transpositions and
-//! similar shrink-then-retype corrections (e.g. `wordl → world`). The
-//! user's anchor shrinks via inside-deletes to a proper prefix of
-//! `original_text` while they prepare to retype past the truncation —
-//! during that window there's no successor yet, but the truncated
-//! prefix isn't a committed outcome either. Treating it as committed
-//! produced a premature `CorrectedToOther` that wouldn't recover when
-//! the eventual seal landed (ticks are keystroke-gated; a pause after
-//! the seal leaves the wrong classification in place). `Incomplete`
-//! keeps the record at its previous outcome until either a successor
-//! seals or the user reverts.
+//! This replaced a single content-stability *debounce* that conflated
+//! all four outcomes and, sampled only on keystrokes, produced three
+//! failure modes: a premature `Kept` at the leading edge of a backspace,
+//! a premature `Abandoned` mid-retype (empty span read as abandoned), and
+//! silent non-resolution when the user stopped (no tick to fire on).
+//! The split — **event-driven** corrections (fire on the seal) vs.
+//! **idle-driven** Kept/Abandoned (fire on a real pause, via a watchdog
+//! tick that runs even with no keystrokes) — addresses all three by
+//! construction.
 //!
-//! `CorrectedToSuggestion` is **independent of the decision arm** —
-//! the candidate is stored on every loggable record regardless of
-//! whether the mode chose to act on it. The `bullon → bullion` case
-//! under Cautious resolves to `CorrectedToSuggestion` because the
-//! candidate ("bullion") was in the score report, even though
-//! Cautious's `LeaveAlone(BelowActiveTier)` wouldn't have fired the
-//! correction.
+//! Idle is measured as `now − stable_since_ms`, where `stable_since_ms`
+//! resets whenever the per-record observation tuple
+//! `(state, post_edit, caret_at_trailing_edge)` changes — i.e. on any
+//! edit that touches X's content, state, or trailing-edge caret.
 //!
-//! Match is **case-sensitive exact** between content chars and
-//! `original_text` / `top_candidate`. C5a doesn't try to normalise case;
-//! the lexicon's case-insensitive lookups happen upstream when the
-//! candidate is generated. Refine in C5b if real usage shows we need it.
+//! Thresholds ([`KEPT_IDLE_THRESHOLD_MS`], [`ABANDONED_IDLE_THRESHOLD_MS`],
+//! [`ABANDONED_CARET_MARGIN`]) are **tunable** module constants — slow
+//! typists (e.g. stroke survivors) take longer pauses and may need them
+//! raised.
 //!
-//! ## Debounce + revisability
+//! `CorrectedToSuggestion` is **independent of the decision arm** — the
+//! candidate is stored on every loggable record regardless of whether the
+//! mode acted on it (the `bullon → bullion` case under Cautious resolves
+//! to `CorrectedToSuggestion` because "bullion" was in the score report).
+//! Match is **case-sensitive exact**; case normalisation is upstream.
 //!
-//! The resolver tracks the per-record observation tuple
-//! `(original_state, post_edit_text)`. Each tick that detects a change
-//! resets the per-anchor `stable_since_ms` timestamp; a record only
-//! resolves once [`DEFAULT_DEBOUNCE_MS`] elapses without further
-//! change. A resolved record re-resolves if the observation later
-//! changes — the resolver compares the newly computed outcome against
-//! the record's CURRENT outcome in the ledger and only emits a
-//! transition when they differ. Once the original anchor is retired
-//! (line reset → `anchors.clear()`), the record's resolver entry is
-//! GC'd on the next tick and the last resolution stands forever.
+//! ## Revisability + GC
+//!
+//! A resolved record re-resolves if a later trigger maps to a different
+//! outcome (Kept → CorrectedToOther when the user comes back and corrects);
+//! the resolver compares the computed outcome against the record's CURRENT
+//! ledger outcome and only emits on a difference. Once the original anchor
+//! is retired (line reset → `anchors.clear()`), the record's resolver
+//! entry is GC'd on the next tick and the last resolution stands.
 
 use std::collections::HashMap;
 
 use crate::anchor::{AnchorState, SpanAnchor};
-use crate::log::{DecisionLedger, Outcome};
+use crate::log::Outcome;
 
-/// Default debounce — short enough to feel live in the debug panel, long
-/// enough to swallow normal mid-word pauses (a typist hovering at ~3 cps
-/// has ~330 ms between keystrokes). Tune from real usage data.
-pub const DEFAULT_DEBOUNCE_MS: u64 = 600;
+/// Idle period (ms) of no edits in a token's region before an untouched,
+/// still-`Tracking` token resolves `Kept`. **Tunable.** Set to 5s to cover
+/// the stroke-survivor "I see the typo, let me think, OK I'll fix it"
+/// window — it must comfortably exceed a user's typical notice-pause so a
+/// deliberate correction-after-a-beat isn't locked as `Kept` first (which
+/// then revises to a correction and double-counts in the 5c motor map).
+/// Raising it reduces, but does not eliminate, that window.
+pub const KEPT_IDLE_THRESHOLD_MS: u64 = 5_000;
+
+/// Idle period (ms) after a token is wiped — caret moved away, no
+/// replacement sealed — before it resolves `Abandoned`. **Starting point —
+/// tunable.** Long, because a slow in-place retype must never be mistaken
+/// for walking away.
+pub const ABANDONED_IDLE_THRESHOLD_MS: u64 = 10_000;
+
+/// How close (in chars) the caret must stay to a wiped token's frozen
+/// `start` to count as "still working here" — holds off `Abandoned` while
+/// a replacement is being retyped in place. **Tunable.**
+pub const ABANDONED_CARET_MARGIN: usize = 8;
 
 /// Resolver version. Bump on any change to the resolution policy that
 /// downstream Components or the debug panel could observe.
-pub const RESOLVER_VERSION: u32 = 3;
+///
+/// v4 — verdict-emission rebuilt from a single content-stability debounce
+/// into an event + idle state machine (see module docs). Corrections fire
+/// on the successor seal; Kept/Abandoned fire on a real idle period via a
+/// watchdog-driven tick; nothing fires mid-edit.
+pub const RESOLVER_VERSION: u32 = 4;
 
 /// Output of [`compute_post_edit_text`]. Captures whether the user has
 /// reached a state the resolver can classify, or is **mid-edit** —
@@ -134,13 +153,23 @@ enum PostEdit {
 }
 
 /// What the resolver remembers about an anchor at last observation.
-/// Deliberately keyed on `(state, post_edit)` — position is NOT part
-/// of the stability tuple, so a pure shift (insert/delete elsewhere on
-/// the line) doesn't reset the debounce.
+/// Keyed on `(state, post_edit, caret_at_trailing_edge)`. A token's
+/// absolute *position* is still NOT in the tuple — a pure shift
+/// (insert/delete elsewhere on the line) doesn't reset the debounce —
+/// but whether the caret sits at the token's right edge IS, because that
+/// edge flipping is the leading signal of a seal-then-correct gesture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Observation {
     state: AnchorState,
     post_edit: PostEdit,
+    /// `caret == anchor.end` — the caret is parked at this token's
+    /// trailing boundary, so the next backspace eats into it. Deleting
+    /// the separator after a just-sealed word moves the caret here, which
+    /// changes the observation and resets the debounce — preventing the
+    /// resolver from locking a premature `Kept` at the instant the user
+    /// starts backspacing to correct. See the "Outcome resolver (5a) —
+    /// known limitations" note in CLAUDE.md.
+    caret_at_trailing_edge: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -150,18 +179,19 @@ struct Observed {
 }
 
 /// Per-anchor outcome resolver. Owns the per-anchor observation cache
-/// (last-seen state, when the current state was first observed) needed
-/// to apply the debounce. Stateless across runs — lives in process
-/// memory only, like the [`DecisionLedger`] it resolves into.
+/// (last-seen tuple + when it was first observed) used to measure region
+/// idle time. Stateless across runs — lives in process memory only, like
+/// the [`DecisionLedger`] it resolves into.
 #[derive(Debug)]
 pub struct OutcomeResolver {
     last_seen: HashMap<u32, Observed>,
-    debounce_ms: u64,
+    kept_idle_ms: u64,
+    abandoned_idle_ms: u64,
 }
 
 impl Default for OutcomeResolver {
     fn default() -> Self {
-        Self::with_debounce_ms(DEFAULT_DEBOUNCE_MS)
+        Self::with_thresholds(KEPT_IDLE_THRESHOLD_MS, ABANDONED_IDLE_THRESHOLD_MS)
     }
 }
 
@@ -170,15 +200,23 @@ impl OutcomeResolver {
         Self::default()
     }
 
-    pub fn with_debounce_ms(debounce_ms: u64) -> Self {
+    /// Construct with explicit idle thresholds. Production uses
+    /// [`Self::new`] (the module-constant defaults); tests and future
+    /// per-user tuning pass small/custom values.
+    pub fn with_thresholds(kept_idle_ms: u64, abandoned_idle_ms: u64) -> Self {
         Self {
             last_seen: HashMap::new(),
-            debounce_ms,
+            kept_idle_ms,
+            abandoned_idle_ms,
         }
     }
 
-    pub fn debounce_ms(&self) -> u64 {
-        self.debounce_ms
+    pub fn kept_idle_ms(&self) -> u64 {
+        self.kept_idle_ms
+    }
+
+    pub fn abandoned_idle_ms(&self) -> u64 {
+        self.abandoned_idle_ms
     }
 
     /// Test-only inspector: time at which the current observation for
@@ -204,32 +242,47 @@ impl OutcomeResolver {
     /// tracker (line reset) have their cache entries removed at the
     /// start of each tick. Records whose anchor is gone are left as
     /// they are; their last resolution stands per the C5a brief.
-    pub fn tick(
+    ///
+    /// `caret` is the host's current caret index in `line_buf`. It feeds
+    /// both the `caret_at_trailing_edge` observation (idle-clock reset) and
+    /// [`decide_verdict`]'s caret-region gating that holds `Kept` /
+    /// `Abandoned` while the user is working at the token.
+    ///
+    /// **Must be called on idle too, not only on keystrokes.** `Kept` and
+    /// `Abandoned` fire on elapsed idle, so the host drives this from its
+    /// periodic watchdog as well as from edit events — otherwise a verdict
+    /// that comes due while the user is paused would never fire.
+    pub fn tick<'a, R: ResolvableRecord + 'a>(
         &mut self,
         now_ms: u64,
         anchors: &[SpanAnchor],
         line_buf: &[char],
-        ledger: &DecisionLedger,
+        caret: usize,
+        records: impl IntoIterator<Item = &'a R>,
     ) -> Vec<(u64, Outcome)> {
         // GC: drop cache entries for anchors that are no longer tracked.
         // Cheap because the typical line carries a handful of anchors.
         let live: std::collections::HashSet<u32> = anchors.iter().map(|a| a.id).collect();
         self.last_seen.retain(|id, _| live.contains(id));
 
-        // Walk the ledger, compute per-record observation, refresh the
+        // Walk the records, compute per-record observation, refresh the
         // cache, and queue transitions for any record whose stable
-        // observation maps to a different outcome than what the ledger
-        // currently holds.
+        // observation maps to a different outcome than what it currently
+        // holds. Generic over [`ResolvableRecord`] so the same verdict
+        // machine drives BOTH the C5b decision ledger (unknown words, for
+        // the lexicon proposer) and the C5c motor ledger (every word).
         let mut changes = Vec::new();
-        for record in ledger.iter() {
-            let Some(original) = anchors.iter().find(|a| a.id == record.anchor_id) else {
+        for record in records {
+            let Some(original) = anchors.iter().find(|a| a.id == record.anchor_id()) else {
                 continue;
             };
 
-            let post_edit = compute_post_edit_text(record, original, anchors, line_buf);
+            let post_edit =
+                compute_post_edit_text(record.original_text(), original, anchors, line_buf);
             let obs = Observation {
                 state: original.state.clone(),
                 post_edit,
+                caret_at_trailing_edge: caret == original.end,
             };
 
             match self.last_seen.get_mut(&original.id) {
@@ -251,30 +304,50 @@ impl OutcomeResolver {
                 }
             }
 
+            // Region idle = time since the observation tuple last changed.
             // Saturating to guard against a non-monotonic `now_ms` (test
-            // fixtures, time skew). A negative delta would otherwise
-            // wrap into a huge u64 and short-circuit the debounce.
+            // fixtures, time skew) — a negative delta would wrap huge.
             let stable_since = self.last_seen[&original.id].stable_since_ms;
-            let elapsed = now_ms.saturating_sub(stable_since);
-            if elapsed < self.debounce_ms {
-                continue;
-            }
-            let Some(computed) = classify(
-                &obs.post_edit,
-                &record.original_text,
-                record.top_candidate.as_deref(),
+            let idle_ms = now_ms.saturating_sub(stable_since);
+
+            // The verdict state machine. Returns None to stay Pending
+            // (mid-edit, or not enough idle) — never fire mid-edit.
+            let Some(computed) = decide_verdict(
+                record.original_text(),
+                record.top_candidate(),
+                original,
+                anchors,
+                line_buf,
+                caret,
+                idle_ms,
+                self.kept_idle_ms,
+                self.abandoned_idle_ms,
             ) else {
-                // Mid-edit — record stays at its previous outcome until
-                // the user commits (or the observation resolves back to
-                // the original content for Kept).
                 continue;
             };
-            if record.outcome != computed {
-                changes.push((record.id, computed));
+            if record.current_outcome() != computed {
+                changes.push((record.record_id(), computed));
             }
         }
         changes
     }
+}
+
+/// A record the [`OutcomeResolver`] can resolve a verdict for. Implemented
+/// by both the C5b [`crate::log::LogRecord`] (decision ledger — unknown
+/// words, carries a candidate) and the C5c [`crate::motor_ledger::MotorRecord`]
+/// (motor ledger — every word, candidate-agnostic). The resolver only needs
+/// these five projections; everything else about a record is the consumer's
+/// business.
+pub trait ResolvableRecord {
+    fn record_id(&self) -> u64;
+    fn anchor_id(&self) -> u32;
+    fn original_text(&self) -> &str;
+    /// The engine's top candidate, if any. `Some` only for the decision
+    /// ledger (drives `CorrectedToSuggestion`); the motor ledger returns
+    /// `None` so every correction reads as a `CorrectedToOther` slip.
+    fn top_candidate(&self) -> Option<&str>;
+    fn current_outcome(&self) -> Outcome;
 }
 
 /// Compute the post-edit observation for this record.
@@ -298,14 +371,14 @@ impl OutcomeResolver {
 ///   5. Otherwise (`Void`, no successor at frozen `start`) →
 ///      `Resolved(empty)`, which classifies as `Abandoned`.
 fn compute_post_edit_text(
-    record: &crate::log::LogRecord,
+    original_text: &str,
     original: &SpanAnchor,
     anchors: &[SpanAnchor],
     line_buf: &[char],
 ) -> PostEdit {
     if matches!(original.state, AnchorState::Tracking) {
         let content = slice_chars(line_buf, original.start, original.end);
-        let orig_chars: Vec<char> = record.original_text.chars().collect();
+        let orig_chars: Vec<char> = original_text.chars().collect();
         if content == orig_chars {
             return PostEdit::Resolved(content);
         }
@@ -329,6 +402,28 @@ fn compute_post_edit_text(
     PostEdit::Resolved(
         find_successor(original.id, original.start, anchors, line_buf).unwrap_or_default(),
     )
+}
+
+/// The post-edit text the resolver would classify for `record`, as a
+/// `String` — the word the user's edits landed on.
+///
+/// Returns `None` when the record's anchor is no longer tracked, or when
+/// the edit is still mid-flight (an `Incomplete` truncation the resolver
+/// wouldn't classify yet). Component 5c (the motor map) calls this to
+/// recover the *corrected* word for a `CorrectedToOther` outcome without
+/// re-deriving the anchor / successor logic that lives here — the same
+/// computation [`OutcomeResolver::tick`] runs internally, just surfaced
+/// as text instead of being folded straight into an [`Outcome`].
+pub fn post_edit_text<R: ResolvableRecord>(
+    record: &R,
+    anchors: &[SpanAnchor],
+    line_buf: &[char],
+) -> Option<String> {
+    let original = anchors.iter().find(|a| a.id == record.anchor_id())?;
+    match compute_post_edit_text(record.original_text(), original, anchors, line_buf) {
+        PostEdit::Resolved(chars) => Some(chars.into_iter().collect()),
+        PostEdit::Incomplete(_) => None,
+    }
 }
 
 /// Slice-level proper-prefix check: `content` is strictly shorter than
@@ -369,26 +464,91 @@ fn slice_chars(line_buf: &[char], start: usize, end: usize) -> Vec<char> {
     }
 }
 
-/// Pure classifier. `None` ⇒ mid-edit, don't emit a transition.
-/// `Some(outcome)` ⇒ the committed outcome for the post-edit text.
-fn classify(post_edit: &PostEdit, original: &str, top_candidate: Option<&str>) -> Option<Outcome> {
-    let text = match post_edit {
-        PostEdit::Incomplete(_) => return None,
-        PostEdit::Resolved(t) => t,
-    };
-    if text.is_empty() {
-        return Some(Outcome::Abandoned);
-    }
+/// Map a **committed, non-empty** text to a corrected/kept outcome.
+/// `text == original` ⇒ `Kept` (a reseal of the same word); `== candidate`
+/// ⇒ `CorrectedToSuggestion`; otherwise `CorrectedToOther`. Never returns
+/// `Abandoned` (the empty/idle path) — the caller decides when a text is
+/// committed (a successor seal). Case-sensitive exact match.
+fn classify_resolved(text: &[char], original: &str, top_candidate: Option<&str>) -> Outcome {
     let now: String = text.iter().collect();
     if now == original {
-        return Some(Outcome::Kept);
+        return Outcome::Kept;
     }
     if let Some(cand) = top_candidate {
         if now == cand {
-            return Some(Outcome::CorrectedToSuggestion);
+            return Outcome::CorrectedToSuggestion;
         }
     }
-    Some(Outcome::CorrectedToOther)
+    Outcome::CorrectedToOther
+}
+
+/// Caret sits within — or at either boundary of — this anchor's span, so
+/// the user may be about to edit X. Inclusive of `end` so the
+/// trailing-edge (about-to-backspace) caret counts as "in region": the
+/// seal-then-correct guard that holds `Kept`.
+fn caret_in_region(caret: usize, anchor: &SpanAnchor) -> bool {
+    caret >= anchor.start && caret <= anchor.end
+}
+
+/// Caret is still within [`ABANDONED_CARET_MARGIN`] chars of a wiped
+/// token's frozen `start` — the user is likely retyping a replacement in
+/// place, so `Abandoned` is held off.
+fn caret_near(caret: usize, start: usize) -> bool {
+    caret.abs_diff(start) <= ABANDONED_CARET_MARGIN
+}
+
+/// The verdict state machine (Component 5a). Returns the outcome to emit,
+/// or `None` to stay `Pending`. See the module-level table. Core rule:
+/// **never fire mid-edit** — corrections fire only on a definitive
+/// successor seal; `Kept`/`Abandoned` only after a real idle period and
+/// only when the caret has left the token's working area.
+#[allow(clippy::too_many_arguments)]
+fn decide_verdict(
+    original_text: &str,
+    top_candidate: Option<&str>,
+    original: &SpanAnchor,
+    anchors: &[SpanAnchor],
+    line_buf: &[char],
+    caret: usize,
+    idle_ms: u64,
+    kept_idle_ms: u64,
+    abandoned_idle_ms: u64,
+) -> Option<Outcome> {
+    // 1. Definitive: a replacement token has sealed at X's start with
+    //    non-empty content. A seal is unambiguous — fire immediately,
+    //    no idle wait. (Identical content ⇒ reseal ⇒ Kept.)
+    if let Some(succ) = find_successor(original.id, original.start, anchors, line_buf) {
+        if !succ.is_empty() {
+            return Some(classify_resolved(&succ, original_text, top_candidate));
+        }
+    }
+
+    // 2. No successor — gate on anchor state, caret, and idle.
+    match original.state {
+        AnchorState::Tracking => {
+            let slice = slice_chars(line_buf, original.start, original.end);
+            let orig: Vec<char> = original_text.chars().collect();
+            if slice != orig {
+                // In-place edit with no seal yet → mid-edit, hold.
+                return None;
+            }
+            // X is intact. Hold while the caret is working in/at X;
+            // otherwise resolve Kept once the region has gone idle.
+            if caret_in_region(caret, original) {
+                return None;
+            }
+            (idle_ms >= kept_idle_ms).then_some(Outcome::Kept)
+        }
+        AnchorState::Void { .. } => {
+            // Wiped, nothing sealed in its place. Hold while the caret is
+            // still near the wipe site (an in-progress retype); otherwise
+            // resolve Abandoned once a long idle has passed.
+            if caret_near(caret, original.start) {
+                return None;
+            }
+            (idle_ms >= abandoned_idle_ms).then_some(Outcome::Abandoned)
+        }
+    }
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -396,8 +556,9 @@ fn classify(post_edit: &PostEdit, original: &str, top_candidate: Option<&str>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anchor::{AnchorTracker, VoidReason};
+    use crate::anchor::AnchorTracker;
     use crate::decision::{DecisionOutcome, LeaveAloneReason};
+    use crate::log::DecisionLedger;
     use crate::score::Confidence;
     use crate::ConfidenceTier;
 
@@ -452,13 +613,105 @@ mod tests {
         )
     }
 
-    // ---- Core outcomes --------------------------------------------------
+    // Idle thresholds for tests — small so mock timestamps can cross
+    // them. `FAR` parks the caret away from any test anchor (no region
+    // guard); the verdict then turns purely on the trigger under test.
+    const KEPT: u64 = 100;
+    const ABANDON: u64 = 300;
+    const FAR: usize = usize::MAX;
+
+    fn resolver() -> OutcomeResolver {
+        OutcomeResolver::with_thresholds(KEPT, ABANDON)
+    }
+
+    /// Tick shim — `anchors.anchors()` + arg order, once.
+    fn r_tick(
+        r: &mut OutcomeResolver,
+        now: u64,
+        anchors: &AnchorTracker,
+        line: &[char],
+        caret: usize,
+        ledger: &DecisionLedger,
+    ) -> Vec<(u64, Outcome)> {
+        r.tick(now, anchors.anchors(), line, caret, ledger.iter())
+    }
+
+    // ---- Event-driven corrections (fire on the successor seal) ----------
 
     #[test]
-    fn pending_resolves_to_kept_when_word_is_untouched() {
-        // Type "teh ", token seals, anchor [0,3) for "teh". User does
-        // not touch the word again. After the debounce elapses, the
-        // record resolves to Kept.
+    fn successor_seal_resolves_corrected_to_suggestion_immediately() {
+        // "bullon " sealed; user backspaces "on" and retypes "ion ",
+        // sealing "bullion" as a successor at [0,7). The seal is a
+        // definitive event — CorrectedToSuggestion fires on the very tick
+        // the successor is present, with NO idle wait.
+        let mut line: Vec<char> = "bullon ".chars().collect();
+        let mut anchors = AnchorTracker::new();
+        let aid = anchors.try_register(0, 6, "bullon").unwrap();
+        let mut ledger = DecisionLedger::new();
+        let rid = log_with_candidate(
+            &mut ledger,
+            leave_alone("bullon", LeaveAloneReason::BelowActiveTier),
+            aid,
+            Some("bullion"),
+            Some(0.47),
+        );
+
+        anchors.apply_delete(6, ' ');
+        line.remove(6);
+        anchors.apply_delete(5, 'n');
+        line.remove(5);
+        anchors.apply_delete(4, 'o');
+        line.remove(4);
+        for (p, c) in [(4, 'i'), (5, 'o'), (6, 'n'), (7, ' ')] {
+            anchors.apply_insert(p, c);
+            line.insert(p, c);
+        }
+        anchors.try_register(0, 7, "bullion").unwrap();
+
+        // Fires at the first tick after the seal — idle is 0 here.
+        let changes = r_tick(&mut resolver(), 0, &anchors, &line, FAR, &ledger);
+        assert_eq!(changes, vec![(rid, Outcome::CorrectedToSuggestion)]);
+    }
+
+    #[test]
+    fn successor_seal_resolves_corrected_to_other_immediately() {
+        // Full backspace + retype "hello ": void at [0,0), "hello" seals.
+        // ≠ original "bullon" and ≠ candidate "bullion" → CorrectedToOther,
+        // immediately on the seal tick.
+        let mut line: Vec<char> = "bullon ".chars().collect();
+        let mut anchors = AnchorTracker::new();
+        let aid = anchors.try_register(0, 6, "bullon").unwrap();
+        let mut ledger = DecisionLedger::new();
+        let rid = log_with_candidate(
+            &mut ledger,
+            leave_alone("bullon", LeaveAloneReason::BelowActiveTier),
+            aid,
+            Some("bullion"),
+            Some(0.47),
+        );
+
+        anchors.apply_delete(6, ' ');
+        line.remove(6);
+        for (p, c) in [(5, 'n'), (4, 'o'), (3, 'l'), (2, 'l'), (1, 'u'), (0, 'b')] {
+            anchors.apply_delete(p, c);
+            line.remove(p);
+        }
+        for (i, c) in "hello ".chars().enumerate() {
+            anchors.apply_insert(i, c);
+            line.insert(i, c);
+        }
+        anchors.try_register(0, 5, "hello").unwrap();
+
+        let changes = r_tick(&mut resolver(), 0, &anchors, &line, FAR, &ledger);
+        assert_eq!(changes, vec![(rid, Outcome::CorrectedToOther)]);
+    }
+
+    // ---- Kept — idle-gated, caret-region-guarded ------------------------
+
+    #[test]
+    fn untouched_word_resolves_kept_after_idle() {
+        // "teh " sealed, never touched, caret elsewhere. No verdict until
+        // the region has been idle ≥ KEPT; then Kept.
         let line: Vec<char> = "teh ".chars().collect();
         let mut anchors = AnchorTracker::new();
         let aid = anchors.try_register(0, 3, "teh").unwrap();
@@ -471,228 +724,53 @@ mod tests {
             Some(0.82),
         );
 
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        let changes = r.tick(0, anchors.anchors(), &line, &ledger);
-        assert!(changes.is_empty(), "no resolution before debounce");
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        let mut r = resolver();
+        assert!(r_tick(&mut r, 0, &anchors, &line, FAR, &ledger).is_empty());
+        assert!(
+            r_tick(&mut r, KEPT - 1, &anchors, &line, FAR, &ledger).is_empty(),
+            "no Kept before the idle threshold"
+        );
+        let changes = r_tick(&mut r, KEPT, &anchors, &line, FAR, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::Kept)]);
     }
 
     #[test]
-    fn mid_line_insert_resolves_to_corrected_to_suggestion() {
-        // "bullon" sealed at [0,6). User navigates back, inserts 'i'
-        // mid-word: apply_insert(4, 'i') lands inside [0,6), end+=1 →
-        // anchor grows to [0,7) and its content slice is now "bullion".
-        // The tokenizer rebuild seals "bullion" as a SEPARATE anchor at
-        // [0,7) (different original_core → no dedupe).
-        let mut line: Vec<char> = "bullon ".chars().collect();
+    fn kept_is_held_while_caret_is_in_the_word_region() {
+        // Same untouched word, but the caret is parked inside/at the span
+        // (the user is poised to edit it). Even far past the idle bar, no
+        // Kept fires — only once the caret leaves does Kept resolve.
+        let line: Vec<char> = "teh ".chars().collect();
         let mut anchors = AnchorTracker::new();
-        let aid = anchors.try_register(0, 6, "bullon").unwrap();
-        let mut ledger = DecisionLedger::new();
-        // Cautious tier with the candidate stored (LeaveAlone arm) —
-        // this is the failing real-world case the brief flagged.
-        let rid = log_with_candidate(
-            &mut ledger,
-            leave_alone("bullon", LeaveAloneReason::BelowActiveTier),
-            aid,
-            Some("bullion"),
-            Some(0.47),
-        );
-
-        anchors.apply_insert(4, 'i');
-        line.insert(4, 'i');
-        // Engine-side: the mid-line insert triggers a tokenizer replay
-        // that re-seals "bullion" as a new anchor. Model that here.
-        let _new_aid = anchors.try_register(0, 7, "bullion").unwrap();
-
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
-        assert_eq!(
-            changes,
-            vec![(rid, Outcome::CorrectedToSuggestion)],
-            "candidate-stored + successor-lookup must attribute ToSuggestion"
-        );
-    }
-
-    #[test]
-    fn partial_backspace_and_retype_resolves_to_corrected_to_suggestion() {
-        // "bullon " sealed, then user backspaces "on" (two inside
-        // deletes shrink the anchor to [0,4) content "bull"). Typing
-        // "ion " appends past the anchor's end (all "after-ignore" for
-        // the original anchor); the trailing space seals "bullion" as
-        // a new anchor at [0,7).
-        let mut line: Vec<char> = "bullon ".chars().collect();
-        let mut anchors = AnchorTracker::new();
-        let aid = anchors.try_register(0, 6, "bullon").unwrap();
+        let aid = anchors.try_register(0, 3, "teh").unwrap();
         let mut ledger = DecisionLedger::new();
         let rid = log_with_candidate(
             &mut ledger,
-            leave_alone("bullon", LeaveAloneReason::BelowActiveTier),
+            would_correct("teh", "the", 0.82),
             aid,
-            Some("bullion"),
-            Some(0.47),
+            Some("the"),
+            Some(0.82),
         );
 
-        // Backspace ' ', 'n', 'o'.
-        anchors.apply_delete(6, ' '); // after-ignore (no merge partner)
-        line.remove(6);
-        anchors.apply_delete(5, 'n'); // inside [0,6) → end=5
-        line.remove(5);
-        anchors.apply_delete(4, 'o'); // inside [0,5) → end=4
-        line.remove(4);
-        // Now line "bull", original anchor [0,4) Tracking content "bull".
-
-        // Type 'i','o','n',' '. Each insert lands at p >= anchor.end=4,
-        // i.e. the "after-ignore" branch — original anchor doesn't grow.
-        anchors.apply_insert(4, 'i');
-        line.insert(4, 'i');
-        anchors.apply_insert(5, 'o');
-        line.insert(5, 'o');
-        anchors.apply_insert(6, 'n');
-        line.insert(6, 'n');
-        anchors.apply_insert(7, ' ');
-        line.insert(7, ' ');
-
-        // Trailing space seals "bullion" as a NEW anchor at [0,7).
-        let _new_aid = anchors.try_register(0, 7, "bullion").unwrap();
-
-        let original = anchors.anchors().iter().find(|a| a.id == aid).unwrap();
-        assert_eq!(
-            (original.start, original.end),
-            (0, 4),
-            "original anchor stays at [0,4) — its end never grew back"
-        );
-
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
-        assert_eq!(
-            changes,
-            vec![(rid, Outcome::CorrectedToSuggestion)],
-            "successor at original.start=0 must find the new anchor's content 'bullion'"
-        );
-    }
-
-    #[test]
-    fn full_backspace_and_retype_resolves_to_corrected_to_other() {
-        // Type "bullon ", backspace everything, retype "hello ". Original
-        // anchor voids `Deleted` at [0,0); "hello" seals at [0,5). The
-        // resolver's successor lookup at frozen anchor.start=0 finds
-        // "hello" and classifies it as ToOther (hello ≠ original
-        // "bullon" and ≠ candidate "bullion").
-        let mut line: Vec<char> = "bullon ".chars().collect();
-        let mut anchors = AnchorTracker::new();
-        let aid = anchors.try_register(0, 6, "bullon").unwrap();
-        let mut ledger = DecisionLedger::new();
-        let rid = log_with_candidate(
-            &mut ledger,
-            leave_alone("bullon", LeaveAloneReason::BelowActiveTier),
-            aid,
-            Some("bullion"),
-            Some(0.47),
-        );
-
-        // Backspace ' ' (after-ignore) then 'n','o','l','l','u','b'
-        // (six inside-deletes, last one voids the anchor).
-        anchors.apply_delete(6, ' ');
-        line.remove(6);
-        for (p, c) in [(5, 'n'), (4, 'o'), (3, 'l'), (2, 'l'), (1, 'u'), (0, 'b')] {
-            anchors.apply_delete(p, c);
-            line.remove(p);
-        }
-        let original = anchors.anchors().iter().find(|a| a.id == aid).unwrap();
-        assert!(matches!(
-            original.state,
-            AnchorState::Void {
-                reason: VoidReason::Deleted
-            }
-        ));
-        assert_eq!(
-            (original.start, original.end),
-            (0, 0),
-            "void freezes the anchor's start at the position the word died — \
-             the resolver's reference point for successor lookup"
-        );
-
-        // Retype "hello ". Each insert at p<=0 would shift a Tracking
-        // anchor, but the original is Void and C2 leaves it frozen —
-        // exactly what the resolver needs to find the replacement.
-        for (i, c) in "hello ".chars().enumerate() {
-            anchors.apply_insert(i, c);
-            line.insert(i, c);
-        }
-        // Trailing space seals "hello" at [0,5) → new anchor B.
-        let _new_aid = anchors.try_register(0, 5, "hello").unwrap();
-
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
-        assert_eq!(
-            changes,
-            vec![(rid, Outcome::CorrectedToOther)],
-            "successor at frozen anchor.start=0 must find 'hello' across the void"
-        );
-    }
-
-    #[test]
-    fn delete_in_place_waits_for_move_on_then_resolves_abandoned() {
-        // Pins the keystroke-gated trigger semantics that surfaced in
-        // manual testing: emptying a span doesn't itself fire a
-        // resolution — the resolver only acts on subsequent ticks past
-        // the debounce window. "Delete in place" (no further tick) =
-        // record stays at its previous outcome (Pending here). "Move
-        // on" (a later tick) = Abandoned fires.
-        let mut line: Vec<char> = "bullon ".chars().collect();
-        let mut anchors = AnchorTracker::new();
-        let aid = anchors.try_register(0, 6, "bullon").unwrap();
-        let mut ledger = DecisionLedger::new();
-        let rid = log_with_candidate(
-            &mut ledger,
-            leave_alone("bullon", LeaveAloneReason::BelowActiveTier),
-            aid,
-            Some("bullion"),
-            Some(0.47),
-        );
-
-        // Backspace everything — the "delete in place" moment.
-        anchors.apply_delete(6, ' ');
-        line.remove(6);
-        for (p, c) in [(5, 'n'), (4, 'o'), (3, 'l'), (2, 'l'), (1, 'u'), (0, 'b')] {
-            anchors.apply_delete(p, c);
-            line.remove(p);
-        }
-        assert!(line.is_empty());
-
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        // First tick — the keystroke that completed the delete. Stamps
-        // the new observation; elapsed=0 → no transition. The record
-        // stays Pending: the user has emptied the span but not yet
-        // "moved on."
-        let changes = r.tick(0, anchors.anchors(), &line, &ledger);
+        let mut r = resolver();
+        // caret == end (3): the about-to-backspace trailing edge counts
+        // as "in region" — the seal-then-correct guard.
+        r_tick(&mut r, 0, &anchors, &line, 3, &ledger);
         assert!(
-            changes.is_empty(),
-            "delete-in-place must not resolve at the deletion tick — that's the wait-for-move-on contract"
+            r_tick(&mut r, 10 * KEPT, &anchors, &line, 3, &ledger).is_empty(),
+            "caret at the trailing edge must hold Kept indefinitely"
         );
-        assert_eq!(ledger.get(rid).unwrap().outcome, Outcome::Pending);
-
-        // Still inside the debounce window — no move-on yet.
-        let changes = r.tick(50, anchors.anchors(), &line, &ledger);
-        assert!(changes.is_empty());
-        assert_eq!(ledger.get(rid).unwrap().outcome, Outcome::Pending);
-
-        // Move-on: a later tick past the debounce window. Models any
-        // subsequent keystroke (typing somewhere else, hitting return,
-        // anything that wakes the resolver). Abandoned fires.
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
-        assert_eq!(changes, vec![(rid, Outcome::Abandoned)]);
+        // Caret leaves → Kept resolves after a fresh idle period.
+        r_tick(&mut r, 10 * KEPT, &anchors, &line, FAR, &ledger);
+        let changes = r_tick(&mut r, 11 * KEPT, &anchors, &line, FAR, &ledger);
+        assert_eq!(changes, vec![(rid, Outcome::Kept)]);
     }
 
+    // ---- Abandoned — idle + caret-distance-gated ------------------------
+
     #[test]
-    fn whole_word_deleted_with_empty_line_resolves_to_abandoned() {
-        // Same as the full-backspace setup but with no retype — line is
-        // empty after the deletes. Successor lookup finds nothing →
-        // Abandoned.
+    fn wiped_word_resolves_abandoned_after_idle_when_caret_away() {
+        // "bullon " fully deleted, line empty, caret moved away. After a
+        // long idle with no successor, Abandoned.
         let mut line: Vec<char> = "bullon ".chars().collect();
         let mut anchors = AnchorTracker::new();
         let aid = anchors.try_register(0, 6, "bullon").unwrap();
@@ -713,88 +791,57 @@ mod tests {
         }
         assert!(line.is_empty());
 
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        let mut r = resolver();
+        assert!(r_tick(&mut r, 0, &anchors, &line, FAR, &ledger).is_empty());
+        assert!(
+            r_tick(&mut r, ABANDON - 1, &anchors, &line, FAR, &ledger).is_empty(),
+            "no Abandoned before the idle threshold"
+        );
+        let changes = r_tick(&mut r, ABANDON, &anchors, &line, FAR, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::Abandoned)]);
     }
 
-    // ---- Mid-edit incomplete state (wordl → world fix) -----------------
-
     #[test]
-    fn wordl_to_world_via_transposition_resolves_to_corrected_to_suggestion() {
-        // The reported real-world failure. User types "wordl ", record
-        // logged with top_candidate="world" (LeaveAlone(BelowActiveTier)
-        // under Cautious). Then corrects the transposition by
-        // backspacing 'l' and 'd' (anchor shrinks via inside-deletes
-        // to [0,3) "wor") and retyping 'l', 'd', ' ' (each insert is
-        // "after-ignore" so the original anchor stays at [0,3); the
-        // trailing space seals "world" as a separate anchor B at
-        // [0,5)). The successor lookup at A.start=0 must find B and
-        // classify CorrectedToSuggestion.
-        let mut line: Vec<char> = "wordl ".chars().collect();
+    fn abandoned_is_held_while_caret_is_near_the_wipe_site() {
+        // Same wipe, but the caret stays at the deletion site (an
+        // in-progress in-place retype). Even far past the idle bar, no
+        // Abandoned — the caret-near guard holds it Pending.
+        let mut line: Vec<char> = "bullon ".chars().collect();
         let mut anchors = AnchorTracker::new();
-        let aid = anchors.try_register(0, 5, "wordl").unwrap();
+        let aid = anchors.try_register(0, 6, "bullon").unwrap();
         let mut ledger = DecisionLedger::new();
         let rid = log_with_candidate(
             &mut ledger,
-            leave_alone("wordl", LeaveAloneReason::BelowActiveTier),
+            leave_alone("bullon", LeaveAloneReason::BelowActiveTier),
             aid,
-            Some("world"),
-            Some(0.50),
+            Some("bullion"),
+            Some(0.47),
         );
 
-        // Backspace ' ' (after-ignore), 'l' (inside), 'd' (inside).
-        anchors.apply_delete(5, ' ');
-        line.remove(5);
-        anchors.apply_delete(4, 'l');
-        line.remove(4);
-        anchors.apply_delete(3, 'd');
-        line.remove(3);
-        let original = anchors.anchors().iter().find(|a| a.id == aid).unwrap();
-        assert_eq!(
-            (original.start, original.end),
-            (0, 3),
-            "anchor shrinks to [0,3) 'wor'"
+        anchors.apply_delete(6, ' ');
+        line.remove(6);
+        for (p, c) in [(5, 'n'), (4, 'o'), (3, 'l'), (2, 'l'), (1, 'u'), (0, 'b')] {
+            anchors.apply_delete(p, c);
+            line.remove(p);
+        }
+
+        let mut r = resolver();
+        r_tick(&mut r, 0, &anchors, &line, 0, &ledger);
+        assert!(
+            r_tick(&mut r, 100 * ABANDON, &anchors, &line, 0, &ledger).is_empty(),
+            "caret at the wipe site must hold Abandoned indefinitely"
         );
-
-        // Type 'l', 'd', ' '. Each insert is "after-ignore" for A — A
-        // stays [0,3); the trailing space seals "world" as a new anchor.
-        anchors.apply_insert(3, 'l');
-        line.insert(3, 'l');
-        anchors.apply_insert(4, 'd');
-        line.insert(4, 'd');
-        anchors.apply_insert(5, ' ');
-        line.insert(5, ' ');
-        let new_aid = anchors.try_register(0, 5, "world").unwrap();
-        assert_ne!(new_aid, aid, "new anchor for 'world' is a separate id");
-
-        // Confirm the engine-observable state matches the panel
-        // description: TWO Tracking anchors at start=0.
-        let at_start_0: Vec<&SpanAnchor> = anchors
-            .anchors()
-            .iter()
-            .filter(|a| matches!(a.state, AnchorState::Tracking) && a.start == 0)
-            .collect();
-        assert_eq!(at_start_0.len(), 2);
-
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
-        assert_eq!(
-            changes,
-            vec![(rid, Outcome::CorrectedToSuggestion)],
-            "successor lookup must pick B (largest end at start=0) and \
-             classify against the stored candidate"
-        );
+        assert_eq!(ledger.get(rid).unwrap().outcome, Outcome::Pending);
     }
 
+    // ---- Mid-edit holds Pending (no verdict mid-edit) -------------------
+
     #[test]
-    fn truncated_mid_edit_does_not_prematurely_resolve_to_other() {
-        // The pause-during-correction case from the wordl trace: user
-        // shrinks the anchor to a proper prefix, pauses past debounce,
-        // and never commits. The resolver must NOT fire ToOther on the
-        // truncated stub — record stays at its previous outcome.
+    fn truncation_holds_pending_even_past_idle() {
+        // Kept word, then the user shrinks it to a proper prefix ("wor")
+        // and pauses. Tracking with a changed slice and no successor =
+        // mid-edit: the resolver must NOT fire any verdict, even far past
+        // the idle bar. The record stays at its prior outcome (Kept).
         let mut line: Vec<char> = "wordl ".chars().collect();
         let mut anchors = AnchorTracker::new();
         let aid = anchors.try_register(0, 5, "wordl").unwrap();
@@ -807,14 +854,14 @@ mod tests {
             Some(0.50),
         );
 
-        let mut r = OutcomeResolver::with_debounce_ms(100);
+        let mut r = resolver();
         // Phase 1: resolve Kept on the untouched word.
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        r_tick(&mut r, 0, &anchors, &line, FAR, &ledger);
+        let changes = r_tick(&mut r, KEPT, &anchors, &line, FAR, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::Kept)]);
         assert!(ledger.resolve_outcome(rid, Outcome::Kept));
 
-        // Phase 2: backspace ' ', 'l', 'd' — anchor truncates to "wor".
+        // Phase 2: backspace ' ', 'l', 'd' → anchor truncates to "wor".
         anchors.apply_delete(5, ' ');
         line.remove(5);
         anchors.apply_delete(4, 'l');
@@ -822,23 +869,20 @@ mod tests {
         anchors.apply_delete(3, 'd');
         line.remove(3);
 
-        // Pause past debounce — observation is Incomplete("wor"), so
-        // no transition fires. Record stays Kept (its prior outcome).
-        r.tick(200, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(500, anchors.anchors(), &line, &ledger);
+        r_tick(&mut r, 200, &anchors, &line, FAR, &ledger);
+        let changes = r_tick(&mut r, 200 + 100 * KEPT, &anchors, &line, FAR, &ledger);
         assert!(
             changes.is_empty(),
-            "Incomplete mid-edit must not flip Kept → ToOther"
+            "truncated mid-edit must not flip Kept → anything"
         );
         assert_eq!(ledger.get(rid).unwrap().outcome, Outcome::Kept);
     }
 
     #[test]
-    fn truncated_mid_edit_resolves_when_successor_seals() {
-        // Continuation of the previous case: after the truncation, the
-        // user retypes and seals a successor. Past the next debounce
-        // the resolver fires the correct transition (Kept → ToSuggestion
-        // here).
+    fn truncation_then_seal_resolves_to_corrected_to_suggestion() {
+        // Continuation: after truncating to "wor", the user retypes and
+        // seals "world". The seal is the definitive event → Kept revises
+        // to CorrectedToSuggestion immediately, no idle wait.
         let mut line: Vec<char> = "wordl ".chars().collect();
         let mut anchors = AnchorTracker::new();
         let aid = anchors.try_register(0, 5, "wordl").unwrap();
@@ -851,22 +895,19 @@ mod tests {
             Some(0.50),
         );
 
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
-        assert_eq!(changes, vec![(rid, Outcome::Kept)]);
+        let mut r = resolver();
+        r_tick(&mut r, 0, &anchors, &line, FAR, &ledger);
         assert!(ledger.resolve_outcome(rid, Outcome::Kept));
 
-        // Truncate to "wor" — Incomplete observation, no transition.
+        // Truncate to "wor" — mid-edit, no transition.
         anchors.apply_delete(5, ' ');
         line.remove(5);
         anchors.apply_delete(4, 'l');
         line.remove(4);
         anchors.apply_delete(3, 'd');
         line.remove(3);
-        r.tick(200, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(400, anchors.anchors(), &line, &ledger);
-        assert!(changes.is_empty(), "Incomplete should hold the resolution");
+        let changes = r_tick(&mut r, 200, &anchors, &line, 3, &ledger);
+        assert!(changes.is_empty(), "mid-edit holds");
 
         // Commit: type 'l', 'd', ' ' — trailing space seals "world".
         anchors.apply_insert(3, 'l');
@@ -877,27 +918,17 @@ mod tests {
         line.insert(5, ' ');
         anchors.try_register(0, 5, "world").unwrap();
 
-        // First tick after the seal — observation changed from
-        // Incomplete("wor") to Resolved("world") via successor lookup.
-        // stable_since resets to this tick.
-        r.tick(500, anchors.anchors(), &line, &ledger);
-        // Past the post-commit debounce: flip Kept → ToSuggestion.
-        let changes = r.tick(650, anchors.anchors(), &line, &ledger);
+        // Fires on the seal tick — no debounce.
+        let changes = r_tick(&mut r, 260, &anchors, &line, 5, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::CorrectedToSuggestion)]);
     }
 
-    // ---- Revisable transitions (Component 5a's "latest write wins") ----
-    //
-    // These pin the two transitions that scrambled in manual debug-panel
-    // testing (likely premature debounce firing during slow editing).
-    // Each test resolves once, applies the next phase of edits, and
-    // asserts the SECOND transition fires — which is the contract.
+    // ---- Revisable transitions (latest write wins) ----------------------
 
     #[test]
     fn revisable_kept_then_full_delete_re_resolves_to_abandoned() {
-        // Phase 1: type "bullon ", record resolves Kept after debounce.
-        // Phase 2: backspace everything, anchor voids Deleted, record
-        // re-resolves Kept → Abandoned.
+        // Phase 1: "bullon " resolves Kept (idle). Phase 2: backspace
+        // everything, caret moves away, long idle → revises to Abandoned.
         let mut line: Vec<char> = "bullon ".chars().collect();
         let mut anchors = AnchorTracker::new();
         let aid = anchors.try_register(0, 6, "bullon").unwrap();
@@ -910,45 +941,31 @@ mod tests {
             Some(0.47),
         );
 
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        // Phase 1 — resolve Kept on untouched word.
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        let mut r = resolver();
+        r_tick(&mut r, 0, &anchors, &line, FAR, &ledger);
+        let changes = r_tick(&mut r, KEPT, &anchors, &line, FAR, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::Kept)], "phase 1: Kept");
         assert!(ledger.resolve_outcome(rid, Outcome::Kept));
 
-        // Phase 2 — full backspace through ' ' (after-ignore) and the
-        // six letters (six inside-deletes, the last voids).
         anchors.apply_delete(6, ' ');
         line.remove(6);
         for (p, c) in [(5, 'n'), (4, 'o'), (3, 'l'), (2, 'l'), (1, 'u'), (0, 'b')] {
             anchors.apply_delete(p, c);
             line.remove(p);
         }
-        let original = anchors.anchors().iter().find(|a| a.id == aid).unwrap();
-        assert!(matches!(
-            original.state,
-            AnchorState::Void {
-                reason: VoidReason::Deleted
-            }
-        ));
         assert!(line.is_empty());
 
-        // First tick after the deletes — observation changed
-        // (Tracking,"bullon") → (Void,empty). stable_since resets.
-        let changes = r.tick(200, anchors.anchors(), &line, &ledger);
-        assert!(changes.is_empty(), "debounce not yet elapsed after delete");
-
-        // Past debounce: record revises from Kept → Abandoned.
-        let changes = r.tick(350, anchors.anchors(), &line, &ledger);
+        // Caret away + long idle → Kept revises to Abandoned.
+        r_tick(&mut r, 200, &anchors, &line, FAR, &ledger);
+        let changes = r_tick(&mut r, 200 + ABANDON, &anchors, &line, FAR, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::Abandoned)]);
     }
 
     #[test]
     fn revisable_abandoned_then_retype_re_resolves_to_corrected_to_other() {
-        // Phase 1: type "bullon ", backspace it entirely, record
-        // resolves Abandoned. Phase 2: retype "hello " — successor B
-        // seals at [0,5). Record re-resolves Abandoned → ToOther.
+        // Phase 1: "bullon " wiped, caret away, long idle → Abandoned.
+        // Phase 2: retype "hello " — the seal revises to CorrectedToOther
+        // immediately.
         let mut line: Vec<char> = "bullon ".chars().collect();
         let mut anchors = AnchorTracker::new();
         let aid = anchors.try_register(0, 6, "bullon").unwrap();
@@ -961,7 +978,6 @@ mod tests {
             Some(0.47),
         );
 
-        // Phase 1: backspace ' ' then six letters; void the anchor.
         anchors.apply_delete(6, ' ');
         line.remove(6);
         for (p, c) in [(5, 'n'), (4, 'o'), (3, 'l'), (2, 'l'), (1, 'u'), (0, 'b')] {
@@ -970,40 +986,163 @@ mod tests {
         }
         assert!(line.is_empty());
 
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
-        assert_eq!(changes, vec![(rid, Outcome::Abandoned)], "phase 1: Abandoned");
+        let mut r = resolver();
+        r_tick(&mut r, 0, &anchors, &line, FAR, &ledger);
+        let changes = r_tick(&mut r, ABANDON, &anchors, &line, FAR, &ledger);
+        assert_eq!(
+            changes,
+            vec![(rid, Outcome::Abandoned)],
+            "phase 1: Abandoned"
+        );
         assert!(ledger.resolve_outcome(rid, Outcome::Abandoned));
 
-        // Phase 2: type "hello ". C2 ignores the Void anchor on each
-        // insert (Void anchors don't track). Trailing space seals
-        // "hello" at [0,5) as a new Tracking anchor B — the successor.
         for (i, c) in "hello ".chars().enumerate() {
             anchors.apply_insert(i, c);
             line.insert(i, c);
         }
-        let _new_aid = anchors.try_register(0, 5, "hello").unwrap();
+        anchors.try_register(0, 5, "hello").unwrap();
 
-        // First tick after the retype — observation went from
-        // (Void,empty) to (Void,"hello"). stable_since resets.
-        let changes = r.tick(200, anchors.anchors(), &line, &ledger);
-        assert!(changes.is_empty(), "debounce not yet elapsed after retype");
-
-        // Past debounce: "hello" ≠ original "bullon" ≠ candidate
-        // "bullion" → record revises from Abandoned → CorrectedToOther.
-        let changes = r.tick(350, anchors.anchors(), &line, &ledger);
+        // Seal → immediate revise to CorrectedToOther.
+        let changes = r_tick(&mut r, ABANDON + 50, &anchors, &line, 6, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::CorrectedToOther)]);
+    }
+
+    // ---- Seal-then-correct gesture: intermediate-state coverage ---------
+
+    #[test]
+    fn worxc_to_word_gesture_no_verdict_until_seal_then_corrected_to_other() {
+        // The live acceptance gesture: `worxc ` → backspace through it →
+        // `word `. Asserts the verdict state at EVERY intermediate point
+        // (after each backspace, after each replacement char), not just at
+        // the end — the previous fix passed end-state tests but failed
+        // live mid-gesture. The two failure modes this pins:
+        //   * premature Kept at the leading edge of backspacing, and
+        //   * premature Abandoned mid-retype (empty span read as
+        //     abandoned while the caret is right there typing).
+        // Nothing may fire until `word` seals; then CorrectedToOther.
+        //
+        // Stress: most ticks below run at idle FAR past KEPT/ABANDON, so
+        // the *caret guards* — not luck of timing — are what hold the
+        // verdict. Unknown word / no candidate so the result can't be
+        // misread as CorrectedToSuggestion.
+        let mut line: Vec<char> = "worxc ".chars().collect();
+        let mut anchors = AnchorTracker::new();
+        let aid = anchors.try_register(0, 5, "worxc").unwrap();
+        let mut ledger = DecisionLedger::new();
+        let rid = log_with_candidate(
+            &mut ledger,
+            leave_alone("worxc", LeaveAloneReason::NoCandidates),
+            aid,
+            None,
+            None,
+        );
+        let big = 100 * ABANDON; // idle well past every threshold
+        let mut r = resolver();
+
+        let pending = |r: &mut OutcomeResolver,
+                       t: u64,
+                       anchors: &AnchorTracker,
+                       line: &[char],
+                       caret: usize,
+                       ledger: &DecisionLedger,
+                       msg: &str| {
+            assert!(
+                r_tick(r, t, anchors, line, caret, ledger).is_empty(),
+                "{msg}"
+            );
+            assert_eq!(ledger.get(rid).unwrap().outcome, Outcome::Pending, "{msg}");
+        };
+
+        // Seal: caret after the space (6) is NOT in worxc's span [0,5).
+        // Hold idle below KEPT here — a real notice-pause is short.
+        pending(&mut r, 0, &anchors, &line, 6, &ledger, "at seal");
+        pending(
+            &mut r,
+            KEPT - 1,
+            &anchors,
+            &line,
+            6,
+            &ledger,
+            "sub-KEPT notice pause",
+        );
+
+        // Backspace the trailing space → caret 5 == worxc.end (in region).
+        // Even far past the idle bar, the caret-in-region guard holds Kept.
+        anchors.apply_delete(5, ' ');
+        line.remove(5);
+        pending(
+            &mut r,
+            big,
+            &anchors,
+            &line,
+            5,
+            &ledger,
+            "space deleted, caret at edge",
+        );
+
+        // Backspace through worxc (c,x,r,o,w); caret 4→0. Each tick at
+        // huge idle. Tracking-shrink is mid-edit; the final delete voids.
+        let mut t = big;
+        for (p, c) in [(4, 'c'), (3, 'x'), (2, 'r'), (1, 'o'), (0, 'w')] {
+            anchors.apply_delete(p, c);
+            line.remove(p);
+            t += big;
+            pending(&mut r, t, &anchors, &line, p, &ledger, "mid backspace");
+        }
+        assert!(line.is_empty());
+
+        // Empty span, caret at the wipe site (0), idle ≫ ABANDON — this is
+        // exactly the premature-Abandoned window. The caret-near guard
+        // must hold it Pending.
+        t += big;
+        pending(
+            &mut r,
+            t,
+            &anchors,
+            &line,
+            0,
+            &ledger,
+            "wiped, caret at site, idle past ABANDON",
+        );
+
+        // Retype "word"; caret 1→4. No successor until the space seals,
+        // and idle keeps growing — but the caret stays within
+        // ABANDONED_CARET_MARGIN of the wipe site, so no Abandoned fires.
+        for (i, c) in "word".chars().enumerate() {
+            anchors.apply_insert(i, c);
+            line.insert(i, c);
+            t += big;
+            pending(
+                &mut r,
+                t,
+                &anchors,
+                &line,
+                i + 1,
+                &ledger,
+                "mid retype, no premature Abandoned",
+            );
+        }
+
+        // Seal "word ": the definitive event. CorrectedToOther fires now,
+        // and only now — never Kept, never Abandoned, at any point above.
+        anchors.apply_insert(4, ' ');
+        line.insert(4, ' ');
+        anchors.try_register(0, 4, "word").unwrap();
+        let changes = r_tick(&mut r, t + 10, &anchors, &line, 5, &ledger);
+        assert_eq!(
+            changes,
+            vec![(rid, Outcome::CorrectedToOther)],
+            "worxc → word resolves CorrectedToOther on the seal — never Kept/Abandoned"
+        );
     }
 
     // ---- Position shift vs content edit --------------------------------
 
     #[test]
     fn position_shift_only_does_not_flip_kept() {
-        // Two words on the line: "teh foo". Anchor for "teh" at [0,3).
-        // After it resolves Kept, the user types 'x' at the START of
-        // the line — "teh" shifts right to [1,4) but its content is
-        // unchanged. The Kept resolution must persist.
+        // "teh foo" — "teh" at [0,3) resolves Kept. Typing 'x' at the
+        // start shifts "teh" to [1,4) with unchanged content. The Kept
+        // resolution must persist (no re-emit, no flip).
         let mut line: Vec<char> = "teh foo".chars().collect();
         let mut anchors = AnchorTracker::new();
         let teh = anchors.try_register(0, 3, "teh").unwrap();
@@ -1017,21 +1156,17 @@ mod tests {
             Some(0.82),
         );
 
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        let mut r = resolver();
+        r_tick(&mut r, 0, &anchors, &line, FAR, &ledger);
+        let changes = r_tick(&mut r, KEPT, &anchors, &line, FAR, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::Kept)]);
         assert!(ledger.resolve_outcome(rid, Outcome::Kept));
 
-        // User inserts 'x' at p=0. Anchor for "teh" shifts to [1,4);
-        // content at [1,4) is still "teh".
+        // Insert 'x' at p=0 → "teh" shifts to [1,4); content still "teh".
         anchors.apply_insert(0, 'x');
         line.insert(0, 'x');
 
-        // Far beyond the debounce — should remain Kept, with no
-        // transition emitted (the resolver short-circuits because
-        // computed == record.outcome).
-        let changes = r.tick(10_000, anchors.anchors(), &line, &ledger);
+        let changes = r_tick(&mut r, 100 * KEPT, &anchors, &line, FAR, &ledger);
         assert!(
             changes.is_empty(),
             "shift-only must not re-resolve a Kept record"
@@ -1041,11 +1176,10 @@ mod tests {
     // ---- Revisability ---------------------------------------------------
 
     #[test]
-    fn kept_record_re_resolves_when_span_is_later_edited() {
-        // "teh " resolves Kept. Then user edits the span content to
-        // "the" via the same in-place trick used in the
-        // pending_resolves_to_corrected_to_suggestion path. Resolver
-        // must re-fire and re-resolve to CorrectedToSuggestion.
+    fn kept_record_re_resolves_when_corrected_by_reseal() {
+        // "teh " resolves Kept. The user then corrects it the realistic
+        // way — shrink to "t", retype "he", seal "the" as a successor.
+        // The seal revises Kept → CorrectedToSuggestion.
         let mut line: Vec<char> = "teh ".chars().collect();
         let mut anchors = AnchorTracker::new();
         let aid = anchors.try_register(0, 3, "teh").unwrap();
@@ -1058,27 +1192,28 @@ mod tests {
             Some(0.82),
         );
 
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        let mut r = resolver();
+        r_tick(&mut r, 0, &anchors, &line, FAR, &ledger);
+        let changes = r_tick(&mut r, KEPT, &anchors, &line, FAR, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::Kept)]);
         assert!(ledger.resolve_outcome(rid, Outcome::Kept));
 
-        // Mutate the anchor's span content to "the" via insert-inside
-        // / delete-tail (apply_insert at p == end is "after, ignore" —
-        // we need the insert strictly inside the span to grow it).
-        anchors.apply_insert(1, 'h');
-        line.insert(1, 'h');
-        anchors.apply_delete(3, line[3]);
+        // Shrink "teh" → "t" (backspace ' ', 'h', 'e'), retype "he ",
+        // sealing "the" as a successor at [0,3).
+        anchors.apply_delete(3, ' ');
         line.remove(3);
-        // Anchor is now [0,3) Tracking with content "the".
+        anchors.apply_delete(2, 'h');
+        line.remove(2);
+        anchors.apply_delete(1, 'e');
+        line.remove(1);
+        for (p, c) in [(1, 'h'), (2, 'e'), (3, ' ')] {
+            anchors.apply_insert(p, c);
+            line.insert(p, c);
+        }
+        anchors.try_register(0, 3, "the").unwrap();
 
-        // First post-edit tick: observation changed → debounce resets.
-        let changes = r.tick(200, anchors.anchors(), &line, &ledger);
-        assert!(changes.is_empty(), "debounce not yet elapsed");
-
-        // Past the debounce window: Kept → CorrectedToSuggestion.
-        let changes = r.tick(350, anchors.anchors(), &line, &ledger);
+        // The seal revises immediately.
+        let changes = r_tick(&mut r, KEPT + 50, &anchors, &line, 4, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::CorrectedToSuggestion)]);
     }
 
@@ -1086,8 +1221,8 @@ mod tests {
 
     #[test]
     fn no_candidates_record_with_unchanged_content_resolves_to_kept() {
-        // Names like "Soumyo" land on LeaveAlone(NoCandidates) — record
-        // has no top_candidate. Untouched text → Kept regardless.
+        // Names like "Soumyo" land on LeaveAlone(NoCandidates) — no
+        // top_candidate. Untouched + idle → Kept regardless.
         let mut anchors = AnchorTracker::new();
         let aid = anchors.try_register(0, 6, "Soumyo").unwrap();
         let mut ledger = DecisionLedger::new();
@@ -1100,23 +1235,22 @@ mod tests {
         );
         let line: Vec<char> = "Soumyo ".chars().collect();
 
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        let mut r = resolver();
+        r_tick(&mut r, 0, &anchors, &line, FAR, &ledger);
+        let changes = r_tick(&mut r, KEPT, &anchors, &line, FAR, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::Kept)]);
     }
 
     #[test]
-    fn no_candidates_record_with_changed_content_resolves_to_corrected_to_other() {
-        // Same Soumyo scenario with `top_candidate = None`: any change
-        // is CorrectedToOther (ToSuggestion is unreachable).
+    fn no_candidates_record_with_resealed_content_resolves_to_corrected_to_other() {
+        // Soumyo with no candidate: a successor seal with different
+        // content is CorrectedToOther (ToSuggestion is unreachable),
+        // immediately on the seal.
         let mut anchors = AnchorTracker::new();
         let aid = anchors.try_register(0, 6, "Soumyo").unwrap();
-        // Replicate the partial-edit shape: drop the anchor's end so a
-        // successor at start=0 can win the lookup.
         anchors.apply_delete(5, 'o');
         anchors.apply_delete(4, 'y');
-        let _new = anchors.try_register(0, 6, "Saumyo").unwrap();
+        anchors.try_register(0, 6, "Saumyo").unwrap();
         let mut ledger = DecisionLedger::new();
         let rid = log_with_candidate(
             &mut ledger,
@@ -1127,21 +1261,17 @@ mod tests {
         );
         let line: Vec<char> = "Saumyo ".chars().collect();
 
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        let changes = r_tick(&mut resolver(), 0, &anchors, &line, FAR, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::CorrectedToOther)]);
     }
 
     #[test]
-    fn debounce_resets_on_content_edit_then_commit_seals_resolves_to_other() {
-        // Two sequential inside-deletes shrink "teh" → "te" → "t". Each
-        // observation changes (`Incomplete("te")` ≠ `Incomplete("t")`)
-        // so each delete resets the debounce timer. Past the debounce,
-        // the record DOES NOT resolve while truncated (the mid-edit
-        // gate from the wordl→world fix). Only once the user commits
-        // by typing a boundary — sealing "t" as a successor anchor —
-        // does the resolver classify CorrectedToOther.
+    fn idle_clock_resets_on_each_content_edit() {
+        // The idle clock (`stable_since_ms`) resets whenever the
+        // observation tuple changes. Two inside-deletes shrink
+        // "teh" → "te" → "t"; each is a distinct observation, so each
+        // resets the clock — and the record never resolves while
+        // truncated (mid-edit hold), even past the idle bar.
         let mut line: Vec<char> = "teh ".chars().collect();
         let mut anchors = AnchorTracker::new();
         let aid = anchors.try_register(0, 3, "teh").unwrap();
@@ -1154,50 +1284,28 @@ mod tests {
             Some(0.82),
         );
 
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
+        let mut r = resolver();
+        r_tick(&mut r, 0, &anchors, &line, 3, &ledger);
         assert_eq!(r.stable_since_ms(aid), Some(0));
 
-        // t=50: delete 'h' at p=2 → anchor [0,2), content "te" (prefix
-        // of "teh"). Observation transitions from Resolved("teh") to
-        // Incomplete("te") — different observation, timer resets.
         anchors.apply_delete(2, 'h');
         line.remove(2);
-        r.tick(50, anchors.anchors(), &line, &ledger);
-        assert_eq!(r.stable_since_ms(aid), Some(50));
+        r_tick(&mut r, 50, &anchors, &line, 2, &ledger);
+        assert_eq!(
+            r.stable_since_ms(aid),
+            Some(50),
+            "edit resets the idle clock"
+        );
 
-        // t=80: delete 'e' at p=1 → anchor [0,1), content "t" (also a
-        // prefix). Incomplete("te") ≠ Incomplete("t") → timer resets.
         anchors.apply_delete(1, 'e');
         line.remove(1);
-        r.tick(80, anchors.anchors(), &line, &ledger);
+        r_tick(&mut r, 80, &anchors, &line, 1, &ledger);
         assert_eq!(r.stable_since_ms(aid), Some(80));
 
-        // t=130 — 50ms after last edit, still inside debounce.
-        let changes = r.tick(130, anchors.anchors(), &line, &ledger);
-        assert!(changes.is_empty());
-
-        // t=200 — past debounce, but observation is still Incomplete →
-        // no transition. The record stays Pending.
-        let changes = r.tick(200, anchors.anchors(), &line, &ledger);
-        assert!(
-            changes.is_empty(),
-            "Incomplete must not fire ToOther on a truncated mid-edit"
-        );
+        // Truncated, far past the idle bar → still no verdict (mid-edit).
+        let changes = r_tick(&mut r, 80 + 100 * KEPT, &anchors, &line, 1, &ledger);
+        assert!(changes.is_empty(), "truncated mid-edit must hold");
         assert_eq!(ledger.get(rid).unwrap().outcome, Outcome::Pending);
-
-        // Commit: user types ' ' which seals "t" as a successor anchor
-        // at [0,1). Now there's a Tracking neighbour at the original
-        // start — observation flips Incomplete → Resolved("t") via the
-        // successor lookup. Timer resets to t=210, then we wait again.
-        anchors.apply_insert(1, ' ');
-        line.insert(1, ' ');
-        let _new_aid = anchors.try_register(0, 1, "t").unwrap();
-        r.tick(210, anchors.anchors(), &line, &ledger);
-
-        // Past the post-commit debounce: classify "t" → ToOther.
-        let changes = r.tick(320, anchors.anchors(), &line, &ledger);
-        assert_eq!(changes, vec![(rid, Outcome::CorrectedToOther)]);
     }
 
     #[test]
@@ -1214,13 +1322,13 @@ mod tests {
             Some(0.82),
         );
 
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
+        let mut r = resolver();
+        r_tick(&mut r, 0, &anchors, &line, FAR, &ledger);
         assert!(r.stable_since_ms(aid).is_some());
 
         anchors.clear();
         line.clear();
-        r.tick(1, anchors.anchors(), &line, &ledger);
+        r_tick(&mut r, 1, &anchors, &line, FAR, &ledger);
         assert!(r.stable_since_ms(aid).is_none());
     }
 
@@ -1238,78 +1346,50 @@ mod tests {
             Some(0.82),
         );
 
-        let mut r = OutcomeResolver::with_debounce_ms(100);
-        r.tick(0, anchors.anchors(), &line, &ledger);
-        let changes = r.tick(150, anchors.anchors(), &line, &ledger);
+        let mut r = resolver();
+        r_tick(&mut r, 0, &anchors, &line, FAR, &ledger);
+        let changes = r_tick(&mut r, KEPT, &anchors, &line, FAR, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::Kept)]);
         assert!(ledger.resolve_outcome(rid, Outcome::Kept));
 
-        let changes = r.tick(200, anchors.anchors(), &line, &ledger);
-        assert!(changes.is_empty());
-        let changes = r.tick(1_000, anchors.anchors(), &line, &ledger);
-        assert!(changes.is_empty());
+        // Kept already holds — later ticks recompute Kept but emit nothing.
+        assert!(r_tick(&mut r, 2 * KEPT, &anchors, &line, FAR, &ledger).is_empty());
+        assert!(r_tick(&mut r, 100 * KEPT, &anchors, &line, FAR, &ledger).is_empty());
     }
 
-    // ---- Pure classifier ------------------------------------------------
+    // ---- classify_resolved (committed-text → outcome) -------------------
 
-    fn resolved(s: &str) -> PostEdit {
-        PostEdit::Resolved(s.chars().collect())
-    }
-
-    fn incomplete(s: &str) -> PostEdit {
-        PostEdit::Incomplete(s.chars().collect())
+    fn cs(s: &str) -> Vec<char> {
+        s.chars().collect()
     }
 
     #[test]
-    fn classify_kept_path() {
+    fn classify_resolved_kept_path() {
         assert_eq!(
-            classify(&resolved("teh"), "teh", Some("the")),
-            Some(Outcome::Kept)
+            classify_resolved(&cs("teh"), "teh", Some("the")),
+            Outcome::Kept
         );
     }
 
     #[test]
-    fn classify_corrected_to_suggestion_path() {
+    fn classify_resolved_corrected_to_suggestion_path() {
         assert_eq!(
-            classify(&resolved("the"), "teh", Some("the")),
-            Some(Outcome::CorrectedToSuggestion)
+            classify_resolved(&cs("the"), "teh", Some("the")),
+            Outcome::CorrectedToSuggestion
         );
     }
 
     #[test]
-    fn classify_corrected_to_other_path() {
+    fn classify_resolved_corrected_to_other_path() {
         assert_eq!(
-            classify(&resolved("tax"), "teh", Some("the")),
-            Some(Outcome::CorrectedToOther)
+            classify_resolved(&cs("tax"), "teh", Some("the")),
+            Outcome::CorrectedToOther
         );
-    }
-
-    #[test]
-    fn classify_abandoned_on_empty() {
+        // No candidate → any non-matching text is ToOther.
         assert_eq!(
-            classify(&resolved(""), "teh", Some("the")),
-            Some(Outcome::Abandoned)
+            classify_resolved(&cs("tax"), "teh", None),
+            Outcome::CorrectedToOther
         );
-    }
-
-    #[test]
-    fn classify_corrected_to_other_when_no_candidate_present() {
-        // top_candidate=None: anything non-empty that doesn't match the
-        // original is ToOther — ToSuggestion is unreachable by design.
-        assert_eq!(
-            classify(&resolved("tax"), "teh", None),
-            Some(Outcome::CorrectedToOther)
-        );
-    }
-
-    #[test]
-    fn classify_incomplete_returns_none() {
-        // Incomplete state never emits a transition — record stays at
-        // its prior outcome until the user commits.
-        assert_eq!(classify(&incomplete("wor"), "wordl", Some("world")), None);
-        // Even when the truncated prefix matches a suggestion-like
-        // shape, Incomplete dominates — we don't classify mid-edit.
-        assert_eq!(classify(&incomplete("the"), "the", Some("the")), None);
     }
 
     // ---- is_proper_prefix ----------------------------------------------

@@ -22,6 +22,8 @@ pub mod lexicon;
 pub mod lexicon_proposal;
 pub mod linguistic;
 pub mod log;
+pub mod motor_ledger;
+pub mod motor_map;
 pub mod motor_signal;
 pub mod resolver;
 pub mod score;
@@ -29,13 +31,13 @@ pub mod tokenizer;
 pub use anchor::{AnchorState, AnchorTracker, AnchorsSnapshot, SpanAnchor, VoidReason};
 pub use candidates::{ranked_known_candidates, KnownCandidate, CANDIDATES_VERSION};
 pub use decision::{
-    decide, mode_min_confidence, DecisionOutcome, LeaveAloneReason, ACTIVE_TIER,
-    DECISION_VERSION, SEPARATION_MARGIN,
+    decide, mode_min_confidence, DecisionOutcome, LeaveAloneReason, ACTIVE_TIER, DECISION_VERSION,
+    SEPARATION_MARGIN,
 };
 pub use lexicon::{Lexicon, LEXICON_VERSION};
 pub use lexicon_proposal::{
-    HoldReason, Lane, LexiconProposal, LexiconProposer, MotorVerdict, ProposalTier,
-    ProposalUpdate, LEXICON_PROPOSAL_VERSION,
+    HoldReason, Lane, LexiconProposal, LexiconProposer, MotorVerdict, ProposalTier, ProposalUpdate,
+    LEXICON_PROPOSAL_VERSION,
 };
 pub use linguistic::{
     is_well_formed, linguistic_signal, plausibility, proximity_verdict, LinguisticSignal,
@@ -45,10 +47,18 @@ pub use log::{
     has_motor_evidence, should_log, DecisionLedger, LogConfidence, LogRecord, Outcome,
     DEFAULT_LEDGER_CAPACITY, LOG_VERSION,
 };
+pub use motor_ledger::{MotorLedger, MotorRecord, DEFAULT_MOTOR_LEDGER_CAPACITY};
+pub use motor_map::{
+    MotorMap, ObserveReport, SlipDistribution, StabilityReport, Timestamp, HALF_LIFE_MS,
+    MAX_SLIP_EDIT_DISTANCE, MAX_SLIP_LENGTH_DIFF, MOTOR_MAP_VERSION, PERSIST_EVERY,
+};
 pub use motor_signal::{
     measure_token_motor, TokenMotorSignal, TokenMotorVerdict, GRAZE_DWELL_MS, MIN_SAMPLE_CHARS,
 };
-pub use resolver::{OutcomeResolver, DEFAULT_DEBOUNCE_MS, RESOLVER_VERSION};
+pub use resolver::{
+    OutcomeResolver, ResolvableRecord, ABANDONED_CARET_MARGIN, ABANDONED_IDLE_THRESHOLD_MS,
+    KEPT_IDLE_THRESHOLD_MS, RESOLVER_VERSION,
+};
 pub use score::{
     confidence_for, score_candidates, Confidence, ConfidenceReport, EditType, ScoredCandidate,
     CONFIDENCE_HIGH_FLOOR, CONFIDENCE_LOW_FLOOR, CONFIDENCE_MEDIUM_FLOOR, SCORE_VERSION,

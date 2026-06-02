@@ -246,6 +246,24 @@ pub struct LogRecord {
     pub log_version: u32,
 }
 
+impl crate::resolver::ResolvableRecord for LogRecord {
+    fn record_id(&self) -> u64 {
+        self.id
+    }
+    fn anchor_id(&self) -> u32 {
+        self.anchor_id
+    }
+    fn original_text(&self) -> &str {
+        &self.original_text
+    }
+    fn top_candidate(&self) -> Option<&str> {
+        self.top_candidate.as_deref()
+    }
+    fn current_outcome(&self) -> Outcome {
+        self.outcome
+    }
+}
+
 /// Bounded rolling decision ledger.
 ///
 /// Owned by the engine; capacity is fixed at construction. Once full,
@@ -727,13 +745,34 @@ mod tests {
     fn ids_are_monotonic_across_appends() {
         let mut ledger = DecisionLedger::new();
         let id0 = append_would_correct(
-            &mut ledger, 0, "a", "an", 0.6, 1, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "a",
+            "an",
+            0.6,
+            1,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
         let id1 = append_would_correct(
-            &mut ledger, 0, "b", "be", 0.6, 2, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "b",
+            "be",
+            0.6,
+            2,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
         let id2 = append_would_correct(
-            &mut ledger, 0, "c", "cat", 0.6, 3, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "c",
+            "cat",
+            0.6,
+            3,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
         assert_eq!((id0, id1, id2), (0, 1, 2));
     }
@@ -744,17 +783,45 @@ mod tests {
     fn capacity_evicts_oldest_when_full() {
         let mut ledger = DecisionLedger::with_capacity(3);
         let id0 = append_would_correct(
-            &mut ledger, 0, "a", "an", 0.6, 1, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "a",
+            "an",
+            0.6,
+            1,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
         let id1 = append_would_correct(
-            &mut ledger, 0, "b", "be", 0.6, 2, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "b",
+            "be",
+            0.6,
+            2,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
         let id2 = append_would_correct(
-            &mut ledger, 0, "c", "cat", 0.6, 3, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "c",
+            "cat",
+            0.6,
+            3,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
         // Capacity full; the next append should evict id0.
         let id3 = append_would_correct(
-            &mut ledger, 0, "d", "do", 0.6, 4, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "d",
+            "do",
+            0.6,
+            4,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
         assert_eq!(ledger.len(), 3);
         assert!(ledger.get(id0).is_none(), "oldest record should be evicted");
@@ -830,13 +897,34 @@ mod tests {
         // Capacity 2 — the third append evicts id0; resolve_outcome on it fails.
         let mut ledger = DecisionLedger::with_capacity(2);
         let id0 = append_would_correct(
-            &mut ledger, 0, "a", "an", 0.6, 1, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "a",
+            "an",
+            0.6,
+            1,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
         append_would_correct(
-            &mut ledger, 0, "b", "be", 0.6, 2, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "b",
+            "be",
+            0.6,
+            2,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
         append_would_correct(
-            &mut ledger, 0, "c", "cat", 0.6, 3, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "c",
+            "cat",
+            0.6,
+            3,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
         assert!(!ledger.resolve_outcome(id0, Outcome::Kept));
     }
@@ -849,7 +937,14 @@ mod tests {
         // called at outcome-resolution time, not at append time.
         let mut ledger = DecisionLedger::new();
         let id = append_would_correct(
-            &mut ledger, 0, "teh", "the", 0.8, 1, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "teh",
+            "the",
+            0.8,
+            1,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
         assert_eq!(ledger.get(id).unwrap().credited, None);
     }
@@ -863,10 +958,24 @@ mod tests {
         // paused row and keep the credited row normal.
         let mut ledger = DecisionLedger::new();
         let id_credited = append_would_correct(
-            &mut ledger, 0, "alpha", "alphax", 0.6, 1, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "alpha",
+            "alphax",
+            0.6,
+            1,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
         let id_paused = append_would_correct(
-            &mut ledger, 0, "beta", "betax", 0.6, 2, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "beta",
+            "betax",
+            0.6,
+            2,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
 
         assert!(ledger.set_credited(id_credited, Some(true)));
@@ -880,7 +989,14 @@ mod tests {
     fn set_credited_returns_false_for_unknown_id() {
         let mut ledger = DecisionLedger::new();
         append_would_correct(
-            &mut ledger, 0, "teh", "the", 0.8, 1, ConfidenceTier::Eager, Confidence::Medium,
+            &mut ledger,
+            0,
+            "teh",
+            "the",
+            0.8,
+            1,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
         );
         assert!(!ledger.set_credited(9_999, Some(true)));
     }

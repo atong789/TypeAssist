@@ -2,9 +2,38 @@
 
 Native macOS app that helps users with motor difficulty type more accurately by learning each user's personal motor patterns and correcting typos via a spatial volatility map (not a generic dictionary).
 
-## Privacy invariant — non-negotiable
+## Nothing leaves the device (Principle #9 — non-negotiable)
 
-All processing is local. No internet, no accounts, no cloud, no telemetry. This is structural, not optional. Do not add an HTTP client, analytics, or remote logging without an explicit product decision to reverse this stance.
+All user data — keystrokes, motor map, snapshots, slip patterns, fatigue signals, mode preferences — stays on the user's local machine. No cloud sync, no analytics, no telemetry, no crash reports, no shared learning across users. **The application has no network calls related to user data, ever.** This is structural, not optional: do not add an HTTP client, analytics, or remote logging.
+
+**Rationale:** this is recovery data — it reveals more about a person's body and cognitive state than most medical records. The privacy bar must be **absolute, not best-effort**. Any future feature that would require sending data off-device is **rejected by default — there is no acceptable tradeoff that opens this door.**
+
+## Capture integrity is observable, not assumed (Principle #8 — non-negotiable)
+
+Every stage of the pipeline (**L1 ingest → engine accept → sealing → 5a verdict → 5c observe → persistence**) exposes a cumulative counter reconciled against the previous stage, so the conversion ratio between adjacent stages is auditable in real time. **Silent drops are unacceptable.** For a recovery-tracking app, a stroke survivor whose week of typing produces 1% of the expected data hasn't been *underserved* — the product has **lied to them about their recovery**. That is the worst failure mode the system has, worse than a wrong correction. This is foundational, not a feature.
+
+Concretely: the engine maintains a `Funnel` (`apps/tauri/src-tauri/src/engine.rs`) with `c_keystrokes_received` / `c_keystrokes_accepted` / `c_tokens_sealed` / `c_records_admitted` / `c_verdicts_resolved` (by outcome) / `c_motor_observations` (kept vs slip) / `c_motor_saves`. `c_records_admitted` sits at the boundary that *caused* the first cliff: the motor map now has its own **`MotorLedger`** (`crates/correction-engine/src/motor_ledger.rs`) admitting **every** motor-evidenced word, decoupled from the C5b decision ledger's `should_log` Known-skip (which is a lexicon concern, not a capture one). The shared `OutcomeResolver` verdicts both ledgers; the decision ledger feeds the lexicon proposer, the motor ledger feeds the motor map. Counters are **reconciled per run, never per session**: **Cmd+Shift+F** dumps a structured `FUNNEL_DUMP` line and then **auto-resets** (closes the run); **Cmd+Shift+R** resets without dumping (start a run from zero); a **60 s periodic dump** emits without resetting (cumulative-within-run, so a long run is reconstructable from the log and survives a crash). Any new pipeline stage adds its counter and its reconciliation; never merge a stage that can drop data without a counter that makes the drop visible.
+
+**Scope (M2.5).** Capture integrity is its own milestone, between understanding (M2) and the learning loop (M4). No 5c-proper, Practice mode, or kill-switch-criterion work proceeds until the funnel is healthy (adjacent-stage ratios match expectation on a calibration run). Fix the drop from funnel **data**, never from hypothesis.
+
+## Every meaningful state is preserved (Principle #6 — non-negotiable)
+
+A recovery record is only as trustworthy as the history it keeps. **Losing a day's state is the same failure class as a silent capture drop** (Principle #8) — the product would be unable to honestly show the user where their hands were. So every meaningful moment is checkpointed by design, not by luck:
+
+- The engine writes a dated snapshot to `~/.typeassist/snapshots/YYYY-MM-DD.json` **once per day, on the first event of a new calendar day**, and **on engine startup before any writes to the live motor map**.
+- **Snapshots are never overwritten or deleted by the engine — they accumulate.** A dated filename plus a write-only-if-absent guard make each day's first-captured state permanent; the live `~/.typeassist/motor_map.json` always holds the latest.
+- This **replaces the previous weekly cadence**, which had already lost a day (no `2026-05-31` snapshot was ever written) — exactly the design flaw this fixes. Never work around a lost state; fix the cadence so it can't be lost.
+- The accumulated snapshots are the durable history the Progress view and the (future) therapist export read back; the Practice trend reads them at daily granularity. Implemented in `engine.rs` (the startup snapshot beside the motor-map load; the watchdog writes the new day's file when the calendar date rolls over).
+
+## TypeAssist grows with you, not over you (Principle #10 — non-negotiable)
+
+Unlike system autocorrect or generic typing assistants, TypeAssist does **not** arrive pre-trained. It learns the specific patterns of the specific person using it. Early on, it observes more than it acts. Over time, as it builds confidence about your slips and your recovery, it begins to help. The trade-off is honest: **less help on day one, more correct help on day ninety.** The user is not a passive subject of the algorithm — they are a participant in their own recovery.
+
+**Implications:**
+- The **first-run experience must communicate this clearly** — it learns *you*; it starts quiet and earns its help, rather than arriving opinionated.
+- The kill-switch (the L2→L3 correction-enable switch) operates **per-user, not by a global threshold** — correction turns on when the map is confident about *this* person's patterns.
+- The product must **never feel like a "worse autocorrect."** A generic assistant that's wrong in unfamiliar ways is worse than none; TypeAssist's value is that it's *yours*.
+- **Practice mode is the accelerator** — the surface where users actively teach TypeAssist their patterns, building the map's confidence faster than ambient typing alone.
 
 ## Architecture — 5 layers
 
@@ -40,7 +69,7 @@ These override implementation convenience. If a feature seems to want a slider, 
 After stroke, fingers recover at physiologically different rates — not by the user's choice. **Thumb and index regain independent control fastest**; the outer three (middle, ring, little) are more tendon-interconnected and recover slowest, **ring and little especially**. This is anatomy, not effort. The engine must be finger-aware about it:
 
 1. **Frame as physiology, not failure.** Higher slip rates and slower improvement on slow-recovery fingers are NORMAL physiology — never the user's failure. UI copy, progress framings, and insights treat a slow ring finger the way physical therapy treats a slow leg: expected, not a deficit.
-2. **Weight correction priors by finger.** Downstream of L2, the correction engine should bias confidence by which finger is involved. A slip on a slow-recovery finger is more likely a motor error to smooth; an unusual key under thumb or index is more likely intentional and should be left alone. This applies to the L4 confidence tiers (`Gentle`/`Balanced`/`Bold`) and to swap-pair scoring in L3.
+2. **Weight correction priors by finger.** Downstream of L2, the correction engine should bias confidence by which finger is involved. A slip on a slow-recovery finger is more likely a motor error to smooth; an unusual key under thumb or index is more likely intentional and should be left alone. This applies to the L4 confidence tiers (`Cautious`/`Balanced`/`Eager`) and to swap-pair scoring in L3.
 3. **Calibrate progress per finger.** Grade each finger against *its own* expected recovery curve, so a slow finger is never made to feel like it's lagging the others. Progress on Progress's "where your hands are gaining ground" is per-finger, not whole-hand.
 
 Sourced from the builder's lived stroke-recovery experience — load-bearing for both engine weighting and UI tone.
@@ -94,10 +123,16 @@ TypeAssist surfaces insight across three surfaces — **Today**, **Progress**, *
 - **Footer**: restate the on-device privacy promise. The opt-in therapist-share link is a **v2 footer element** — never pushed.
 - **Never on this surface**: WPM, streaks, daily scores, comparison to other users, goals/targets, prescriptions.
 
-### Practice — opt-in targeted training
+### Practice — opt-in "breathing exercise for the affected hand" (menu-bar panel)
 
-- Where structured measurement legitimately belongs (the user opted into an exercise). Typing-Club style: accuracy and improvement on focused letter-combinations, in TypeAssist's voice. Levels: **Gentle / Steady / Spirited** (kinds of day, not difficulty grades).
-- **Content is personalised to the user's own tricky keys and finger-transitions** (drawn from the volatility map) — not a generic keyboard-row curriculum. Real lowercase words, short and focused, denser by level. At cold start, a sensible common set until the map has learned the user.
+Practice Mode lives in the **macOS menu bar** as a small dropdown panel (not a window), built for short, frequent use — two minutes between meetings. The whole app is menu-bar-only (Grammarly model): no Dock icon, one tray entry point, with the main window (Today/Progress/Settings) opened *from* the tray. Lives in `apps/tauri/src/routes/PracticePanel.svelte` (its own webview window, label `practice`); shell wiring (tray, Accessory policy, panel window) is in `apps/tauri/src-tauri/src/lib.rs`.
+
+- **Calm, four-phase loop**: `Ready?` (a moment of intention) → typing → `Continue?` (the user controls the pace) → snapshot. Built around a breathing-exercise feel. A round shows sentences in **blocks of 3** (tunable `BLOCK_SIZE`); `Continue?` appears only at the end of a block, so the rhythm isn't broken after one sentence.
+- **Slips shown live, but gently — never judgmentally.** As the user types, the actual key is rendered; a wrong key shows *immediately* as a slip marked **amber + wavy underline + a dot** (triple-coded so it reads without colour perception; never red). The caret **advances past** the slip (it never sticks) and backspace removes it. There is **no live score, percentage, timer, or WPM** — honesty about *what was typed*, but no judgement. (This refines the brief's original "no live feedback": the builder decided hiding slips felt dishonest; the calm comes from the gentle marking + absence of scoring, not from concealment.)
+- **Real sentences, weighted to weak keys.** Short, real, **all-lowercase** sentences SELECTED from a curated bank (`apps/tauri/src/lib/sentences.txt`), scored by density of the user's weak keys (`query_weakest_keys` / the `engine://motor-stability` report) but with other keys appearing naturally. **Never generated by an LLM** — if repetition bites, grow the bank. Cold start: a sensible common set until the map has learned the user.
+- **Snapshot at the end**: "what happened" (keys leaned into, observations added — the motor map's `total_observations` delta across the round) plus, when ≥2 daily snapshots exist, a per-key **trend** derived from the dated archives (`engine://practice-trend`). Early sessions gracefully show "what happened" only.
+- **Deferred (clean seams left):** fatigue lines in the snapshot (L2 fatigue is deferred) and mode-calibration (Cautious/Balanced/Eager) — the L2→L3 kill-switch is off, so a mode switch wouldn't act yet. Add both when those layers land.
+- All Practice copy lives in **one** place (`apps/tauri/src/lib/practiceCopy.ts`); sentence content in `sentences.txt`.
 
 ### Cross-cutting — progress is offered, never imposed
 
@@ -105,17 +140,44 @@ The same number that motivates on a good day can sting on a bad one. Progress is
 
 ## Typing surfaces
 
-TypeAssist sees user typing on three kinds of surface: the **ambient** OS-wide capture (no UI), **Warm-up** (opt-in, unmeasured), and **Practice** (opt-in, measured — future). These share one rule and diverge on another.
+TypeAssist sees user typing on three kinds of surface: the **ambient** OS-wide capture (no UI), **Warm-up** (opt-in, unmeasured), and **Practice** (opt-in, the menu-bar breathing panel). These share one rule and diverge on another.
 
 - **Backspace always works (universal).** On every typing surface, backspace moves the caret back one character so the user can retype. Never block backspace, never discourage it — self-correction is signal, not failure (see Correction-engine state model → `SelfCorrected`).
-- **Warm-up — unmeasured: smooth and advance.** A wrong key never blocks and never displays as an error: the caret advances one character and the *correct target character* appears (the slip is silently smoothed). No red, no "try again," no error state of any kind, anywhere. The caret must never stick waiting for the correct key. **Passages are always all-lowercase** — no proper nouns, no capitals, no shifted punctuation. Shift is a hard two-key chord for our users and Warm-up must never require it. Lives in `apps/tauri/src/routes/WarmUp.svelte`.
-- **Practice — measured: slips are visible.** A wrong key *does* appear in the rendered stream, marked with **both amber colour and a wavy underline** so the slip is visible without colour perception (never red). The caret advances past the slip; backspace removes the slip so the user can retype (universal backspace rule applies). Slips are counted internally for the end-of-round readout, but **no live score, percentage, timer, or WPM** is shown during the round. Lives in `apps/tauri/src/routes/Practice.svelte`.
+- **Warm-up — smooth and advance.** A wrong key never blocks and never displays as an error: the caret advances one character and the *correct target character* appears (the slip is silently smoothed). No red, no "try again," no error state of any kind, anywhere. The caret must never stick waiting for the correct key. **Passages are always all-lowercase** — no proper nouns, no capitals, no shifted punctuation. Shift is a hard two-key chord for our users and Warm-up must never require it. Lives in `apps/tauri/src/routes/WarmUp.svelte`.
+- **Practice — slips visible live, gently.** A wrong key appears *immediately* in the rendered stream, marked with **amber colour + a wavy underline + a dot** (triple-coded so the slip reads without colour perception; never red). The caret advances past the slip; backspace removes it (universal backspace rule applies). There is **no live score, percentage, timer, or WPM** — the surface is honest about what was typed but never judgmental, and measurement (keys, observations, trend) surfaces only in the end-of-round **snapshot**. All-lowercase sentences from the curated bank. Lives in `apps/tauri/src/routes/PracticePanel.svelte`. (The slip *capture* still flows through the ambient tap regardless.) See "Insight system → Practice" for the full flow.
 
 ## Correction-engine state model
 
-- **Confidence tiers**: `Gentle`, `Balanced`, `Bold`.
+- **Confidence tiers** (engine mode — how aggressive corrections are): `Cautious` (acts on High confidence only), `Balanced` (Medium+), `Eager` (Low+). Defined in `crates/correction-engine/src/lib.rs` as `ConfidenceTier`.
 - **Space-error types**: `MissingSpace`, `ExtraSpace`, `ModifierDrift`.
 - **Outcome states** (per word): `CleanHit`, `SelfCorrected`, `UncorrectedMiss`, `TwoKeysTogether`. All four are intentional — do not collapse to three. Self-corrections via backspace are signal, not failure.
+
+### Outcome resolver (5a) — verdict state machine + limitations
+
+The resolver is an **event + idle state machine** (`resolver::decide_verdict`), not a debounce. Core rule: **never fire a verdict mid-edit.** Four definitive triggers:
+- **`CorrectedToOther` / `CorrectedToSuggestion`** — fire *immediately* when a successor token seals at the original's `start` with different content (a seal is unambiguous; no wait).
+- **`Kept`** — fire when the token is still intact, the caret is **not** in/at its span, and its region has been idle ≥ `KEPT_IDLE_THRESHOLD_MS` (~5s; sized for slow-typing/stroke-survivor notice-pauses).
+- **`Abandoned`** — fire when the token is wiped, no successor, the caret has moved ≥ `ABANDONED_CARET_MARGIN` chars from its `start`, and idle ≥ `ABANDONED_IDLE_THRESHOLD_MS` (~10s).
+- otherwise stay `Pending`.
+
+The thresholds + margin are **tunable** module constants (raise for slow typists). Idle is driven by **both** keystroke ticks and the engine's 1s watchdog tick (`tick_resolver` is called from the watchdog) — without the watchdog, an idle-due verdict would never fire when the user stops. `caret` is threaded through `OutcomeResolver::tick`. This replaced a single content-stability debounce that produced premature `Kept` (leading edge of backspace), premature `Abandoned` (mid-retype empty span), and silent non-resolution (user stops, no tick).
+
+**Known limitations:**
+- **Long in-place replacements vs `ABANDONED_CARET_MARGIN`.** Abandoned is held off while the caret stays within the margin (default 8 chars) of a wiped token's start. Retyping a replacement **longer than the margin** *without sealing it* (no boundary typed) and then pausing past the abandon idle can mis-fire `Abandoned`. Normal retypes seal (a space/punctuation) → `CorrectedToOther` fires first, so this only bites unsealed long edits. Tune the margin if real usage hits it.
+- **Selection-replace is not covered.** Mouse-select-and-overwrite corrections (select a word, type over it) may not move the caret *through* the token's region the way backspace-then-retype does — and selection events may not even reach the engine via the sidecar (the L1 tap streams keystrokes, not selection/caret state). So a select-and-replace correction can still resolve `Kept` and miss the slip. **TODO:** add a selection-aware signal in a future iteration.
+
+### Motor map (5c) — v0 design notes
+
+The motor map (`crates/correction-engine/src/motor_map.rs`) is the engine's first per-user learner: a `HashMap<char, SlipDistribution>` keyed by *intended* character, built passively from resolved `Kept` / `CorrectedToOther` outcomes (30-day half-life decay). It is **observe-and-store only** — the **L2→L3 kill-switch stays OFF**; nothing here feeds a correction back until the map is flipped manually after the gathered data looks sensible.
+
+**Persistence.** The live `~/.typeassist/motor_map.json` is flushed by `engine::flush_motor_map` on a **time cadence** (every `MOTOR_FLUSH_INTERVAL_MS`, 2s, when `MotorMap::has_unsaved()`), driven by the 1s watchdog. This is the primary durability path — the post-loop shutdown `save_to` does **not** reliably run under `tauri dev` (no `RunEvent`/exit hook in `lib.rs`, so the engine task is aborted at its await on app exit). **Dated snapshots** (`snapshots/YYYY-MM-DD.json`) are the durable history, independent of the live-file cadence, written per **Principle #6**: **daily** (the watchdog checks every ~10 min and writes when a day has elapsed) **plus one at startup before any writes** (preserving the as-loaded state). The per-day filename dedupes, so repeated launches keep the day's opening state. The Practice trend (`engine://practice-trend`) reads these dated files, so daily snapshots also give the trend daily (not weekly) granularity.
+
+Four conscious v0 simplifications — **intended behaviour, not bugs.** Don't "fix" them without a product decision:
+
+1. **Reads use `last_now`, not wall-clock.** `query_*` / `confidence` decay against the most recent observation time (the map's read methods take no `now`), so a query made long after the last keystroke shows slightly stale values. Fine live; revisit with a `refresh(now)` if cold queries ever matter.
+2. **Transpositions log as two substitutions, not a swap.** Alignment is plain Levenshtein (no Damerau transposition op, no spatial cost), so `teh→the` records as two subs — spurious cross-pair noise that washes out at scale. Revisit with Damerau-Levenshtein only if real data shows transpositions dominate.
+3. **Pruning at `1e-4` drops single-observation slips after ~390 days.** A slip seen once and never again decays below the prune floor (~13 half-lives) and is forgotten. This is the intended forgetting policy, not a leak.
+4. **Outcomes are observed per resolver transition, with no retraction.** The resolver is revisable (a record can flip `Kept` → `CorrectedToOther`); the proposer retracts on flip, but the motor map does not. So a word kept-then-corrected counts its `Kept` positives *and* the correction's matches/slips — a mild upward bias on confidence for re-edited words. Acceptable while the kill-switch is off and we're only gathering data; add retraction (or count only the final outcome at anchor retirement) before flipping.
 
 ## Ghost-key signals (L2)
 

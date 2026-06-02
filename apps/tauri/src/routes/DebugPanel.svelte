@@ -501,6 +501,24 @@
   type CaptureHealth = "unknown" | "live" | "unhealthy" | "stopped";
   let captureHealth: CaptureHealth = "unknown";
 
+  /// **C5c motor map** — the `StabilityReport` read-model from
+  /// `engine://motor-stability`: kill-switch inputs (sample coverage,
+  /// overall slip rate) + the weakest-keys preview Practice mode would
+  /// build a curriculum from. Emitted periodically (~30s) and on demand
+  /// (`request_motor_stability`, fired on mount so the readout populates
+  /// immediately rather than waiting for the first periodic tick). `null`
+  /// until the first emit; the map starts empty on a fresh session.
+  interface StabilityReport {
+    total_observations: number;
+    keys_tracked: number;
+    keys_well_sampled: number;
+    min_samples: number;
+    overall_slip_rate: number;
+    weakest: [string, number][];
+    generated_at: number;
+  }
+  let stability: StabilityReport | null = null;
+
   /// **C5c Layer A** — per-finger motor baseline snapshot, replaced
   /// wholesale on each `engine://motor-baseline` event. Renders as a
   /// stable 10-row table even before any data arrives.
@@ -903,6 +921,19 @@
         logRows = next;
       }),
     );
+    unlistens.push(
+      // C5c motor stability read-model. Replaced wholesale on each emit
+      // (periodic ~30s + on-demand). Drives the always-visible MOTOR
+      // readout so the slip map can be sanity-checked as it accumulates.
+      await listen<StabilityReport>("engine://motor-stability", (e) => {
+        stability = e.payload;
+      }),
+    );
+    // Pull a fresh report now so the readout isn't blank until the first
+    // periodic tick (it's a read-only request — emits, changes nothing).
+    void invoke("request_motor_stability").catch((err) =>
+      console.error("request_motor_stability failed:", err),
+    );
   });
 
   onDestroy(() => {
@@ -927,6 +958,10 @@
   function fmtKeyFinger(row: { hand: Hand | null; finger: Finger | null }): string {
     if (!row.hand || !row.finger) return "—";
     return fmtFinger(row.hand, row.finger);
+  }
+  /// Slip rate (0–1) → one-decimal percent for the MOTOR readout.
+  function fmtSlipPct(rate: number): string {
+    return `${(rate * 100).toFixed(1)}%`;
   }
   /// Compose a token's raw form for display: leading + core + trailing,
   /// with core highlighted (the brief: span anchor tracks core only).
@@ -1184,6 +1219,41 @@
     <div class="spacer" />
     <button type="button" class="clear" on:click={clear}>Clear</button>
   </header>
+
+  <!-- C5c MOTOR stability readout. Always visible (funnel spirit) so the
+       slip map can be sanity-checked as it accumulates. Updates on the
+       engine's periodic ~30s emit + the on-mount request. Headline numbers
+       are the kill-switch inputs; the weakest list is Practice's source. -->
+  <div class="motor-readout" aria-label="Motor map stability">
+    <span class="stat-label">MOTOR</span>
+    {#if stability}
+      <span class="motor-stat" title="Lifetime observations folded into the motor map">
+        obs <b>{stability.total_observations}</b>
+      </span>
+      <span
+        class="motor-stat"
+        title="Keys with ≥{stability.min_samples} decayed samples (earned a slip rate), of {stability.keys_tracked} tracked"
+      >
+        sampled <b>{stability.keys_well_sampled}/{stability.keys_tracked}</b>
+      </span>
+      <span class="motor-stat" title="Decayed slip rate across well-sampled keys">
+        slip <b>{fmtSlipPct(stability.overall_slip_rate)}</b>
+      </span>
+      <span class="motor-sep">·</span>
+      <span class="motor-stat">weakest</span>
+      {#if stability.weakest.length > 0}
+        {#each stability.weakest as [k, rate] (k)}
+          <span class="motor-key" title="{fmtKey(k)} slips {fmtSlipPct(rate)}"
+            >{fmtKey(k)} {fmtSlipPct(rate)}</span
+          >
+        {/each}
+      {:else}
+        <span class="motor-empty">no well-sampled keys yet</span>
+      {/if}
+    {:else}
+      <span class="motor-empty">waiting for first report…</span>
+    {/if}
+  </div>
 
   <div class="body">
     <!-- Left column: live event feed (scrolls independently). -->
@@ -1919,6 +1989,31 @@
   }
   .clear:hover { background: #353c45; }
   .clear:focus { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+
+  /* ---- C5c motor stability readout (always-visible bar) ---------------- */
+  .motor-readout {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0.45rem 0.9rem;
+    padding: 0.4rem 0.9rem;
+    background: #12161b;
+    border-bottom: 1px solid #2a2f36;
+    color: #c9d1d9;
+  }
+  .motor-stat { color: #7f8a96; }
+  .motor-stat b { color: #e6e6e6; font-weight: 600; }
+  .motor-sep { color: #3a414a; }
+  .motor-key {
+    color: #e6e6e6;
+    background: #2a2f36;
+    border: 1px solid #3a414a;
+    border-radius: 4px;
+    padding: 0.05rem 0.4rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .motor-empty { color: #7f8a96; font-style: italic; }
 
   /* ---- Two equal columns: feed | model state --------------------------- */
   .body {

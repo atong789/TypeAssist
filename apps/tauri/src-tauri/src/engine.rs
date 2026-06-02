@@ -33,13 +33,15 @@ use std::time::Instant;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::path::{Path, PathBuf};
+
 use behavioural_model::{BehaviouralModel, InputEvent};
 use correction_engine::{
     decide, has_motor_evidence, measure_token_motor, ranked_known_candidates, score_candidates,
     should_log, AnchorTracker, Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome,
-    Lexicon, LexiconProposer, OutcomeResolver, ScoredCandidate, Token,
-    TokenKind, Tokenizer, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
-    SCORE_VERSION,
+    Lexicon, LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver,
+    ScoredCandidate, StabilityReport, Token, TokenKind, Tokenizer, ACTIVE_TIER, CANDIDATES_VERSION,
+    DECISION_VERSION, LEXICON_VERSION, SCORE_VERSION,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
@@ -142,6 +144,19 @@ pub const EVT_MOTOR_BASELINE: &str = "engine://motor-baseline";
 /// dwell + IKI + co-activation dimensions. Skipped for non-typing
 /// keys (`finger_for` returned `None`) — no anomaly to compute.
 pub const EVT_MOTOR_KEYSTROKE: &str = "engine://motor-keystroke";
+/// **C5c motor map.** The [`StabilityReport`] read-model — kill-switch
+/// inputs (sample coverage, overall slip rate) plus the weakest-keys preview
+/// Practice mode consumes. Emitted periodically by the watchdog and on
+/// demand via [`EngineControl::RequestMotorStability`]. Exposes the data;
+/// the kill-switch itself is not built.
+pub const EVT_MOTOR_STABILITY: &str = "engine://motor-stability";
+/// **Practice trend.** Per-key slip-rate series reconstructed from the daily
+/// motor-map snapshots (`~/.typeassist/snapshots/*.json`) — the data behind the
+/// Practice snapshot's "where these keys are heading". Emitted on demand via
+/// [`EngineControl::RequestPracticeTrend`]. Daily granularity, and each key
+/// carries only the days it had enough samples to be trustworthy, so
+/// a key with <2 points simply renders no trend (graceful, never invented).
+pub const EVT_PRACTICE_TREND: &str = "engine://practice-trend";
 /// **C5 capture-health.** Engine-derived view of the sidecar's
 /// capture state. Emitted whenever the state transitions — NOT on
 /// every heartbeat. Panel renders a header pill so silent capture
@@ -237,6 +252,18 @@ pub enum EngineControl {
     /// sidecar process) when no heartbeat arrives within the
     /// soft-restart timeout.
     RestartCapture,
+    /// **C5c motor stability request.** Ask the engine to emit the current
+    /// [`StabilityReport`] on [`EVT_MOTOR_STABILITY`] immediately — Practice
+    /// mode pulls fresh weakest-keys at session start; the (future)
+    /// kill-switch reads the coverage/slip-rate inputs. Read-only: emits
+    /// data, changes nothing.
+    RequestMotorStability,
+    /// **Practice trend request.** Reconstruct the per-key slip-rate trend for
+    /// `keys` from the daily snapshot archives and emit it on
+    /// [`EVT_PRACTICE_TREND`]. Practice asks for this at the snapshot, for the
+    /// keys the round leaned into. Read-only: reads on-disk history, changes
+    /// nothing.
+    RequestPracticeTrend { keys: Vec<char> },
 }
 
 /// Tauri-managed handle for sending [`EngineControl`] messages to
@@ -413,6 +440,315 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// **Capture-integrity funnel** (CLAUDE.md Principle #8 — capture integrity
+/// is observable, not assumed). Cumulative per-session counters at each
+/// pipeline boundary so the conversion ratio between adjacent stages is
+/// auditable: `received → accepted → sealed → verdict → observe → save`.
+/// A break in any ratio localises a silent drop. Task-local — reset each
+/// engine session; not persisted.
+#[derive(Debug, Default)]
+struct Funnel {
+    /// L1: raw Key/Backspace events received from the sidecar.
+    keystrokes_received: u64,
+    /// After filtering (modifier/Cmd-Ctrl drops, non-text nav, pause).
+    keystrokes_accepted: u64,
+    /// Fresh Word/Acronym seals (a new anchor registered). Replay re-seals
+    /// are NOT counted (they re-tokenise existing content), so this is the
+    /// distinct-word count.
+    tokens_sealed: u64,
+    /// Admitted to the C5c **motor ledger** — every fresh, motor-evidenced
+    /// sealed word (known included). The stage between sealing and the
+    /// motor verdict; the gate is just motor evidence (no lexicon Known-skip),
+    /// so `admitted ≈ sealed` minus paste / zero-dwell. (Principle #8: the
+    /// new boundary is observable.)
+    records_admitted: u64,
+    /// 5a verdicts emitted (from the MOTOR ledger), by outcome (revisable: a
+    /// record can re-resolve, so totals can exceed `tokens_sealed`). The motor
+    /// ledger is candidate-agnostic, so `corr_sug` is always 0 here.
+    v_kept: u64,
+    v_corr_sug: u64,
+    v_corr_oth: u64,
+    v_abandoned: u64,
+    /// 5c char-level observations folded into the motor map.
+    motor_kept: u64,
+    motor_slip: u64,
+    /// Successful `motor_map.json` flushes.
+    motor_saves: u64,
+    /// Session start (ms since epoch), stamped at task spawn.
+    session_started_ms: u64,
+}
+
+impl Funnel {
+    fn new(now: u64) -> Self {
+        Self {
+            session_started_ms: now,
+            ..Default::default()
+        }
+    }
+
+    /// Emit the structured funnel line to the log. Same output for both
+    /// callers (the Cmd+Shift+F chord and the 60s auto-dump).
+    fn dump(&self) {
+        tracing::info!(
+            "FUNNEL_DUMP {{ c_keystrokes_received: {}, c_keystrokes_accepted: {}, \
+             c_tokens_sealed: {}, c_records_admitted: {}, c_verdicts_resolved: {{kept: {}, \
+             corr_sug: {}, corr_oth: {}, abandoned: {}}}, c_motor_observations: {{kept: {}, \
+             slip: {}}}, c_motor_saves: {}, session_started_at: {} }}",
+            self.keystrokes_received,
+            self.keystrokes_accepted,
+            self.tokens_sealed,
+            self.records_admitted,
+            self.v_kept,
+            self.v_corr_sug,
+            self.v_corr_oth,
+            self.v_abandoned,
+            self.motor_kept,
+            self.motor_slip,
+            self.motor_saves,
+            self.session_started_ms,
+        );
+    }
+
+    /// Zero every counter and restamp the run start — closes a measurement
+    /// run and opens a fresh one (Principle #8: counters reconciled **per
+    /// run**, never conflated across runs). Logs a `FUNNEL_RESET` marker so
+    /// run boundaries are visible when reconstructing from the log. Called
+    /// by the explicit dump chord (after the dump) and the reset chord.
+    fn reset(&mut self, now: u64) {
+        *self = Funnel::new(now);
+        tracing::info!("FUNNEL_RESET — counters zeroed, new run from {}", now);
+    }
+}
+
+// ---- Component 5c motor-map persistence paths + cadence --------------------
+//
+// The L4 crate is deliberately path-agnostic (it stays portable); the host
+// resolves the concrete `~/.typeassist/...` locations here. macOS-only for
+// now, so HOME is sufficient — a Windows adapter would resolve differently.
+
+/// `~/.typeassist`, or `None` if HOME is unset (the map then runs in-memory
+/// only — no durable file this session).
+fn typeassist_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".typeassist"))
+}
+
+/// `~/.typeassist/motor_map.json` — the live, periodically-saved map.
+fn motor_map_path() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("motor_map.json"))
+}
+
+/// `~/.typeassist/snapshots` — the daily dated archive directory.
+fn snapshots_dir() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("snapshots"))
+}
+
+/// Minimum interval between live motor-map flushes when there are unsaved
+/// observations. The watchdog checks every 1s; flushing at most this often
+/// bounds force-quit data loss to ~this window while keeping disk writes
+/// modest during continuous typing. See [`flush_motor_map`].
+const MOTOR_FLUSH_INTERVAL_MS: u64 = 2_000;
+
+/// Watchdog ticks between periodic `EVT_MOTOR_STABILITY` emits. The report
+/// changes slowly, so 30 s keeps a passive consumer (debug panel) current
+/// without spam; Practice pulls fresh on demand via the control command.
+const MOTOR_STABILITY_EMIT_TICKS: u64 = 30;
+
+/// How many weakest keys the [`StabilityReport`] preview carries (Practice
+/// curriculum source). A handful is plenty — Practice shows a few at a time.
+const WEAKEST_PREVIEW_N: usize = 8;
+
+/// UTC civil date `(year, month, day)` from ms-since-epoch. Howard
+/// Hinnant's `civil_from_days` — exact, branch-light, no date crate.
+fn ymd_from_epoch_ms(ms: u64) -> (i64, u32, u32) {
+    let days = (ms / 86_400_000) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Inverse of [`ymd_from_epoch_ms`] (midnight UTC) — `days_from_civil`.
+/// Used to compare existing dated snapshots against the daily cadence.
+fn epoch_ms_from_ymd(y: i64, m: u32, d: u32) -> u64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m as i64 - 3 } else { m as i64 + 9 }; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146_097 + doe - 719_468;
+    (days.max(0) as u64) * 86_400_000
+}
+
+/// `YYYY-MM-DD` for the snapshot filename stem.
+fn snapshot_date(ms: u64) -> String {
+    let (y, m, d) = ymd_from_epoch_ms(ms);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Parse a `YYYY-MM-DD.json` snapshot filename back to a civil date, or
+/// `None` if it isn't one. Lets the cadence survive app restarts (seeded
+/// from the newest file on disk rather than an in-memory-only timestamp).
+fn parse_snapshot_date(filename: &str) -> Option<(i64, u32, u32)> {
+    let stem = filename.strip_suffix(".json")?;
+    let mut parts = stem.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+/// How many well-sampled keys to pull from each historical snapshot when
+/// building a trend. Large enough to cover any key the user might have
+/// practiced (a stability report only carries gated, trustworthy keys).
+const TREND_LOOKUP_N: usize = 64;
+
+/// Minimum slip rate for a key to count as "worth practicing" and light the
+/// tray dot. The dot reflects MOTOR-MAP STATE (is there a genuinely weak key?),
+/// not "did the user practice today" — so it keys off the worst slip rate, not
+/// merely whether any key has enough samples. **Tunable.** Starting at 5%: a
+/// clean typist (e.g. all keys <1% slip) shows no dot, which is honest; a
+/// recovering hand with a 20–40% slip on a slow finger lights it clearly.
+const PRACTICE_DOT_SLIP_THRESHOLD: f32 = 0.05;
+
+/// Reflect "weak keys worth practicing" in the menu-bar icon by swapping
+/// between the plain and badge-dot **template** images. The signal is the
+/// dot's SHAPE, not colour (a template icon is monochrome), so it reads for
+/// colour-blind users too. Only touches the OS when the state actually
+/// changes, tracked via `last`.
+fn update_tray_dot<R: Runtime>(
+    app: &AppHandle<R>,
+    last: &mut Option<bool>,
+    report: &StabilityReport,
+) {
+    // `weakest` is sorted worst-first, so the head is the highest slip rate.
+    // Light the dot only when that clears the "worth practicing" bar.
+    let want_dot = report
+        .weakest
+        .first()
+        .is_some_and(|(_, slip_rate)| *slip_rate >= PRACTICE_DOT_SLIP_THRESHOLD);
+    if *last == Some(want_dot) {
+        return;
+    }
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let icon = if want_dot {
+            tauri::include_image!("icons/tray-icon-dot.png")
+        } else {
+            tauri::include_image!("icons/tray-icon.png")
+        };
+        let _ = tray.set_icon(Some(icon));
+        let _ = tray.set_icon_as_template(true);
+        *last = Some(want_dot);
+    }
+}
+
+/// One `(date, slip_rate)` sample in a key's [`PracticeTrend`] series.
+#[derive(Serialize, Clone)]
+struct TrendPoint {
+    /// `YYYY-MM-DD` of the daily snapshot this point came from.
+    date: String,
+    /// Decayed slip rate for the key as of that snapshot, `[0,1]`.
+    slip_rate: f32,
+}
+
+/// A single key's slip-rate trend across the daily snapshots. `points` holds
+/// only the weeks where the key cleared the sample bar — so a sparse history is
+/// honest rather than back-filled with invented numbers.
+#[derive(Serialize, Clone)]
+struct KeyTrend {
+    key: char,
+    points: Vec<TrendPoint>,
+}
+
+/// Payload for [`EVT_PRACTICE_TREND`].
+#[derive(Serialize, Clone)]
+struct PracticeTrend {
+    keys: Vec<KeyTrend>,
+    generated_at: u64,
+}
+
+/// Reconstruct a per-key slip-rate trend from the daily snapshot archives.
+/// Loads each dated snapshot, reads its gated stability report, and records a
+/// point for each requested key that the snapshot sampled well enough to trust.
+/// Pure read of on-disk history — touches no live state. Returns an empty
+/// series (no points) when the directory is missing or holds < 1 snapshot.
+fn build_practice_trend(dir: Option<&Path>, keys: &[char], now: u64) -> PracticeTrend {
+    let mut series: Vec<KeyTrend> = keys
+        .iter()
+        .map(|&key| KeyTrend {
+            key,
+            points: vec![],
+        })
+        .collect();
+
+    if let Some(dir) = dir {
+        // Collect dated snapshots oldest → newest so each series reads in time
+        // order (the trend line is drawn left = older, right = newer).
+        let mut dated: Vec<(u64, PathBuf, String)> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let s = name.to_str()?;
+                let (y, m, d) = parse_snapshot_date(s)?;
+                Some((epoch_ms_from_ymd(y, m, d), entry.path(), s.to_string()))
+            })
+            .collect();
+        dated.sort_by_key(|(ms, _, _)| *ms);
+
+        for (_, path, filename) in &dated {
+            let Ok(snap) = MotorMap::load_from(path) else {
+                continue;
+            };
+            // The gated weakest list is exactly "keys with a trustworthy slip
+            // rate" — reuse it as the per-key lookup for this snapshot.
+            let lookup: std::collections::HashMap<char, f32> = snap
+                .stability_report(TREND_LOOKUP_N)
+                .weakest
+                .into_iter()
+                .collect();
+            let date = filename.strip_suffix(".json").unwrap_or(filename);
+            for kt in &mut series {
+                if let Some(&slip_rate) = lookup.get(&kt.key) {
+                    kt.points.push(TrendPoint {
+                        date: date.to_string(),
+                        slip_rate,
+                    });
+                }
+            }
+        }
+    }
+
+    PracticeTrend {
+        keys: series,
+        generated_at: now,
+    }
+}
+
+/// The newest dated snapshot in `dir`, as ms-since-epoch — `None` if the
+/// directory is missing/empty or holds no parseable dated file.
+fn most_recent_snapshot_ms(dir: &Path) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        if let Some((y, m, d)) = name.to_str().and_then(parse_snapshot_date) {
+            let ms = epoch_ms_from_ymd(y, m, d);
+            best = Some(best.map_or(ms, |b| b.max(ms)));
+        }
+    }
+    best
+}
+
 /// Payload for [`EVT_LEXICON_PROPOSAL`]. `proposal: None` means the
 /// proposal was retracted (its only contributing record rolled back
 /// under C5a's revisable transitions).
@@ -454,36 +790,48 @@ struct MotorKeystrokeEvent {
     anomaly: Option<behavioural_model::motor_baseline::KeystrokeAnomaly>,
 }
 
-/// Run one [`OutcomeResolver`] pass and surface every transition,
-/// including the C5b proposer side-effects. The resolver is a pure
-/// observer; this helper:
-///   1. Applies any resolved transitions to the ledger.
-///   2. Broadcasts each updated record on [`EVT_LOG_RECORD_UPDATED`].
-///   3. Re-notes each updated record into the proposer and emits
-///      [`EVT_LEXICON_PROPOSAL`] if the word's proposal changed.
+/// Run the outcome resolver and surface every transition. **Two passes,
+/// two ledgers, one shared verdict machine** (the C5c decoupling):
 ///
-/// Called from every anchor-affecting site: once a fresh anchor lands
-/// (so the debounce timer starts ticking), and once after each edit
-/// that might move a record's outcome.
+///   * **Decision pass (C5b).** Resolves the [`DecisionLedger`] — *unknown*
+///     words only (gated by `should_log`). Applies transitions, broadcasts
+///     `EVT_LOG_RECORD_UPDATED`, re-notes the lexicon proposer. The motor
+///     map is NOT fed here.
+///   * **Motor pass (C5c).** Resolves the [`MotorLedger`] — *every*
+///     motor-evidenced word (known included), candidate-agnostic. Each
+///     `Kept` / `CorrectedToOther` is folded into `motor_map` (the funnel's
+///     verdict + observation counters live here, since this is the capture
+///     pipeline Principle #8 reconciles). A `MotorRecord` never carries a
+///     candidate, so every correction reads as a `CorrectedToOther` slip.
+///
+/// Each uses its own resolver instance (independent stability caches). Both
+/// run on every anchor-affecting edit AND the idle watchdog. Live-map
+/// persistence is NOT done here — [`flush_motor_map`] handles it on a timer.
+#[allow(clippy::too_many_arguments)]
 fn tick_resolver<R: Runtime>(
     app: &AppHandle<R>,
     resolver: &mut OutcomeResolver,
+    motor_resolver: &mut OutcomeResolver,
     anchors: &AnchorTracker,
     line_buf: &[char],
+    caret: usize,
     ledger: &mut DecisionLedger,
+    motor_ledger: &mut MotorLedger,
     proposer: &mut LexiconProposer,
+    motor_map: &mut MotorMap,
+    funnel: &mut Funnel,
 ) {
-    let changes = resolver.tick(now_ms(), anchors.anchors(), line_buf, ledger);
-    for (record_id, outcome) in changes {
-        tracing::info!("RESOLVE_OUTCOME rid={} -> {:?}", record_id, outcome);
+    let now = now_ms();
+
+    // --- Decision pass (C5b lexicon proposer): unknown words only. ---
+    let dchanges = resolver.tick(now, anchors.anchors(), line_buf, caret, ledger.iter());
+    for (record_id, outcome) in dchanges {
+        tracing::info!("DECISION_VERDICT rid={} -> {:?}", record_id, outcome);
         if ledger.resolve_outcome(record_id, outcome) {
-            // Write the `credited` slot BEFORE the emit so the panel
-            // sees the right value on the same event. Kept → reflects
-            // the proposer's pause state at note-time (which is also
-            // what note_record itself will read inside
-            // emit_proposal_change). Non-Kept → None, since those
-            // outcomes never contribute regardless of pause.
-            let credited = if matches!(outcome, correction_engine::Outcome::Kept) {
+            // Write the `credited` slot BEFORE the emit so the panel sees the
+            // right value on the same event. Kept → reflects the proposer's
+            // pause state at note-time; non-Kept → None.
+            let credited = if matches!(outcome, Outcome::Kept) {
                 Some(!proposer.credit_paused())
             } else {
                 None
@@ -493,6 +841,93 @@ fn tick_resolver<R: Runtime>(
                 let _ = app.emit(EVT_LOG_RECORD_UPDATED, rec.clone());
                 emit_proposal_change(app, proposer, &rec);
             }
+        }
+    }
+
+    // --- Motor pass (C5c motor map): EVERY motor-evidenced word. ---
+    let mchanges =
+        motor_resolver.tick(now, anchors.anchors(), line_buf, caret, motor_ledger.iter());
+    for (record_id, outcome) in mchanges {
+        tracing::info!("RESOLVE_OUTCOME rid={} -> {:?}", record_id, outcome);
+        if motor_ledger.resolve_outcome(record_id, outcome) {
+            // Funnel (Principle #8): a verdict was assigned in the capture
+            // pipeline. Counts transitions, so revisions can tally > once.
+            match outcome {
+                Outcome::Kept => funnel.v_kept += 1,
+                Outcome::CorrectedToSuggestion => funnel.v_corr_sug += 1,
+                Outcome::CorrectedToOther => funnel.v_corr_oth += 1,
+                Outcome::Abandoned => funnel.v_abandoned += 1,
+                Outcome::Pending => {}
+            }
+            if let Some(rec) = motor_ledger.get(record_id).cloned() {
+                // Fold the outcome into the motor map (observe-and-store
+                // only; the kill-switch stays off).
+                let report = match outcome {
+                    Outcome::Kept => {
+                        motor_map.observe_outcome(outcome, &rec.original_text, None, now)
+                    }
+                    Outcome::CorrectedToOther => {
+                        let corrected = correction_engine::resolver::post_edit_text(
+                            &rec,
+                            anchors.anchors(),
+                            line_buf,
+                        );
+                        motor_map.observe_outcome(
+                            outcome,
+                            &rec.original_text,
+                            corrected.as_deref(),
+                            now,
+                        )
+                    }
+                    // Abandoned / Pending carry no key-for-key intent in v0.
+                    // (CorrectedToSuggestion never arises from the motor ledger.)
+                    _ => ObserveReport::default(),
+                };
+                // Funnel: char-level observations folded in (5c boundary).
+                funnel.motor_kept += u64::from(report.correct);
+                funnel.motor_slip += u64::from(report.slips);
+            }
+        }
+    }
+}
+
+/// Flush the live motor map to disk if it has unsaved observations and at
+/// least [`MOTOR_FLUSH_INTERVAL_MS`] has passed since the last save.
+/// Driven by the watchdog so the live file is maintained on a time cadence
+/// — closing the data-loss window that the (unreliable) shutdown save and
+/// the coarse 100-observation mark leave open. `last_save_ms` is advanced
+/// only on a successful write, so a failed write retries next tick.
+///
+/// Returns `true` iff a write succeeded this call (so the caller can bump
+/// the capture funnel's `c_motor_saves`).
+fn flush_motor_map(
+    motor_map: &mut MotorMap,
+    path: Option<&Path>,
+    now: u64,
+    last_save_ms: &mut u64,
+) -> bool {
+    if !motor_map.has_unsaved() {
+        return false;
+    }
+    if now.saturating_sub(*last_save_ms) < MOTOR_FLUSH_INTERVAL_MS {
+        return false;
+    }
+    let Some(path) = path else {
+        return false; // no HOME — in-memory only this session
+    };
+    match motor_map.save_to(path) {
+        Ok(()) => {
+            *last_save_ms = now;
+            tracing::info!(
+                "MOTOR_MAP_SAVED (flush) obs={} path={:?}",
+                motor_map.total_observations(),
+                path
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!("motor map flush save failed: {e}");
+            false
         }
     }
 }
@@ -546,8 +981,10 @@ fn emit_sealed_token<R: Runtime>(
     lexicon: &Lexicon,
     map: &VolatilityMap,
     ledger: &mut DecisionLedger,
+    motor_ledger: &mut MotorLedger,
     line_dwells: &[u32],
     proposer: &mut LexiconProposer,
+    funnel: &mut Funnel,
 ) {
     // C5b acronym fix: route `Acronym` tokens through the same L4
     // pipeline as `Word`. All-caps product names (UPI, BBMP, ONDC) were
@@ -584,6 +1021,10 @@ fn emit_sealed_token<R: Runtime>(
             let _ = app.emit(EVT_TOKEN, tok);
             return;
         };
+
+        // Funnel (Principle #8): a fresh Word/Acronym seal. Counted here —
+        // the single fresh-seal chokepoint — so replays don't inflate it.
+        funnel.tokens_sealed += 1;
 
         // C5b casing baseline. Count only fresh seals so backspace
         // replays don't double-count. Includes known-word seals — the
@@ -653,11 +1094,25 @@ fn emit_sealed_token<R: Runtime>(
             },
         );
 
-        // Component 4 — append to the decision ledger if the gates pass.
-        // Two gates: (a) UNKNOWN-word filter via `should_log`; (b) motor
-        // evidence via per-char dwells in this token's span. The privacy
-        // guarantee is structural: no motor evidence → no ledger entry.
+        // Motor evidence: per-char dwells on this token's span. The privacy
+        // guarantee is structural — no motor evidence (pasted / synthetic
+        // text, dwell == 0) → no record in either ledger.
         let has_motor = has_motor_evidence(line_dwells, tok.start, tok.end);
+
+        // Component 5c — MOTOR ledger admission. Unlike the decision ledger
+        // (unknown words only, for the lexicon proposer), the motor map wants
+        // EVERY motor-evidenced word — a cleanly-typed known word is prime
+        // motor data. Gate is motor evidence alone (no Known-skip). One lean
+        // record per fresh seal; the shared resolver verdicts it and the
+        // motor map observes it (in `tick_resolver`'s motor pass).
+        if has_motor {
+            motor_ledger.append(now_ms(), anchor_id, tok.core.clone());
+            funnel.records_admitted += 1;
+        }
+
+        // Component 4 — decision ledger (C5b lexicon proposer): UNKNOWN words
+        // only, via `should_log`'s Known-skip. This gate stays where it
+        // belongs — it's a lexicon concern, not a capture one.
         if should_log(&outcome, has_motor) {
             let ts = now_ms();
             // C5b fix: candidate-INDEPENDENT motor signal computed
@@ -699,7 +1154,6 @@ fn emit_sealed_token<R: Runtime>(
     }
     let _ = app.emit(EVT_TOKEN, tok);
 }
-
 
 /// Build the lexicon-row payload for a Word token. Pure function — pulled
 /// out so the v2 "membership vs frequency" invariant can be pinned by
@@ -875,8 +1329,7 @@ pub fn spawn<R: Runtime>(
     // Control channel: Tauri commands → engine task. Unbounded so the
     // UI thread is never blocked. The returned sender is `manage`d by
     // Tauri and cloned per command invocation.
-    let (control_tx, mut control_rx) =
-        tokio::sync::mpsc::unbounded_channel::<EngineControl>();
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<EngineControl>();
 
     tauri::async_runtime::spawn(async move {
         // L2 lives here for the life of the engine. Single owner, single async
@@ -919,6 +1372,11 @@ pub fn spawn<R: Runtime>(
         // Pending until the next key arrives — fine for the debug
         // panel; revisit if real users notice.
         let mut resolver = OutcomeResolver::new();
+        // C5c motor resolver — a SECOND resolver instance with its own
+        // stability cache, resolving the motor ledger (every word). Kept
+        // separate from the decision resolver so the two passes never share
+        // per-anchor state. See `tick_resolver`.
+        let mut motor_resolver = OutcomeResolver::new();
         // L4 Observing brief, Component 5b Phase 1: lexicon proposer.
         // Watches Kept outcomes from the resolver, classifies each
         // word's promotion lane and motor verdict, and emits per-word
@@ -928,6 +1386,77 @@ pub fn spawn<R: Runtime>(
         // contribution so a kept-then-corrected word never stays
         // promoted.
         let mut proposer = LexiconProposer::new();
+        // L4 Observing brief, Component 5c: motor map. Learns this user's
+        // per-key slip distribution from resolved Kept / CorrectedToOther
+        // outcomes (fed in `tick_resolver`). Loaded from disk on startup;
+        // saved every 100 observations + on graceful shutdown; a DAILY dated
+        // snapshot is written by the watchdog, plus one at startup before any
+        // writes (Principle #6 — every meaningful state is preserved).
+        // **Observe-and-store only** — the L2→L3 kill-switch stays OFF; nothing
+        // here feeds a correction back. Paths resolve under `~/.typeassist`;
+        // `None` (HOME unset) degrades to an in-memory map with no durability.
+        let motor_map_path = motor_map_path();
+        let snapshots_dir = snapshots_dir();
+        let mut motor_map = match motor_map_path.as_deref() {
+            Some(path) if path.exists() => match MotorMap::load_from(path) {
+                Ok(map) => {
+                    tracing::info!(
+                        "MOTOR_MAP_LOADED obs={} keys={} path={:?}",
+                        map.total_observations(),
+                        map.len(),
+                        path
+                    );
+                    map
+                }
+                Err(e) => {
+                    // Don't clobber a possibly-recoverable file by silently
+                    // starting fresh — surface it and keep going in memory.
+                    tracing::warn!("motor map load failed ({e}); starting fresh in memory");
+                    MotorMap::new()
+                }
+            },
+            _ => MotorMap::new(),
+        };
+        // C5c motor ledger — the motor map's own record stream: EVERY
+        // motor-evidenced sealed word (known included), lean records the
+        // shared resolver verdicts. Decouples the motor map from the
+        // decision ledger's lexicon Known-skip (the sealed→verdict cliff).
+        // In-memory only, like the decision ledger.
+        let mut motor_ledger = MotorLedger::new();
+        // Daily-snapshot bookkeeping (Principle #6): the calendar date whose
+        // snapshot we've already handled this run, seeded from the newest dated
+        // file on disk so the first event of a *new* calendar day is detected
+        // correctly across restarts.
+        let mut last_snapshot_date: Option<(i64, u32, u32)> = snapshots_dir
+            .as_deref()
+            .and_then(most_recent_snapshot_ms)
+            .map(ymd_from_epoch_ms);
+        // **Startup snapshot (Principle #6).** Preserve the as-loaded state
+        // BEFORE the loop mutates the live map, so every launch leaves a
+        // checkpoint — even a session that crashes before its first flush.
+        // Dated files are NEVER overwritten or deleted by the engine: write
+        // today's only if absent, so snapshots accumulate as durable history.
+        if let Some(dir) = snapshots_dir.as_deref() {
+            let now = now_ms();
+            let today = dir.join(format!("{}.json", snapshot_date(now)));
+            if !today.exists() {
+                let _ = std::fs::create_dir_all(dir);
+                match motor_map.write_snapshot(&today) {
+                    Ok(()) => tracing::info!("MOTOR_SNAPSHOT_STARTUP path={today:?}"),
+                    Err(e) => tracing::warn!("startup motor snapshot failed: {e}"),
+                }
+            }
+            // Mark today handled (whether we wrote or it already existed), so
+            // the watchdog only acts when the calendar day rolls over.
+            last_snapshot_date = Some(ymd_from_epoch_ms(now));
+        }
+        // Last time the live motor map was flushed to disk. Drives the
+        // periodic flush (see `flush_motor_map`); 0 means "never this
+        // session" so the first dirty watchdog tick flushes promptly.
+        let mut last_motor_save_ms: u64 = 0;
+        // Capture-integrity funnel (Principle #8). Per-session boundary
+        // counters; dumped on the Cmd+Shift+F chord and every 60s.
+        let mut funnel = Funnel::new(now_ms());
         // L4 lexicon (Component 3a). Process-wide singleton — first touch
         // parses the ~50k-entry bundled list; subsequent reads are HashMap
         // lookups. Read-only this slice: scoring/correction come later.
@@ -974,6 +1503,10 @@ pub fn spawn<R: Runtime>(
         let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(1));
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut watchdog_ticks: u64 = 0;
+
+        // Last menu-bar dot state (Some(true) = dot shown). `None` until the
+        // first stability emit, so the icon is set once we know the state.
+        let mut last_tray_dot: Option<bool> = None;
 
         // The receive loop selects between the sidecar event stream,
         // the control channel, and the capture-health watchdog so:
@@ -1045,6 +1578,16 @@ pub fn spawn<R: Runtime>(
                     // telling us what state it's in. Continues the outer
                     // 'engine_loop so the next sidecar event (or control
                     // command) is awaited.
+                    // Funnel L1 boundary: count every raw typing event from
+                    // the sidecar BEFORE any filtering (pause / modifier /
+                    // non-text), so `received` is the true denominator.
+                    if matches!(
+                        parsed,
+                        InputEvent::Key { .. } | InputEvent::Backspace { .. }
+                    ) {
+                        funnel.keystrokes_received += 1;
+                    }
+
                     if input_paused
                         && matches!(
                             parsed,
@@ -1159,6 +1702,9 @@ pub fn spawn<R: Runtime>(
                         }
                         InputEvent::Shutdown => break 'engine_loop,
                         InputEvent::Backspace { .. } => {
+                            // Funnel: a backspace passed the pause filter and
+                            // enters the edit pipeline (not a modifier drop).
+                            funnel.keystrokes_accepted += 1;
                             // Emit so the debug feed shows backspaces — they're
                             // signal, not noise (CLAUDE.md: self-corrections).
                             let _ = app_handle.emit(
@@ -1204,8 +1750,10 @@ pub fn spawn<R: Runtime>(
                                         lexicon,
                                         model.slip_detector.map(),
                                         &mut ledger,
+                                        &mut motor_ledger,
                                         &line_dwells,
                                         &mut proposer,
+                                        &mut funnel,
                                     );
                                 }
                             }
@@ -1217,10 +1765,15 @@ pub fn spawn<R: Runtime>(
                             tick_resolver(
                                 &app_handle,
                                 &mut resolver,
+                                &mut motor_resolver,
                                 &anchors,
                                 &line_buf,
+                                caret,
                                 &mut ledger,
+                                &mut motor_ledger,
                                 &mut proposer,
+                                &mut motor_map,
+                                &mut funnel,
                             );
                             let snap = anchors.snapshot();
                             let _ = app_handle.emit(
@@ -1276,6 +1829,23 @@ pub fn spawn<R: Runtime>(
                                 single_char,
                                 Some(c) if is_non_text_key(c)
                             );
+
+                            // Diagnostic chords (Principle #8) — consumed here,
+                            // never reach the tokenizer / line buffer:
+                            //   Cmd+Shift+F → dump the funnel, then auto-reset
+                            //                 (closes this run, opens a fresh one).
+                            //   Cmd+Shift+R → reset only (start a run from zero).
+                            if modifiers.command && modifiers.shift {
+                                if matches!(single_char, Some('f') | Some('F')) {
+                                    funnel.dump();
+                                    funnel.reset(now_ms());
+                                    continue;
+                                }
+                                if matches!(single_char, Some('r') | Some('R')) {
+                                    funnel.reset(now_ms());
+                                    continue;
+                                }
+                            }
 
                             if is_non_text {
                                 // Caret-only handling. Left/Right/Home/End
@@ -1338,6 +1908,8 @@ pub fn spawn<R: Runtime>(
                                 match (ch_iter.next(), ch_iter.next()) {
                                     (Some(c), None) => {
                                         if c == '\n' || c == '\r' {
+                                            // Funnel: newline accepted as input.
+                                            funnel.keystrokes_accepted += 1;
                                             // True line reset. Tokens panel clears,
                                             // anchors are dropped. Any token the
                                             // newline sealed goes through the same
@@ -1354,8 +1926,10 @@ pub fn spawn<R: Runtime>(
                                                     lexicon,
                                                     model.slip_detector.map(),
                                                     &mut ledger,
+                                                    &mut motor_ledger,
                                                     &line_dwells,
                                                     &mut proposer,
+                                                    &mut funnel,
                                                 );
                                             }
                                             line_buf.clear();
@@ -1385,6 +1959,9 @@ pub fn spawn<R: Runtime>(
                                             else {
                                                 continue;
                                             };
+                                            // Funnel: a text char was accepted into
+                                            // the line buffer (past all filters).
+                                            funnel.keystrokes_accepted += 1;
                                             // C4 motor-evidence proxy: store this
                                             // char's dwell at the same index. A real
                                             // keystroke carries a non-zero dwell;
@@ -1403,8 +1980,10 @@ pub fn spawn<R: Runtime>(
                                                         lexicon,
                                                         model.slip_detector.map(),
                                                         &mut ledger,
+                                                        &mut motor_ledger,
                                                         &line_dwells,
                                                         &mut proposer,
+                                                        &mut funnel,
                                                     );
                                                 }
                                             } else {
@@ -1429,8 +2008,10 @@ pub fn spawn<R: Runtime>(
                                                             lexicon,
                                                             model.slip_detector.map(),
                                                             &mut ledger,
+                                                            &mut motor_ledger,
                                                             &line_dwells,
                                                             &mut proposer,
+                                                            &mut funnel,
                                                         );
                                                     }
                                                 }
@@ -1447,10 +2028,15 @@ pub fn spawn<R: Runtime>(
                                             tick_resolver(
                                                 &app_handle,
                                                 &mut resolver,
+                                                &mut motor_resolver,
                                                 &anchors,
                                                 &line_buf,
+                                                caret,
                                                 &mut ledger,
+                                                &mut motor_ledger,
                                                 &mut proposer,
+                                                &mut motor_map,
+                                                &mut funnel,
                                             );
                                             let snap = anchors.snapshot();
                                             let _ = app_handle.emit(
@@ -1666,6 +2252,25 @@ pub fn spawn<R: Runtime>(
                                 "engine input pause set to {input_paused}"
                             );
                         }
+                        EngineControl::RequestMotorStability => {
+                            // On-demand read-model emit (Practice pulls fresh
+                            // weakest-keys at session start). Read-only.
+                            let report: StabilityReport =
+                                motor_map.stability_report(WEAKEST_PREVIEW_N);
+                            update_tray_dot(&app_handle, &mut last_tray_dot, &report);
+                            let _ = app_handle.emit(EVT_MOTOR_STABILITY, report);
+                        }
+                        EngineControl::RequestPracticeTrend { keys } => {
+                            // Reconstruct the per-key trend from daily snapshot
+                            // archives. Read-only history scan; the Practice
+                            // snapshot renders a key only if it has ≥2 points.
+                            let trend = build_practice_trend(
+                                snapshots_dir.as_deref(),
+                                &keys,
+                                now_ms(),
+                            );
+                            let _ = app_handle.emit(EVT_PRACTICE_TREND, trend);
+                        }
                     }
                 }
                 _ = watchdog.tick() => {
@@ -1677,6 +2282,60 @@ pub fn spawn<R: Runtime>(
                     // reloads converge to truth without waiting for a
                     // transition.
                     watchdog_ticks = watchdog_ticks.wrapping_add(1);
+
+                    // C5a verdict state machine: Kept / Abandoned fire on
+                    // elapsed idle, so the resolver must tick even when no
+                    // keystroke arrives (the user paused after a gesture).
+                    // The keystroke handlers tick it on edits; this is the
+                    // idle driver. Cheap — walks the bounded ledger and
+                    // recomputes per-record observations.
+                    tick_resolver(
+                        &app_handle,
+                        &mut resolver,
+                        &mut motor_resolver,
+                        &anchors,
+                        &line_buf,
+                        caret,
+                        &mut ledger,
+                        &mut motor_ledger,
+                        &mut proposer,
+                        &mut motor_map,
+                        &mut funnel,
+                    );
+
+                    // Component 5c: maintain the live motor-map file on a
+                    // time cadence (not only every 100 obs / on shutdown,
+                    // which under `tauri dev` may never run — the task is
+                    // aborted at this await on app exit). Bounds force-quit
+                    // loss to ~MOTOR_FLUSH_INTERVAL_MS of observations.
+                    if flush_motor_map(
+                        &mut motor_map,
+                        motor_map_path.as_deref(),
+                        now_ms(),
+                        &mut last_motor_save_ms,
+                    ) {
+                        funnel.motor_saves += 1;
+                    }
+
+                    // Capture-integrity funnel (Principle #8): auto-dump
+                    // every 60s (watchdog ticks every 1s) so the funnel is
+                    // reconstructable from logs after the fact, in addition
+                    // to the on-demand Cmd+Shift+F chord.
+                    if watchdog_ticks % 60 == 0 {
+                        funnel.dump();
+                    }
+
+                    // C5c motor stability: periodic read-model emit so a
+                    // passive consumer (debug panel / future Practice) stays
+                    // current. Skip while the map is empty (nothing to say).
+                    if watchdog_ticks % MOTOR_STABILITY_EMIT_TICKS == 0 && !motor_map.is_empty() {
+                        let report: StabilityReport =
+                            motor_map.stability_report(WEAKEST_PREVIEW_N);
+                        // Tray "dot" reflects whether there are weak keys worth
+                        // practicing — shape, not colour (it's a template icon).
+                        update_tray_dot(&app_handle, &mut last_tray_dot, &report);
+                        let _ = app_handle.emit(EVT_MOTOR_STABILITY, report);
+                    }
 
                     // Compute desired state from heartbeat freshness.
                     let desired_health = match last_heartbeat_at {
@@ -1734,6 +2393,30 @@ pub fn spawn<R: Runtime>(
                             CaptureHealthEvent { state: current_capture_health },
                         );
                     }
+
+                    // Component 5c: daily motor-map snapshot (Principle #6).
+                    // The watchdog ticks every 1s and is the only periodic timer,
+                    // so it stands in for "the first event of a new calendar day":
+                    // when the date rolls over from the one we last handled, write
+                    // that day's snapshot. Dated files are NEVER overwritten — only
+                    // written if absent — so snapshots accumulate. The in-memory
+                    // date guard keeps this to a free compare on the common path
+                    // (a stat only when the day actually changes). No-op when HOME
+                    // is unset (snapshots_dir None).
+                    if let Some(dir) = snapshots_dir.as_deref() {
+                        let today = ymd_from_epoch_ms(now_ms());
+                        if last_snapshot_date != Some(today) {
+                            let path =
+                                dir.join(format!("{:04}-{:02}-{:02}.json", today.0, today.1, today.2));
+                            if !path.exists() {
+                                match motor_map.write_snapshot(&path) {
+                                    Ok(()) => tracing::info!("MOTOR_SNAPSHOT_DAILY path={path:?}"),
+                                    Err(e) => tracing::warn!("motor map snapshot failed: {e}"),
+                                }
+                            }
+                            last_snapshot_date = Some(today);
+                        }
+                    }
                 }
             }
         }
@@ -1780,6 +2463,21 @@ pub fn spawn<R: Runtime>(
         // sidecar has another mechanism for staying alive — and read
         // `Bridge.swift` to understand the EOF=shutdown contract.
         drop(sidecar_child);
+
+        // Component 5c: graceful-shutdown save. The 100-observation cadence
+        // can leave a tail of recent observations uncommitted; flush them so
+        // the session's learning survives app quit. Only reached on real
+        // shutdown / panic unwind (the loop survives sidecar restarts).
+        if let Some(path) = motor_map_path.as_deref() {
+            match motor_map.save_to(path) {
+                Ok(()) => tracing::info!(
+                    "MOTOR_MAP_SAVED (shutdown) obs={} path={:?}",
+                    motor_map.total_observations(),
+                    path
+                ),
+                Err(e) => tracing::warn!("motor map shutdown save failed: {e}"),
+            }
+        }
     });
 
     Ok(control_tx)
@@ -1790,6 +2488,49 @@ pub fn spawn<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Component 5c snapshot date helpers ------------------------------
+
+    const DAY_MS: u64 = 86_400_000;
+
+    #[test]
+    fn ymd_from_epoch_known_dates() {
+        assert_eq!(ymd_from_epoch_ms(0), (1970, 1, 1));
+        // 2026-05-30 (today, per the build context) — midnight UTC.
+        let ms = epoch_ms_from_ymd(2026, 5, 30);
+        assert_eq!(ymd_from_epoch_ms(ms), (2026, 5, 30));
+        // A leap day round-trips.
+        assert_eq!(
+            ymd_from_epoch_ms(epoch_ms_from_ymd(2024, 2, 29)),
+            (2024, 2, 29)
+        );
+    }
+
+    #[test]
+    fn snapshot_date_round_trips_through_filename() {
+        for &(y, m, d) in &[(1970, 1, 1), (2026, 5, 30), (2024, 2, 29), (1999, 12, 31)] {
+            let ms = epoch_ms_from_ymd(y, m, d);
+            let name = format!("{}.json", snapshot_date(ms));
+            assert_eq!(parse_snapshot_date(&name), Some((y, m, d)));
+        }
+    }
+
+    #[test]
+    fn ymd_ignores_intraday_time() {
+        // Any time within a day maps to that day's date.
+        let base = epoch_ms_from_ymd(2026, 5, 30);
+        assert_eq!(ymd_from_epoch_ms(base + DAY_MS - 1), (2026, 5, 30));
+        assert_eq!(ymd_from_epoch_ms(base + DAY_MS), (2026, 5, 31));
+    }
+
+    #[test]
+    fn parse_snapshot_date_rejects_non_snapshots() {
+        assert_eq!(parse_snapshot_date("motor_map.json"), None);
+        assert_eq!(parse_snapshot_date("2026-13-01.json"), None); // bad month
+        assert_eq!(parse_snapshot_date("2026-05-30.txt"), None); // wrong ext
+        assert_eq!(parse_snapshot_date("2026-05-30-extra.json"), None); // extra part
+        assert_eq!(parse_snapshot_date("not-a-date.json"), None);
+    }
 
     // ---- Each of the four nav keys ---------------------------------------
 
