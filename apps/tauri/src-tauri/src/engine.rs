@@ -40,8 +40,8 @@ use correction_engine::{
     decide, has_motor_evidence, measure_token_motor, ranked_known_candidates, score_candidates,
     should_log, AnchorTracker, Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome,
     Lexicon, LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver,
-    ScoredCandidate, StabilityReport, Token, TokenKind, Tokenizer, ACTIVE_TIER, CANDIDATES_VERSION,
-    DECISION_VERSION, LEXICON_VERSION, SCORE_VERSION,
+    ScoredCandidate, StabilityReport, Token, TokenKind, Tokenizer, WordPatternStore, ACTIVE_TIER,
+    CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION, SCORE_VERSION,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
@@ -474,6 +474,15 @@ struct Funnel {
     motor_slip: u64,
     /// Successful `motor_map.json` flushes.
     motor_saves: u64,
+    /// 5d word-pattern store: of the `CorrectedToOther` verdicts the store
+    /// sees, how many were recorded as a `typed→target` pattern vs skipped
+    /// (semantic rewrite / no-op / no recoverable post-edit text). The two
+    /// reconcile against `v_corr_oth` (Principle #8: this stage drops data —
+    /// the rewrite filter — so the drop is counted, not silent).
+    word_patterns_observed: u64,
+    word_pattern_skipped: u64,
+    /// Successful `word_patterns.json` flushes.
+    word_pattern_saves: u64,
     /// Session start (ms since epoch), stamped at task spawn.
     session_started_ms: u64,
 }
@@ -493,7 +502,8 @@ impl Funnel {
             "FUNNEL_DUMP {{ c_keystrokes_received: {}, c_keystrokes_accepted: {}, \
              c_tokens_sealed: {}, c_records_admitted: {}, c_verdicts_resolved: {{kept: {}, \
              corr_sug: {}, corr_oth: {}, abandoned: {}}}, c_motor_observations: {{kept: {}, \
-             slip: {}}}, c_motor_saves: {}, session_started_at: {} }}",
+             slip: {}}}, c_motor_saves: {}, c_word_patterns: {{observed: {}, skipped: {}}}, \
+             c_word_pattern_saves: {}, session_started_at: {} }}",
             self.keystrokes_received,
             self.keystrokes_accepted,
             self.tokens_sealed,
@@ -505,6 +515,9 @@ impl Funnel {
             self.motor_kept,
             self.motor_slip,
             self.motor_saves,
+            self.word_patterns_observed,
+            self.word_pattern_skipped,
+            self.word_pattern_saves,
             self.session_started_ms,
         );
     }
@@ -535,6 +548,14 @@ fn typeassist_dir() -> Option<PathBuf> {
 /// `~/.typeassist/motor_map.json` — the live, periodically-saved map.
 fn motor_map_path() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("motor_map.json"))
+}
+
+/// `~/.typeassist/word_patterns.json` — the live word-pattern store (C5d),
+/// its OWN file beside the motor map. Deliberately NOT under `snapshots/`:
+/// the Practice-trend reader loads every file there as a `MotorMap`, so a
+/// differently-shaped file in that directory would break it.
+fn word_patterns_path() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("word_patterns.json"))
 }
 
 /// `~/.typeassist/snapshots` — the daily dated archive directory.
@@ -819,6 +840,7 @@ fn tick_resolver<R: Runtime>(
     motor_ledger: &mut MotorLedger,
     proposer: &mut LexiconProposer,
     motor_map: &mut MotorMap,
+    word_patterns: &mut WordPatternStore,
     funnel: &mut Funnel,
 ) {
     let now = now_ms();
@@ -872,6 +894,24 @@ fn tick_resolver<R: Runtime>(
                             anchors.anchors(),
                             line_buf,
                         );
+                        // C5d word-pattern store: learn the typed→target pair
+                        // (observe-only; kill-switch off). Counts observed vs
+                        // skipped so the rewrite-filter drop is auditable.
+                        match corrected.as_deref() {
+                            Some(c) => {
+                                if word_patterns
+                                    .observe_correction(outcome, &rec.original_text, c, now)
+                                    .recorded
+                                {
+                                    funnel.word_patterns_observed += 1;
+                                } else {
+                                    funnel.word_pattern_skipped += 1;
+                                }
+                            }
+                            // CorrectedToOther with no recoverable post-edit
+                            // text — can't form a pattern.
+                            None => funnel.word_pattern_skipped += 1,
+                        }
                         motor_map.observe_outcome(
                             outcome,
                             &rec.original_text,
@@ -927,6 +967,43 @@ fn flush_motor_map(
         }
         Err(e) => {
             tracing::warn!("motor map flush save failed: {e}");
+            false
+        }
+    }
+}
+
+/// Flush the live word-pattern store (C5d) on the same time cadence as
+/// [`flush_motor_map`] — its own file, its own last-save clock. Returns
+/// `true` iff a write succeeded this call (so the caller can bump the funnel's
+/// `c_word_pattern_saves`).
+fn flush_word_patterns(
+    store: &mut WordPatternStore,
+    path: Option<&Path>,
+    now: u64,
+    last_save_ms: &mut u64,
+) -> bool {
+    if !store.has_unsaved() {
+        return false;
+    }
+    if now.saturating_sub(*last_save_ms) < MOTOR_FLUSH_INTERVAL_MS {
+        return false;
+    }
+    let Some(path) = path else {
+        return false; // no HOME — in-memory only this session
+    };
+    match store.save_to(path) {
+        Ok(()) => {
+            *last_save_ms = now;
+            tracing::info!(
+                "WORD_PATTERNS_SAVED (flush) patterns={} obs={} path={:?}",
+                store.len(),
+                store.total_observations(),
+                path
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!("word-pattern store flush save failed: {e}");
             false
         }
     }
@@ -1426,6 +1503,33 @@ pub fn spawn<R: Runtime>(
             },
             _ => MotorMap::new(),
         };
+        // C5d word-pattern store — learns typed→target word corrections,
+        // observe-only (kill-switch OFF). Its own file beside the motor map;
+        // load-fail keeps going in memory rather than clobbering a recoverable
+        // file. No dated snapshot (the live file is the durability this slice;
+        // snapshots/ is motor-map-shaped — see `word_patterns_path`).
+        let word_patterns_path = word_patterns_path();
+        let mut word_patterns = match word_patterns_path.as_deref() {
+            Some(path) if path.exists() => match WordPatternStore::load_from(path) {
+                Ok(store) => {
+                    tracing::info!(
+                        "WORD_PATTERNS_LOADED patterns={} obs={} path={:?}",
+                        store.len(),
+                        store.total_observations(),
+                        path
+                    );
+                    store
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "word-pattern store load failed ({e}); starting fresh in memory"
+                    );
+                    WordPatternStore::new()
+                }
+            },
+            _ => WordPatternStore::new(),
+        };
+        let mut last_word_patterns_save_ms: u64 = 0;
         // C5c motor ledger — the motor map's own record stream: EVERY
         // motor-evidenced sealed word (known included), lean records the
         // shared resolver verdicts. Decouples the motor map from the
@@ -1782,6 +1886,7 @@ pub fn spawn<R: Runtime>(
                                 &mut motor_ledger,
                                 &mut proposer,
                                 &mut motor_map,
+                                &mut word_patterns,
                                 &mut funnel,
                             );
                             let snap = anchors.snapshot();
@@ -2045,6 +2150,7 @@ pub fn spawn<R: Runtime>(
                                                 &mut motor_ledger,
                                                 &mut proposer,
                                                 &mut motor_map,
+                                                &mut word_patterns,
                                                 &mut funnel,
                                             );
                                             let snap = anchors.snapshot();
@@ -2309,6 +2415,7 @@ pub fn spawn<R: Runtime>(
                         &mut motor_ledger,
                         &mut proposer,
                         &mut motor_map,
+                        &mut word_patterns,
                         &mut funnel,
                     );
 
@@ -2324,6 +2431,16 @@ pub fn spawn<R: Runtime>(
                         &mut last_motor_save_ms,
                     ) {
                         funnel.motor_saves += 1;
+                    }
+
+                    // C5d: same cadence for the word-pattern store's own file.
+                    if flush_word_patterns(
+                        &mut word_patterns,
+                        word_patterns_path.as_deref(),
+                        now_ms(),
+                        &mut last_word_patterns_save_ms,
+                    ) {
+                        funnel.word_pattern_saves += 1;
                     }
 
                     // Capture-integrity funnel (Principle #8): auto-dump
@@ -2485,6 +2602,18 @@ pub fn spawn<R: Runtime>(
                     path
                 ),
                 Err(e) => tracing::warn!("motor map shutdown save failed: {e}"),
+            }
+        }
+        // C5d word-pattern store: same graceful-shutdown flush.
+        if let Some(path) = word_patterns_path.as_deref() {
+            match word_patterns.save_to(path) {
+                Ok(()) => tracing::info!(
+                    "WORD_PATTERNS_SAVED (shutdown) patterns={} obs={} path={:?}",
+                    word_patterns.len(),
+                    word_patterns.total_observations(),
+                    path
+                ),
+                Err(e) => tracing::warn!("word-pattern store shutdown save failed: {e}"),
             }
         }
     });
