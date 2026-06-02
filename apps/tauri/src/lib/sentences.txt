@@ -1,0 +1,124 @@
+# Practice Mode sentence bank — v1 (placeholder copy, iterate freely).
+# One short, real, ALL-LOWERCASE phrase per line. No capitals, no punctuation
+# that needs Shift (Shift is a hard two-key chord for our users). Lines starting
+# with # are comments. Keep phrases short (3–8 words) and natural — these are
+# read calmly, not raced. To grow variety, just add lines here; never add an LLM.
+the morning light feels gentle and warm
+a quiet walk clears the busy mind
+she poured a cup of fresh coffee
+the garden smells of rain and grass
+we talked late into the cool evening
+my hands feel a little steadier today
+the river moved slow and silver
+a soft breeze drifted through the room
+he wrote a short note to a friend
+the bread was warm from the oven
+birds settled on the old wooden fence
+the kettle began to whistle softly
+we watched the clouds roll past
+a small dog slept by the door
+the lake was calm at first light
+she hummed a tune while she worked
+the path wound up the green hill
+warm tea and a good book wait
+the candle flickered in the dark
+leaves gathered along the quiet street
+the train slowed as it neared town
+he folded the map with care
+a gentle rhythm helps the work flow
+the moon rose over the still bay
+we shared a meal and a few stories
+the old clock ticked in the hall
+soft music played in the next room
+she planted seeds in the spring soil
+the fire crackled and gave off heat
+a long day ends with a deep breath
+the children built a sand castle
+he sketched the harbour at dusk
+the wind carried the scent of pine
+we found a bench beneath the oak
+the cat curled up on the chair
+warm sunlight spilled across the floor
+she read the letter twice that night
+the bakery opened just after dawn
+a thin mist hung over the field
+he tuned the radio to a calm station
+the puzzle slowly came together
+we strolled along the sandy shore
+the lamp cast a soft yellow glow
+fresh snow covered the silent yard
+she wrapped the gift in plain paper
+the boat drifted near the reeds
+he stacked the books by the window
+a quiet joy filled the small kitchen
+the orchard was heavy with ripe fruit
+we sat and watched the tide return
+the violin played a slow sweet note
+morning frost laced the windowpane
+she traced the river on the map
+the porch swing creaked in the breeze
+a warm blanket and a quiet hour
+he whistled as he washed the dishes
+the meadow glowed in the late sun
+we gathered wood for the evening fire
+the soup simmered on the low flame
+she opened the window to the dawn
+a steady hand guides the brush
+the harbour lights blinked in the fog
+he read aloud by the fading light
+the trail led down to the creek
+warm cider waited by the hearth
+the swallows wheeled above the barn
+we counted stars from the back step
+a slow walk is its own reward
+the bread rose under a clean cloth
+she sang softly to the sleeping child
+the ferry crossed the grey water
+he mended the fence in the morning
+the quiet town slept under the moon
+a single leaf fell to the path
+we packed a basket for the picnic
+the willow leaned over the pond
+she set the table for two
+the storm passed and left the air clean
+he carried the lantern to the shed
+the market buzzed with morning trade
+a calm sea reflects the open sky
+the typewriter clicked in steady time
+she watered the ferns on the sill
+the dawn chorus woke the sleepy street
+we roasted chestnuts over the coals
+the old bridge arched over the stream
+he polished the brass until it shone
+a flock of geese crossed the dusk
+the cabin sat among the tall trees
+she knitted a scarf by the fire
+the postman waved from the gate
+warm rain fell on the quiet roof
+we paddled the canoe past the bend
+the bell rang clear across the valley
+he gathered apples in a wide hat
+the soft clay took the shape with ease
+she wrote a list of small joys
+the kite climbed high on the wind
+a quiet hum settled over the office
+the baker dusted the loaves with flour
+we watched the embers fade to grey
+the brook chattered over smooth stones
+she tied the boat to the dock
+the long hall echoed with soft steps
+he traced a slow circle in the sand
+warm bread and honey for the morning
+the fox slipped between the hedges
+we lingered over the last of the tea
+the harbour was still before the dawn
+she laughed at the funny old story
+the quiet quilt warmed the cold bed
+he jotted a quick note in the margin
+a lazy afternoon drifts by the river
+the orchard hummed with busy bees
+we waved the train out of the station
+the soft moss cushioned every step
+she zipped the jacket against the chill
+the jazz drifted from the open window
+a gentle pace keeps the breath even

@@ -1,23 +1,24 @@
 <script lang="ts">
   import Home from "./routes/Home.svelte";
   import Settings from "./routes/Settings.svelte";
-  import Practice from "./routes/Practice.svelte";
   import WarmUp from "./routes/WarmUp.svelte";
   import Today from "./routes/Today.svelte";
   import Progress from "./routes/Progress.svelte";
   import DebugPanel from "./routes/DebugPanel.svelte";
-  import { tick } from "svelte";
+  import { onMount, tick } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
 
   // Builder's debug view — hidden behind Cmd+Shift+D. Not a user feature.
   let debugOpen = false;
 
-  type Route = "home" | "today" | "warmup" | "practice" | "settings" | "progress";
+  // Practice is no longer a sidebar destination — it lives in its own menu-bar
+  // panel window (opened from the tray), not the main app's routes.
+  type Route = "home" | "today" | "warmup" | "settings" | "progress";
 
   const items: { route: Route; label: string }[] = [
     { route: "home", label: "Home" },
     { route: "today", label: "Today" },
     { route: "warmup", label: "Warm-up" },
-    { route: "practice", label: "Practice" },
     { route: "settings", label: "Settings" },
   ];
 
@@ -35,15 +36,8 @@
   //  - MANUAL activation: arrows only move focus; Enter/Space (or click) selects.
   //    Chosen over auto-activation so a stray arrow press never changes screens
   //    — fewer accidental navigations for motor-impaired users.
-  // Bumping this on every sidebar click to Practice forces a remount of the
-  // Practice screen (via {#key practiceKey} below) so it always lands on
-  // level-select — never resumes a round in progress.
-  let practiceKey = 0;
-
   function selectIndex(i: number) {
-    const newRoute = items[i].route;
-    if (newRoute === "practice") practiceKey += 1;
-    route = newRoute;
+    route = items[i].route;
   }
 
   function onTabKeydown(event: KeyboardEvent, index: number) {
@@ -88,6 +82,19 @@
     await tick();
     focusOnArrival = null;
   }
+
+  // Menu-bar entry: the tray's "Open TypeAssist" / "Settings" items show this
+  // (otherwise hidden) window and ask it to land on a specific route. The
+  // webview stays loaded across hide/show, so this listener is registered once.
+  onMount(() => {
+    const unlisten = listen<string>("app://route", (e) => {
+      const target = e.payload as Route;
+      route = target;
+    });
+    return () => {
+      unlisten.then((off) => off());
+    };
+  });
 
   // Focus trap: keep keyboard focus inside the app's controls. In a WebView,
   // Tab past the last focusable element hands focus to the host window — a
@@ -171,7 +178,6 @@
     {#if route === "home"}<Home on:navigate={handleNavigate} />
     {:else if route === "today"}<Today on:navigate={handleNavigate} focusTarget={focusOnArrival} />
     {:else if route === "warmup"}<WarmUp on:navigate={handleNavigate} />
-    {:else if route === "practice"}{#key practiceKey}<Practice />{/key}
     {:else if route === "settings"}<Settings />
     {:else if route === "progress"}<Progress on:navigate-back={handleNavigateBack} />
     {/if}

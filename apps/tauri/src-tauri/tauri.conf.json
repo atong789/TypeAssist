@@ -10,6 +10,7 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
@@ -17,7 +18,21 @@
         "width": 960,
         "height": 800,
         "minHeight": 720,
-        "resizable": true
+        "resizable": true,
+        "visible": false
+      },
+      {
+        "label": "practice",
+        "title": "Practice",
+        "width": 360,
+        "height": 480,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visible": false,
+        "skipTaskbar": true,
+        "shadow": false
       }
     ],
     "security": {
