@@ -40,13 +40,122 @@
   // have been caught 12×. Mirrors TIER1_MIN_OBSERVATIONS engine-side.
   const READY_THRESHOLD = 12;
 
+  // One calendar day's typing rollup, as the engine persists it (UTC-dated, to
+  // match the dated motor snapshots). coord + precis === slips always.
+  interface ProgressDay {
+    date: string;
+    words: number;
+    slips: number;
+    coord: number;
+    precis: number;
+  }
+
   let activeTab: Tab = "statistics";
   let patterns: ImpactPattern[] = [];
+  let progressDays: ProgressDay[] = [];
 
   // The command already returns patterns sorted by obs desc, so each group keeps
   // that order (the brief's "sorted by obs desc").
   $: ready = patterns.filter((p) => p.ready);
   $: observing = patterns.filter((p) => !p.ready);
+
+  // ---- Statistics derivations -------------------------------------------
+  //
+  // Match the engine's UTC civil date for "today" (its rows are UTC-dated), so
+  // the right entry is picked regardless of timezone. The two metric cards and
+  // the two composition %s are all TODAY's live numbers — and because the
+  // engine guarantees coord + precis === slips, coord% + precis% === slip rate
+  // exactly. The trend sparklines are the historical shape (weekly rollup).
+  const pad2 = (n: number) => String(n).padStart(2, "0");
+  const todayKey = (() => {
+    const d = new Date();
+    return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+  })();
+
+  const round1 = (x: number) => Math.round(x * 10) / 10;
+  const fmt1 = (x: number) => x.toFixed(1);
+
+  $: today = progressDays.find((d) => d.date === todayKey) ?? null;
+  $: wordsToday = today?.words ?? 0;
+  $: hasToday = today !== null && today.words > 0;
+  $: coordPct = hasToday ? round1((today!.coord / today!.words) * 100) : null;
+  $: precisPct = hasToday ? round1((today!.precis / today!.words) * 100) : null;
+  // Slip rate shown = the sum of the two displayed parts, so the brief's
+  // "X% + Y% = Z%" holds EXACTLY on screen (rounding each independently could
+  // otherwise make 6.2 + 8.3 ≠ 14.6). The engine guarantees coord+precis==slips.
+  $: slipPct =
+    coordPct !== null && precisPct !== null ? round1(coordPct + precisPct) : null;
+
+  // Last 7 calendar days ending today (UTC), absent days drawn as empty bars.
+  // The block is hidden until ≥2 days of data exist (brief).
+  $: last7 = (() => {
+    const map = new Map(progressDays.map((d) => [d.date, d]));
+    const base = Date.parse(`${todayKey}T00:00:00Z`);
+    const out: { weekday: string; words: number }[] = [];
+    for (let i = 6; i >= 0; i--) {
+      const dt = new Date(base - i * 86_400_000);
+      const key = `${dt.getUTCFullYear()}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
+      out.push({
+        weekday: dt.toLocaleDateString(undefined, { weekday: "short", timeZone: "UTC" }),
+        words: map.get(key)?.words ?? 0,
+      });
+    }
+    return out;
+  })();
+  $: maxBar = Math.max(1, ...last7.map((d) => d.words));
+  // Nonzero days get a small floor so a light day still reads as a bar.
+  const barHeight = (words: number, max: number) =>
+    words === 0 ? 0 : Math.max(8, (words / max) * 100);
+
+  // Weekly rollup for the trend lines: fixed 7-day buckets (epoch-aligned).
+  // A line needs ≥2 weeks of points; below that the row shows just the %.
+  $: weekly = (() => {
+    const buckets = new Map<number, { words: number; coord: number; precis: number }>();
+    for (const d of progressDays) {
+      const day = Math.floor(Date.parse(`${d.date}T00:00:00Z`) / 86_400_000);
+      const b = buckets.get(Math.floor(day / 7)) ?? { words: 0, coord: 0, precis: 0 };
+      b.words += d.words;
+      b.coord += d.coord;
+      b.precis += d.precis;
+      buckets.set(Math.floor(day / 7), b);
+    }
+    return [...buckets.keys()]
+      .sort((a, b) => a - b)
+      .map((k) => {
+        const b = buckets.get(k)!;
+        return {
+          coord: b.words ? (b.coord / b.words) * 100 : 0,
+          precis: b.words ? (b.precis / b.words) * 100 : 0,
+        };
+      });
+  })();
+  $: coordSeries = weekly.map((w) => w.coord);
+  $: precisSeries = weekly.map((w) => w.precis);
+
+  // Sparkline geometry. Neutral shape only — never good/bad colored; a flat
+  // series reads as steady (drawn mid-height).
+  const TREND_W = 120;
+  const TREND_H = 26;
+  function trendPoints(series: number[]): string {
+    if (series.length < 2) return "";
+    const min = Math.min(...series);
+    const max = Math.max(...series);
+    const span = max - min || 1;
+    const n = series.length;
+    return series
+      .map((v, i) => {
+        const x = (i / (n - 1)) * TREND_W;
+        const y = max === min ? TREND_H / 2 : TREND_H - ((v - min) / span) * TREND_H;
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(" ");
+  }
+  function trendEnd(series: number[]): { x: number; y: number } | null {
+    const pts = trendPoints(series);
+    if (!pts) return null;
+    const last = pts.split(" ").pop()!.split(",");
+    return { x: parseFloat(last[0]), y: parseFloat(last[1]) };
+  }
 
   // Today's date, e.g. "Tuesday, 3 June". Built from parts so the day-before-
   // month order is locale-stable (matches the mockup), not en-US's "June 3".
@@ -70,6 +179,16 @@
       .catch(() => {
         // A read failure leaves the last-known list rather than blanking the
         // ledger; the panel is read-only so there's nothing to retry.
+      });
+  }
+
+  function loadProgress() {
+    invoke<ProgressDay[]>("read_progress_stats")
+      .then((d) => {
+        progressDays = d ?? [];
+      })
+      .catch(() => {
+        // Read-only; keep the last-known days rather than blanking.
       });
   }
 
@@ -161,9 +280,11 @@
     const offOpen = listen("progress://open", () => {
       activeTab = "statistics";
       loadPatterns();
+      loadProgress();
       focusActiveTab();
     });
     loadPatterns();
+    loadProgress();
     focusActiveTab();
     return () => {
       offOpen.then((off) => off());
@@ -223,14 +344,81 @@
     bind:this={scrollEl}
   >
     {#if activeTab === "statistics"}
-      <!-- Built in step 4, on the verified engine numbers. Honest empty state
-           until then — never a predicted or placeholder figure. -->
-      <div class="empty">
-        <p class="empty-lead">This view mirrors how you type.</p>
-        <p class="empty-sub">
-          It fills in once there's a day of typing to reflect.
-        </p>
-      </div>
+      <!-- Statistics — how I type. Live today numbers + accumulated trends.
+           Mirror not scoreboard: neutral single color, never red, no targets;
+           a flat trend reads as steady. -->
+      {#if progressDays.length === 0}
+        <div class="empty">
+          <p class="empty-lead">This view mirrors how you type.</p>
+          <p class="empty-sub">
+            It fills in once there's a day of typing to reflect.
+          </p>
+        </div>
+      {:else}
+        <div class="stats">
+          <div class="cards">
+            <div class="card">
+              <div class="card-label">Words today</div>
+              <div class="card-value">{wordsToday.toLocaleString()}</div>
+            </div>
+            <div class="card">
+              <div class="card-label">Slip rate</div>
+              <div class="card-value">
+                {slipPct === null ? "—" : `${fmt1(slipPct)}%`}
+              </div>
+            </div>
+          </div>
+
+          {#if progressDays.length >= 2}
+            <section class="block">
+              <h2 class="block-title">Last 7 days</h2>
+              <div class="bars">
+                {#each last7 as d}
+                  <div class="bar-col">
+                    <div class="bar-track">
+                      <div class="bar" style="height: {barHeight(d.words, maxBar)}%"></div>
+                    </div>
+                    <div class="bar-label">{d.weekday}</div>
+                  </div>
+                {/each}
+              </div>
+            </section>
+          {/if}
+
+          <section class="block">
+            <h2 class="block-title">What the slip rate is made of</h2>
+            {#if slipPct === null}
+              <p class="quiet-line">No typing yet today.</p>
+            {:else}
+              {#each [{ name: "Coordination", caption: "right keys, right order", pct: coordPct, series: coordSeries }, { name: "Precision", caption: "right key, clean hit", pct: precisPct, series: precisSeries }] as row}
+                {@const pts = trendPoints(row.series)}
+                {@const end = trendEnd(row.series)}
+                <div class="comp-row">
+                  <div class="comp-head">
+                    <div class="comp-name">{row.name}</div>
+                    <div class="comp-caption">{row.caption}</div>
+                  </div>
+                  <div class="comp-trend">
+                    {#if pts}
+                      <svg viewBox="0 0 {TREND_W} {TREND_H}" width={TREND_W} height={TREND_H} aria-hidden="true">
+                        <polyline points={pts} fill="none" stroke="var(--trend-line)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                        {#if end}
+                          <circle cx={end.x} cy={end.y} r="2.5" fill="var(--trend-line)" />
+                        {/if}
+                      </svg>
+                    {/if}
+                  </div>
+                  <div class="comp-pct">{fmt1(row.pct ?? 0)}%</div>
+                </div>
+              {/each}
+              <p class="comp-sum">
+                {fmt1(coordPct ?? 0)}% coordination + {fmt1(precisPct ?? 0)}% precision =
+                your {fmt1(slipPct)}% slip rate.
+              </p>
+            {/if}
+          </section>
+        </div>
+      {/if}
     {:else}
       <!-- Impact — what TypeAssist has learned and is ready to smooth. Fully
            read-only: no buttons, no actions, no tap targets (brief). -->
@@ -319,6 +507,9 @@
     overflow: hidden;
     display: flex;
     flex-direction: column;
+    /* Neutral trend-line color — a mirror, never a scoreboard. Single tone,
+       never red/green; a flat line just reads as steady. */
+    --trend-line: color-mix(in srgb, canvastext 45%, canvas);
   }
 
   .close {
@@ -434,6 +625,115 @@
     color: var(--text-secondary);
     font-size: 0.95rem;
     max-width: 18rem;
+  }
+
+  /* ---- Statistics ---- */
+  .stats {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+  }
+  .cards {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+  }
+  .card {
+    padding: 0.85rem 1rem;
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
+  }
+  .card-label {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    margin-bottom: 0.35rem;
+  }
+  .card-value {
+    font-size: 1.9rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .block-title {
+    margin: 0 0 0.7rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  /* Last 7 days — uniform neutral bars, no highlighted "today". */
+  .bars {
+    display: flex;
+    align-items: flex-end;
+    gap: 0.5rem;
+    height: 92px;
+  }
+  .bar-col {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.35rem;
+    height: 100%;
+  }
+  .bar-track {
+    flex: 1;
+    width: 100%;
+    display: flex;
+    align-items: flex-end;
+  }
+  .bar {
+    width: 100%;
+    border-radius: 5px 5px 0 0;
+    background: color-mix(in srgb, canvastext 22%, canvas);
+    min-height: 0;
+  }
+  .bar-label {
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+  }
+
+  /* Composition — each row: name + caption, a neutral trend line, the %. */
+  .comp-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    align-items: center;
+    gap: 0.9rem;
+    padding: 0.6rem 0;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .comp-name {
+    font-size: 1rem;
+    font-weight: 600;
+  }
+  .comp-caption {
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+  }
+  .comp-trend {
+    width: 120px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+  }
+  .comp-pct {
+    font-size: 1.05rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    min-width: 3.5rem;
+    text-align: right;
+  }
+  .comp-sum {
+    margin: 0.7rem 0 0;
+    color: var(--text-secondary);
+    font-size: 0.88rem;
+    line-height: 1.45;
+  }
+  .quiet-line {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
   }
 
   /* ---- Impact ---- */
