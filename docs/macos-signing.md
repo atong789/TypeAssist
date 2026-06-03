@@ -66,18 +66,22 @@ instead (no stable grant), override: `just signing_identity=- build-sidecar`.
 
 ## Granting the permission (one time)
 
-The sidecar is a standalone binary inside the bundle, so grant **it** (not just
-the app). Easiest: reveal it in Finder and drag it into the list —
+The sidecar calls `AXIsProcessTrusted()`, but macOS attributes that check to its
+**responsible process — the `TypeAssist` app**. So grant **the app**:
+
+System Settings → Privacy & Security → **Accessibility** → add **`TypeAssist`**
+and toggle it **ON**. That's the entry that matters; once both the app and the
+sidecar are stably cert-signed, the app-level grant covers the sidecar. (Under
+the old ad-hoc signing this attribution didn't hold — granting the app alone
+kept re-prompting — which is the bug stable signing fixes.) Because the
+signature is stable, this grant **persists across future rebuilds**.
+
+Adding the sidecar binary itself is a harmless extra, not required. If you ever
+want to (e.g. debugging), reveal it and drag it onto the list:
 
 ```sh
 open -R "/Applications/TypeAssist.app/Contents/MacOS/typeassist-input-macos"
 ```
-
-System Settings → Privacy & Security → **Accessibility**: drag
-`typeassist-input-macos` onto the list, toggle on. Repeat under **Input
-Monitoring**. (The `TypeAssist` app entry is optional — the sidecar entry is the
-one the trust check reads.) Because the sidecar is cert-signed, this grant
-persists across future rebuilds.
 
 > If a grant ever does get into a bad state, reset and re-grant:
 > `tccutil reset Accessibility app.typeassist && tccutil reset ListenEvent app.typeassist`
