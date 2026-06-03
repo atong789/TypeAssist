@@ -8,6 +8,8 @@ All user data — keystrokes, motor map, snapshots, slip patterns, fatigue signa
 
 **Rationale:** this is recovery data — it reveals more about a person's body and cognitive state than most medical records. The privacy bar must be **absolute, not best-effort**. Any future feature that would require sending data off-device is **rejected by default — there is no acceptable tradeoff that opens this door.**
 
+**Ephemeral contextual checks are not data collection.** The precise rule is: *nothing leaves the device, and no user activity is stored or logged.* Reading a transient piece of context that exists **only in memory, for a single decision, and is never persisted** is acceptable — it is not collection. The motivating case (M3): reading the **currently focused app's bundle ID** to pick that app's correction mode (Mail → Eager, Notes → Cautious, …). The bundle ID is used for one decision and discarded — never written to disk, never logged, never associated with keystrokes or content. The line is **persistence/logging**, not *observation*: an in-memory read for an immediate choice is fine; recording *which app you were in* (a timeline of your activity) is the surveillance this principle forbids.
+
 ## Capture integrity is observable, not assumed (Principle #8 — non-negotiable)
 
 Every stage of the pipeline (**L1 ingest → engine accept → sealing → 5a verdict → 5c observe → persistence**) exposes a cumulative counter reconciled against the previous stage, so the conversion ratio between adjacent stages is auditable in real time. **Silent drops are unacceptable.** For a recovery-tracking app, a stroke survivor whose week of typing produces 1% of the expected data hasn't been *underserved* — the product has **lied to them about their recovery**. That is the worst failure mode the system has, worse than a wrong correction. This is foundational, not a feature.
@@ -100,7 +102,7 @@ TypeAssist surfaces insight across three surfaces — **Today**, **Progress**, *
 - **Ambient** — normal all-day typing everywhere on the Mac, captured passively. The core product.
 - **Deliberate practice** — opt-in structured sessions (Practice mode, Warm-up).
 
-**Content-blind, always.** The app never sees *what* was typed — only motor/timing shape (key, dwell, drift, episode rhythm). Insight speaks to **episode shape and patterns, never content**. Do **not** track which app was focused (surveillance feel).
+**Content-blind, always.** The app never sees *what* was typed — only motor/timing shape (key, dwell, drift, episode rhythm). Insight speaks to **episode shape and patterns, never content**. Never **store or log** which app was focused — a timeline of app usage is surveillance and is forbidden in insight/history. (This is distinct from the ephemeral focused-app read M3 uses to choose a correction mode — see Principle #9: an in-memory read for a single decision that is never persisted is allowed; *recording* a usage timeline is not.)
 
 ### Today — the daily mirror (observational, read-only)
 
