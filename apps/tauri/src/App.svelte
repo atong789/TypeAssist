@@ -3,9 +3,8 @@
   import Settings from "./routes/Settings.svelte";
   import WarmUp from "./routes/WarmUp.svelte";
   import Today from "./routes/Today.svelte";
-  import Progress from "./routes/Progress.svelte";
   import DebugPanel from "./routes/DebugPanel.svelte";
-  import { onMount, tick } from "svelte";
+  import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
 
   // Builder's debug view — hidden behind Cmd+Shift+D. Not a user feature.
@@ -13,7 +12,7 @@
 
   // Practice is no longer a sidebar destination — it lives in its own menu-bar
   // panel window (opened from the tray), not the main app's routes.
-  type Route = "home" | "today" | "warmup" | "settings" | "progress";
+  type Route = "home" | "today" | "warmup" | "settings";
 
   const items: { route: Route; label: string }[] = [
     { route: "home", label: "Home" },
@@ -24,10 +23,6 @@
 
   let route: Route = "home";
   let tabEls: HTMLButtonElement[] = [];
-
-  // "progress" is a sub-view reached from Today, not a sidebar tab. While it's
-  // open, keep Today lit and tabbable so the sidebar stays keyboard-reachable.
-  $: activeTab = route === "progress" ? "today" : route;
 
   // Sidebar is a WAI-ARIA vertical tablist with roving tabindex:
   //  - one tab stop (the selected tab); Tab enters here, Tab again exits to the
@@ -67,20 +62,6 @@
   // Route changes requested by a child view (e.g. Home's "Start" → Warm-up).
   function handleNavigate(event: CustomEvent<string>) {
     route = event.detail as Route;
-  }
-
-  // Returning from a sub-view: restore focus to the control that opened it so
-  // the focus ring lands on a sensible visible target on arrival, no Tab
-  // needed (see CLAUDE.md "Navigation lands focus on a sensible target").
-  // Pairs with the focus-on-mount in the sub-view's primary anchor.
-  let focusOnArrival: string | null = null;
-  async function handleNavigateBack() {
-    focusOnArrival = "progress-link";
-    route = "today";
-    // One-shot hint: clear after Today has mounted and consumed the prop, so
-    // a later normal arrival on Today doesn't re-trigger the restore.
-    await tick();
-    focusOnArrival = null;
   }
 
   // Menu-bar entry: the tray's "Open TypeAssist" / "Settings" items show this
@@ -163,9 +144,9 @@
           role="tab"
           id={`tab-${item.route}`}
           aria-controls="screen-panel"
-          aria-selected={activeTab === item.route}
-          tabindex={activeTab === item.route ? 0 : -1}
-          class:active={activeTab === item.route}
+          aria-selected={route === item.route}
+          tabindex={route === item.route ? 0 : -1}
+          class:active={route === item.route}
           bind:this={tabEls[i]}
           on:click={() => selectIndex(i)}
           on:keydown={(e) => onTabKeydown(e, i)}
@@ -174,12 +155,11 @@
     </div>
   </nav>
 
-  <div class="panel" id="screen-panel" role="tabpanel" aria-labelledby={`tab-${activeTab}`}>
+  <div class="panel" id="screen-panel" role="tabpanel" aria-labelledby={`tab-${route}`}>
     {#if route === "home"}<Home on:navigate={handleNavigate} />
-    {:else if route === "today"}<Today on:navigate={handleNavigate} focusTarget={focusOnArrival} />
+    {:else if route === "today"}<Today />
     {:else if route === "warmup"}<WarmUp on:navigate={handleNavigate} />
     {:else if route === "settings"}<Settings />
-    {:else if route === "progress"}<Progress on:navigate-back={handleNavigateBack} />
     {/if}
   </div>
 </main>

@@ -1,24 +1,9 @@
-<!-- Today — the daily mirror (see CLAUDE.md "Insight system"). Read-only: a
-     gentle narrative readback + descriptive "what I noticed" notes. The ONLY
-     interactive element is the quiet link into Progress. No timeline, no
-     back-arrow. Filled vs. empty morning is a simple data-driven switch. -->
+<!-- Today — the daily mirror (see CLAUDE.md "Insight system"). Fully read-only:
+     a gentle narrative readback + descriptive "what I noticed" notes. No
+     interactive elements, no timeline, no back-arrow. Progress lives in the
+     menu-bar panel (opened from the tray), not a link from here. Filled vs.
+     empty morning is a simple data-driven switch. -->
 <script lang="ts">
-  import { createEventDispatcher, onMount } from "svelte";
-
-  const dispatch = createEventDispatcher<{ navigate: string }>();
-
-  // One-shot hint from the parent: when set, focus the matching control on
-  // mount so the ring lands on a sensible visible target on arrival (see
-  // CLAUDE.md "Navigation lands focus on a sensible target"). Currently used
-  // when returning from Progress.
-  export let focusTarget: string | null = null;
-  let progressLinkEl: HTMLButtonElement;
-  onMount(() => {
-    if (focusTarget === "progress-link") {
-      progressLinkEl?.focus();
-    }
-  });
-
   // TODO: wire to real session data. Flip to false to preview the empty morning.
   const hasData = true;
 
@@ -65,10 +50,6 @@
       <p class="empty">{emptyNote}</p>
     {/if}
   </section>
-
-  <button class="progress-link" bind:this={progressLinkEl} on:click={() => dispatch("navigate", "progress")}>
-    See your progress<span class="arrow" aria-hidden="true"> →</span>
-  </button>
 </div>
 
 <style>
@@ -119,27 +100,5 @@
   .empty {
     margin: 0.75rem 0 0;
     color: var(--text-secondary);
-  }
-
-  /* The only interactive element on Today. Accent colour is mixed toward the
-     text colour so it clears WCAG AA contrast in both light and dark mode. */
-  .progress-link {
-    align-self: flex-start;
-    margin-top: 0.25rem;
-    padding: 0.4rem 0.2rem;
-    background: transparent;
-    border: none;
-    font: inherit;
-    font-weight: 600;
-    color: color-mix(in srgb, var(--focus-ring) 72%, canvastext);
-    cursor: pointer;
-  }
-  .progress-link:hover {
-    text-decoration: underline;
-  }
-  .progress-link:focus {
-    outline: 3px solid var(--focus-ring);
-    outline-offset: 3px;
-    border-radius: 4px;
   }
 </style>

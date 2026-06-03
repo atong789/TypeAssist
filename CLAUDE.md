@@ -109,7 +109,7 @@ TypeAssist surfaces insight across three surfaces — **Today**, **Progress**, *
 - A short, gentle **narrative readback** of the day. A friend giving a readback, never a clinician.
 - **"What I noticed"**: a few specific, recognizable patterns (e.g. "right thumb on the spacebar"). **Descriptive, never prescriptive** — never "you should practice."
 - **No clock-time / time-of-day timeline.** (Retired: time-of-day bands are context-free — a user can't connect "hesitant at 2pm" to anything. The meaningful variable is the **typing episode/effort** — cold starts, sustained-effort fatigue, recovery — not the clock.)
-- **Read-only.** The only interactive element is a quiet link into Progress. Today is a sidebar destination, so **no back-arrow**.
+- **Read-only.** Today has **no interactive elements** — it observes. (Progress is reached from the **menu-bar panel** via the tray, not a link from Today.) Today is a sidebar destination, so **no back-arrow**.
 - **Honest empty states**: a morning with no data says "the day's just beginning" — never predictions or yesterday's baggage.
 - **Today observes; Home invites.** Any call to action (e.g. a warm-up suggestion on a stiff cold-start morning) lives on **Home's warm-up card**, never on Today.
 
