@@ -131,12 +131,31 @@
   let trend: KeyTrend[] = [];
   $: trendKeys = trend.filter((k) => k.points.length >= 2);
 
-  function trendStatus(kt: KeyTrend): string {
-    const first = kt.points[0].slip_rate;
-    const last = kt.points[kt.points.length - 1].slip_rate;
-    if (last < first - 0.02) return "steadier than before";
-    if (last > first + 0.02) return "still finding it";
-    return "holding steady";
+  // A key's trend is shown as a neutral sparkline — the line speaks for itself
+  // (Facts, not commentary: no invented verdict words like "holding steady").
+  // Mirror, not scoreboard: a single neutral tone, never red. The
+  // ≥2-weekly-points gate above is unchanged, so the trend still appears once
+  // there's enough history — only the wording was removed, not the trend.
+  const SPARK_W = 110;
+  const SPARK_H = 24;
+  function sparkPoints(points: TrendPoint[]): string {
+    const ys = points.map((p) => p.slip_rate);
+    const min = Math.min(...ys);
+    const max = Math.max(...ys);
+    const span = max - min || 1;
+    const n = points.length;
+    return points
+      .map((p, i) => {
+        const x = (i / (n - 1)) * SPARK_W;
+        const y = max === min ? SPARK_H / 2 : SPARK_H - ((p.slip_rate - min) / span) * SPARK_H;
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(" ");
+  }
+  function sparkEnd(points: TrendPoint[]): { x: number; y: number } {
+    const parts = sparkPoints(points).split(" ");
+    const [x, y] = parts[parts.length - 1].split(",");
+    return { x: parseFloat(x), y: parseFloat(y) };
   }
 
   function computeSegments(cs: string[]): Segment[] {
@@ -397,9 +416,22 @@
           <p class="trend-head">{copy.snapshot.trendHeader}</p>
           <ul class="trend-list">
             {#each trendKeys as kt}
+              {@const pts = sparkPoints(kt.points)}
+              {@const e = sparkEnd(kt.points)}
               <li class="trend-row">
                 <span class="trend-key">{kt.key}</span>
-                <span class="trend-status">{trendStatus(kt)}</span>
+                <span class="trend-spark">
+                  <svg
+                    viewBox="0 0 {SPARK_W} {SPARK_H}"
+                    width={SPARK_W}
+                    height={SPARK_H}
+                    role="img"
+                    aria-label={`${kt.key}: slip-rate trend over ${kt.points.length} weeks`}
+                  >
+                    <polyline points={pts} fill="none" stroke="var(--trend-line)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                    <circle cx={e.x} cy={e.y} r="2.5" fill="var(--trend-line)" />
+                  </svg>
+                </span>
               </li>
             {/each}
           </ul>
@@ -442,6 +474,8 @@
     display: flex;
     flex-direction: column;
     justify-content: center;
+    /* Neutral trend-line color — mirror, not scoreboard; never red. */
+    --trend-line: color-mix(in srgb, canvastext 45%, canvas);
   }
 
   /* Natural-height wrapper the ResizeObserver measures — must NOT be stretched
@@ -676,9 +710,10 @@
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-weight: 600;
   }
-  .trend-status {
-    text-align: right;
+  .trend-spark {
+    justify-self: end;
+    display: flex;
+    align-items: center;
     color: var(--text-secondary);
-    font-size: 0.9rem;
   }
 </style>
