@@ -72,7 +72,7 @@ After stroke, fingers recover at physiologically different rates — not by the 
 
 1. **Frame as physiology, not failure.** Higher slip rates and slower improvement on slow-recovery fingers are NORMAL physiology — never the user's failure. UI copy, progress framings, and insights treat a slow ring finger the way physical therapy treats a slow leg: expected, not a deficit.
 2. **Weight correction priors by finger.** Downstream of L2, the correction engine should bias confidence by which finger is involved. A slip on a slow-recovery finger is more likely a motor error to smooth; an unusual key under thumb or index is more likely intentional and should be left alone. This applies to the L4 confidence tiers (`Cautious`/`Balanced`/`Eager`) and to swap-pair scoring in L3.
-3. **Calibrate progress per finger.** Grade each finger against *its own* expected recovery curve, so a slow finger is never made to feel like it's lagging the others. Progress on Progress's "where your hands are gaining ground" is per-finger, not whole-hand.
+3. **Calibrate progress per finger — internally; never surface a finger in the UI.** Grade each finger against *its own* expected recovery curve so a slow finger is never made to feel like it's lagging — but keep that calibration **internal** (it informs engine priors and copy *tone*, not a per-finger readout). The **Progress view does not surface per-finger**: the "where your hands are gaining ground" per-finger breakdown is **retired**. **Why:** finger attribution is *inferred* from a standard touch-typing hand-map we can't trust for an adapted typist, and showing it implies those fingers *ought* to improve — the opposite of the dignity goal. This is a **refinement** of #3 this session, not a reversal: the per-finger correction *weighting* in #2 is unchanged, and the physiology-not-failure stance in #1 stands. (See *Insight system → Design principles for insight surfaces → Report what's observed, never what's assumed*.)
 
 Sourced from the builder's lived stroke-recovery experience — load-bearing for both engine weighting and UI tone.
 
@@ -87,7 +87,7 @@ TypeAssist's users have motor difficulties (stroke survivors, arthritis). Large,
 - **Focus must never escape the app (focus trap).** In a WebView, Tab past the last control hands focus to the host window — a ringless, non-DOM location — before wrapping. A root-level `keydown` handler wraps focus: Tab on the last tabbable → first, Shift+Tab on the first → last (computing tabbables live, respecting roving `tabindex="-1"`). This keeps the ring continuous on every screen, including ones with no content yet. Lives in `apps/tauri/src/App.svelte`.
 - **Navigation lands focus on a sensible visible target.** The focus ring must never be invisible after a navigation. Opening a sub-view focuses its **primary anchor** (e.g. Progress focuses its back arrow on arrival, via `.focus()` in `onMount`). Returning from a sub-view **restores focus to the control that opened it** (e.g. returning to Today focuses the "See your progress" link). Implementation: child views dispatch `navigate-back` instead of `navigate` when returning; the parent passes a one-shot `focusTarget` prop, cleared via `tick()` after the child mounts. Because rings are styled on `:focus` (not only `:focus-visible`), programmatic focus shows the ring immediately — no Tab needed.
 - **One screen-title style, used everywhere.** Every screen wraps its name in `<header class="screen-header"><h1>…</h1></header>` and gets the **same** title treatment — shared style in `apps/tauri/src/app.css`. Sub-views with a back path (Progress, the Practice round) add a standalone focusable chevron button (`.screen-back`) before the `<h1>`; that chevron is the **only** visual difference between a sub-view header and a top-level header (the title itself is identical). Where a title has a "· context" suffix (e.g. *Today · Friday, May 23*; *Practice · Steady*), wrap the suffix in `<span class="screen-context">` so it renders in the secondary color while the heading otherwise looks identical. Never hand-size or hand-style a title.
-- **Fit the launch window — nothing important below the fold.** Every screen must lay out so all of its read-only content sits within the launch window without scrolling. Read-only content is *not* keyboard-reachable, so anything below the fold can only be reached with a mouse — which a keyboard-first app must not require. Pair a tight, compact layout with a Tauri default + `minHeight` that holds the densest screen, and cap any expandable list (e.g. Progress's "See all fingers") to what fits. Window dimensions live in `apps/tauri/src-tauri/tauri.conf.json`.
+- **Fit the launch window — nothing important below the fold.** Every screen must lay out so all of its read-only content sits within the launch window without scrolling. Read-only content is *not* keyboard-reachable, so anything below the fold can only be reached with a mouse — which a keyboard-first app must not require. Pair a tight, compact layout with a Tauri default + `minHeight` that holds the densest screen, and cap any expandable list to what fits — or let it scroll *within* a fixed-size region (as the menu-bar Progress panel's Impact ledger does). Window dimensions live in `apps/tauri/src-tauri/tauri.conf.json`.
 - **WCAG AA contrast.** Body and secondary ("quiet") text must clear **4.5:1** against the background in *both* light and dark mode (3:1 for large text and non-text UI). Use the `--text-secondary` token, not translucent gray — gray mixed with `transparent` fails contrast unpredictably over varied backgrounds.
 - **Semantic elements.** Use real `<button>`/`<a>` with appropriate ARIA (e.g. `aria-current="page"` on the active nav item), never click-handler `<div>`s, so screen readers announce roles correctly.
 - **No sliders, anywhere.** Discrete card selectors only (see Product principles). Enforced by CSS in `apps/tauri/src/app.css`.
@@ -113,17 +113,34 @@ TypeAssist surfaces insight across three surfaces — **Today**, **Progress**, *
 - **Honest empty states**: a morning with no data says "the day's just beginning" — never predictions or yesterday's baggage.
 - **Today observes; Home invites.** Any call to action (e.g. a warm-up suggestion on a stiff cold-start morning) lives on **Home's warm-up card**, never on Today.
 
-### Progress — where the meaning lives (reached from Today; feeds the therapist export)
+### Progress — the menu-bar dashboard (Statistics + Impact)
 
-- **Clean rate, not error count**: "landed clean 88% this week, up from 82% last month." Always a **rate** (per 100 words), never a raw count — a heavy day inflates raw counts and misleads. Capability framing ("clean"), never deficit ("errors").
-- **Steadiness trend across weeks** — meaningful because it spans weeks, not one day. The trend line **must show honest variation** (good and bad weeks both belong); never a fake monotonic rise.
-- **Volume as practice**: "~14,000 words this week, all of it practice." Reflective and gentle — **never a goal/target/streak**. A quiet day must never read as failure.
-- **Slips smoothed for you**: the count of silent corrections, framed as **help given** ("smoothed for you"), never errors made. This makes invisible progress visible — the whole point, since silent help means the user can't otherwise feel the improvement.
-- **"Where your hands are gaining ground"**: per-finger/per-key patterns + commonalities (recurring swap-pairs from the volatility map), framed as capability ("steadier," "gaining ground"). Show **only fingers with something to say** (gains, plus the occasional "still finding it"), capped ~3–4 by default, with a quiet **"see all"** for the full hand. Calm by default, complete on demand.
-- **No progress without meaningful samples**: a finger needs enough real data before it earns a trend; below that show "still getting to know this one," never a number invented from a few keystrokes. (Exact threshold is a build-time tuning detail.)
-- **Range selector**: Week / Month / All time. Retain longitudinal data locally (cheap, private; also powers the therapist export).
-- **Footer**: restate the on-device privacy promise. The opt-in therapist-share link is a **v2 footer element** — never pushed.
-- **Never on this surface**: WPM, streaks, daily scores, comparison to other users, goals/targets, prescriptions.
+A menu-bar dashboard so the user reads their own typing data without Console.app. Its own webview window (label `progress`), mirroring Practice Mode: tray-anchored, click-away to close, no Dock icon, fixed ~400×560 (the Impact ledger scrolls **internally** — the panel never grows toward the Dock). Reloads its data each open. Reduce Motion honored by construction (no tab-switch animation — the highlight jumps). Lives in `apps/tauri/src/routes/ProgressPanel.svelte`; reads via the `read_word_patterns` / `read_progress_stats` Tauri commands. **Observe-only** — no correction yet.
+
+- **Navigation — one-hand, no chords (hard rule).** Segmented control `Statistics | Impact`: switch by click, or single key `1`/`2` or `←`/`→` — **never** a modifier combo. Scroll = wheel/trackpad or single `↑`/`↓`/space. The keyboard focus ring follows the selected tab (roving tabindex) — ring and visible tab always agree.
+
+**Statistics tab — how I type.**
+- **Words today** + **Slip rate** — live same-day counters (today's in-progress row, not the decayed map).
+- **Last 7 days** — 7 uniform volume bars (no highlighted "today"). Hidden until ≥2 days of data exist.
+- **What the slip rate is made of** — two rows, **Coordination** ("right keys, right order") and **Precision** ("right key, clean hit"), each a neutral trend line + the current %, with a line stating `X% coordination + Y% precision = Z% slip rate`. The slip rate is shown as the **sum of the two displayed parts**, so the equation always holds on screen. **No per-finger view, no range selector, no time-of-day label.**
+- **Granular empty states**: today's numbers show as soon as the user types today; the 7-day bars appear at ≥2 days; the trend lines appear once there are ≥2 weekly points (~2 weeks).
+
+**Impact tab — what the system has learned and is ready to fix.**
+- **Passive, read-only ledger** — no buttons, no actions, no tap targets. Rationale: **twelve catches is consent** — if the user didn't want a pattern fixed, it wouldn't have been caught 12×.
+- Reads `word_patterns.json` directly (replaces scraping `KILL_SWITCH_DUMP` from Console). Each row's "N obs" is the **decayed** weight the kill-switch actually sees.
+- Layout: observe-only banner → `N ready · M observing` summary → **Ready** group (≥12 obs) → "12-observation threshold" divider → **Observing** group (`n / 12`). Each row: `typed → target` (mono) + `coord`/`precis` tag + obs count + Ready/Observing pill.
+
+**Slip definition & classification.**
+- A **slip** = an immediate, same-word, small correction (edit distance ≤2) — a motor mistype the user caught. **Not** a left-in typo, **not** an editorial rewrite (rewrites are excluded by the edit-distance guard — validated: 14 corrections in a test session resolved to 7 true slips).
+- The slip rate **decomposes** into Coordination + Precision, which partition the slips and sum to the total: **Coordination** = transposition (right keys, wrong order — `teh → the`); **Precision** = wrong adjacent key / doubling / omission, a clean-targeting failure (`wprd → word`).
+- Classification is **derived on read** from the `typed → target` pair (keyboard adjacency + edit distance; L2 inter-key timing can sharpen it later) in `crates/correction-engine/src/slip_class.rs`. **Never persisted** — no format change to `motor_map.json` / `word_patterns.json`.
+
+**Data & accumulation.**
+- One daily append-only file: `~/.typeassist/progress_snapshots.json` — `{ date, words, slips, coord, precis }`, on-device only. Today's cards = the current in-progress day's row (seeded from disk on startup, so a mid-day restart **resumes** rather than zeroes); the 7-day bars = the last finalized rows; trends = daily rows rolled up to weekly points, plotting the whole accumulated history (no window selector).
+- The live model (`motor_map.json`, `word_patterns.json`) keeps **decaying** (~30-day half-life) so correction reflects how the user types *now*; the snapshot file is **history** and is never decayed.
+- All dev/test runs use the **`TYPEASSIST_DATA_DIR`** scratch valve so a build under test never writes real `~/.typeassist` (two writers on recovery data is a Principle #6/#8 hazard).
+
+- **Future (not this phase):** "**slips smoothed for you**" (a count of silent corrections, framed as *help given*) lands once correction is live; the **clean-rate** framing ("landed clean 88% this week") and the opt-in **therapist export** (v2 footer) read back this same accumulated history; the footer restates the on-device privacy promise. **Never on this surface, ever:** WPM, streaks, daily scores, comparison to other users, goals/targets, prescriptions.
 
 ### Practice — opt-in "breathing exercise for the affected hand" (menu-bar panel)
 
@@ -139,6 +156,18 @@ Practice Mode lives in the **macOS menu bar** as a small dropdown panel (not a w
 ### Cross-cutting — progress is offered, never imposed
 
 The same number that motivates on a good day can sting on a bad one. Progress is rich and available in the views the user **goes to** (Progress, Practice), framed as capability growing — never a daily verdict, notification, or streak that greets them. **The good day and the bad day both belong.**
+
+### Design principles for insight surfaces (locked)
+
+These govern Today / Progress / Practice and **extend** the non-negotiables (#8 capture integrity, #9 nothing leaves the device, #10 grows with you not over you).
+
+- **Mirror, not coach.** Reflect how the user types *now*; never imply they should return to a baseline they've moved past. A survivor's ring/little fingers opting out is their **adapted normal**, not a gap to close. (This retired the per-finger "still finding footing" framing — see Recovery physiology #3.)
+- **Report what's observed, never what's assumed.** Surface **keystrokes** — what the app actually sees — not **finger attribution**, which is *inferred* from a standard touch-typing hand-map that may be wrong for any given user. No finger-level claims in the UI.
+- **Mirror, not scoreboard.** No targets, no good/bad coloring; a single neutral color. A flat trend reads as "holding steady," never "no progress." **Never use red for slips.**
+- **Facts, not commentary.** No invented or clinical-sounding state words ("smoothing", "holding steady"). The numbers and the line speak for themselves; any interpretive word must come from defined criteria or the user's/therapist's vocabulary — never invented by the app.
+- **Voice: observational, warm, never deficit-framed.** Count corrections, not mistakes.
+- **Earn the space.** Every element appears only when it has something to say — granular empty states, no padding for its own sake.
+- **Respect the user's locale.** Spelling and language follow the system setting (en-US, en-GB, en-IN…), never a hardcoded default, with a user override. *(Open item: Practice Mode currently shows British spelling on a US-set Mac — the word bank isn't yet reading the OS locale. Fix pending.)*
 
 ## Typing surfaces
 
