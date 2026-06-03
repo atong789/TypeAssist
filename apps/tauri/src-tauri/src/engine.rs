@@ -37,14 +37,14 @@ use std::path::{Path, PathBuf};
 
 use behavioural_model::{BehaviouralModel, InputEvent};
 use correction_engine::{
-    decide, has_motor_evidence, measure_token_motor, ranked_known_candidates, score_candidates,
-    should_log, AnchorTracker, Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome,
-    Lexicon, LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver,
-    PatternReadiness, ScoredCandidate, StabilityReport, Token, TokenKind, Tokenizer,
-    WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
-    SCORE_VERSION,
+    classify_slip, decide, has_motor_evidence, measure_token_motor, ranked_known_candidates,
+    score_candidates, should_log, AnchorTracker, Confidence, ConfidenceTier, DecisionLedger,
+    DecisionOutcome, Lexicon, LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome,
+    OutcomeResolver, PatternReadiness, ScoredCandidate, SlipClass, StabilityReport, Token,
+    TokenKind, Tokenizer, WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION,
+    LEXICON_VERSION, SCORE_VERSION,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
@@ -542,7 +542,16 @@ impl Funnel {
 
 /// `~/.typeassist`, or `None` if HOME is unset (the map then runs in-memory
 /// only — no durable file this session).
+///
+/// `TYPEASSIST_DATA_DIR` overrides the location outright. This is the
+/// **dev-safety valve**: a dev build can be pointed at a scratch folder so it
+/// never writes the same files as an installed release build (two writers on
+/// the same recovery data is a Principle #6/#8 hazard). Unset in normal use, so
+/// the default `~/.typeassist` is unchanged.
 fn typeassist_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("TYPEASSIST_DATA_DIR") {
+        return Some(PathBuf::from(dir));
+    }
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".typeassist"))
 }
 
@@ -627,6 +636,214 @@ fn parse_snapshot_date(filename: &str) -> Option<(i64, u32, u32)> {
         return None;
     }
     Some((y, m, d))
+}
+
+// ---- Progress daily stats (Statistics tab) ---------------------------------
+//
+// A tiny append-only daily rollup the Progress view's Statistics tab reads:
+// per calendar day, words typed + slips, split into coordination vs precision
+// (see `slip_class`). This is the ONLY new persisted file — the motor map and
+// word-pattern stores keep their existing formats untouched. Today's row
+// updates live; past days are immutable once the calendar day rolls.
+
+/// On-disk shape version for `progress_snapshots.json`.
+const PROGRESS_SNAPSHOTS_VERSION: u32 = 1;
+
+/// Minimum interval between live `progress_snapshots.json` writes when the
+/// day's tally has unsaved increments. Matches the motor-map flush cadence so
+/// "today" tracks within ~2s without churning the disk.
+const PROGRESS_FLUSH_INTERVAL_MS: u64 = 2_000;
+
+/// `~/.typeassist/progress_snapshots.json` — the append-only daily rollup.
+fn progress_snapshots_path() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("progress_snapshots.json"))
+}
+
+/// One calendar day's typing rollup, as persisted. `date` is `YYYY-MM-DD` (UTC
+/// civil date, matching the dated motor snapshots). `coord + precis == slips`
+/// always (every counted slip classifies as exactly one).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DailyEntry {
+    date: String,
+    words: u64,
+    slips: u64,
+    coord: u64,
+    precis: u64,
+}
+
+/// The file: a version tag + the accumulated daily history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProgressSnapshots {
+    version: u32,
+    days: Vec<DailyEntry>,
+}
+
+/// In-memory tally for the CURRENT day. Increments live in `tick_resolver`; the
+/// watchdog upserts it into the file and rolls it at the day boundary.
+#[derive(Debug, Clone)]
+struct DailyTally {
+    /// Civil date this tally is for (the watchdog rolls it when `now` differs).
+    date: (i64, u32, u32),
+    words: u64,
+    slips: u64,
+    coord: u64,
+    precis: u64,
+    /// Unwritten increments since the last flush — gates the periodic write.
+    dirty: bool,
+}
+
+impl DailyTally {
+    fn new(date: (i64, u32, u32)) -> Self {
+        Self {
+            date,
+            words: 0,
+            slips: 0,
+            coord: 0,
+            precis: 0,
+            dirty: false,
+        }
+    }
+
+    fn date_str(&self) -> String {
+        let (y, m, d) = self.date;
+        format!("{y:04}-{m:02}-{d:02}")
+    }
+
+    fn to_entry(&self) -> DailyEntry {
+        DailyEntry {
+            date: self.date_str(),
+            words: self.words,
+            slips: self.slips,
+            coord: self.coord,
+            precis: self.precis,
+        }
+    }
+
+    /// A word landed (a `Kept` clean word, or a `CorrectedToOther` that also
+    /// counts as a typed word). Bumps the slip-rate denominator.
+    fn add_word(&mut self) {
+        self.words += 1;
+        self.dirty = true;
+    }
+
+    /// A motor slip resolved — record it under its class. The caller has
+    /// already counted the word via [`Self::add_word`], so the two %s
+    /// (coord / precis, each over `words`) sum to the slip rate.
+    fn add_slip(&mut self, class: SlipClass) {
+        self.slips += 1;
+        match class {
+            SlipClass::Coordination => self.coord += 1,
+            SlipClass::Precision => self.precis += 1,
+        }
+        self.dirty = true;
+    }
+}
+
+/// Read the accumulated daily history, or an empty list if absent/unparseable
+/// (a missing file is the honest "no data yet" state, never an error).
+fn read_progress_days(path: &Path) -> Vec<DailyEntry> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<ProgressSnapshots>(&bytes)
+            .map(|s| s.days)
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Seed the current-day tally from disk so a mid-day restart RESUMES today's
+/// counts (Principle #6/#8 — never silently drop the morning's data on a
+/// relaunch) instead of overwriting them with a fresh zero on the next flush.
+fn load_daily_tally(path: Option<&Path>, now: u64) -> DailyTally {
+    let mut tally = DailyTally::new(ymd_from_epoch_ms(now));
+    let today = tally.date_str();
+    if let Some(path) = path {
+        if let Some(e) = read_progress_days(path)
+            .into_iter()
+            .find(|e| e.date == today)
+        {
+            tally.words = e.words;
+            tally.slips = e.slips;
+            tally.coord = e.coord;
+            tally.precis = e.precis;
+        }
+    }
+    tally
+}
+
+/// Upsert the tally's day into the file, preserving every other day. Atomic
+/// (temp + rename). Only the row for `tally.date` is replaced or appended —
+/// past days are never mutated.
+fn write_progress(path: &Path, tally: &DailyTally) -> std::io::Result<()> {
+    let mut days = read_progress_days(path);
+    let entry = tally.to_entry();
+    match days.iter_mut().find(|e| e.date == entry.date) {
+        Some(slot) => *slot = entry,
+        None => days.push(entry),
+    }
+    days.sort_by(|a, b| a.date.cmp(&b.date)); // YYYY-MM-DD sorts chronologically
+    let snap = ProgressSnapshots {
+        version: PROGRESS_SNAPSHOTS_VERSION,
+        days,
+    };
+    let json = serde_json::to_vec_pretty(&snap).map_err(std::io::Error::other)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Watchdog-driven progress persistence + day rollover. On a calendar-day
+/// change, finalize the (now-complete) old day — only if it had data, so empty
+/// days never clutter the history — then open a fresh tally. Otherwise flush
+/// today at most every [`PROGRESS_FLUSH_INTERVAL_MS`] when it has unsaved
+/// increments. Returns `true` iff a write succeeded. On a rollover write
+/// failure the old tally is kept (not reset) so the day retries next tick
+/// rather than being silently lost.
+fn tick_progress(
+    tally: &mut DailyTally,
+    path: Option<&Path>,
+    now: u64,
+    last_save_ms: &mut u64,
+) -> bool {
+    let today = ymd_from_epoch_ms(now);
+
+    if today != tally.date {
+        let mut wrote = false;
+        if tally.words > 0 || tally.slips > 0 {
+            if let Some(path) = path {
+                match write_progress(path, tally) {
+                    Ok(()) => wrote = true,
+                    Err(e) => {
+                        tracing::warn!("progress rollover write failed: {e}");
+                        return false; // keep old tally; retry before resetting
+                    }
+                }
+            }
+        }
+        *tally = DailyTally::new(today);
+        *last_save_ms = now;
+        return wrote;
+    }
+
+    if !tally.dirty || now.saturating_sub(*last_save_ms) < PROGRESS_FLUSH_INTERVAL_MS {
+        return false;
+    }
+    let Some(path) = path else {
+        return false; // no durable file this session
+    };
+    match write_progress(path, tally) {
+        Ok(()) => {
+            *last_save_ms = now;
+            tally.dirty = false;
+            true
+        }
+        Err(e) => {
+            tracing::warn!("progress snapshot write failed: {e}");
+            false
+        }
+    }
 }
 
 /// How many well-sampled keys to pull from each historical snapshot when
@@ -843,6 +1060,7 @@ fn tick_resolver<R: Runtime>(
     motor_map: &mut MotorMap,
     word_patterns: &mut WordPatternStore,
     funnel: &mut Funnel,
+    tally: &mut DailyTally,
 ) {
     let now = now_ms();
 
@@ -875,10 +1093,21 @@ fn tick_resolver<R: Runtime>(
         if motor_ledger.resolve_outcome(record_id, outcome) {
             // Funnel (Principle #8): a verdict was assigned in the capture
             // pipeline. Counts transitions, so revisions can tally > once.
+            // Same-day stats (Statistics tab): a resolved word is one typed
+            // word. Both Kept (clean) and CorrectedToOther (slipped) count
+            // toward today's words — the slip-rate denominator. Like the funnel
+            // these count verdict transitions, so a re-edited word can tally
+            // more than once (a mild, documented bias while observe-only).
             match outcome {
-                Outcome::Kept => funnel.v_kept += 1,
+                Outcome::Kept => {
+                    funnel.v_kept += 1;
+                    tally.add_word();
+                }
                 Outcome::CorrectedToSuggestion => funnel.v_corr_sug += 1,
-                Outcome::CorrectedToOther => funnel.v_corr_oth += 1,
+                Outcome::CorrectedToOther => {
+                    funnel.v_corr_oth += 1;
+                    tally.add_word();
+                }
                 Outcome::Abandoned => funnel.v_abandoned += 1,
                 Outcome::Pending => {}
             }
@@ -900,6 +1129,13 @@ fn tick_resolver<R: Runtime>(
                         // skipped so the rewrite-filter drop is auditable.
                         match corrected.as_deref() {
                             Some(c) => {
+                                // Same-day slip rate (Statistics): a motor typo
+                                // (not a semantic rewrite) is a slip, split
+                                // coordination vs precision. Derived from the
+                                // pair — nothing new persisted to the stores.
+                                if let Some(class) = classify_slip(&rec.original_text, c) {
+                                    tally.add_slip(class);
+                                }
                                 if word_patterns
                                     .observe_correction(outcome, &rec.original_text, c, now)
                                     .recorded
@@ -1630,6 +1866,20 @@ pub fn spawn<R: Runtime>(
         // Capture-integrity funnel (Principle #8). Per-session boundary
         // counters; dumped on the Cmd+Shift+F chord and every 60s.
         let mut funnel = Funnel::new(now_ms());
+        // Progress Statistics: the current day's live word/slip tally, seeded
+        // from disk so a mid-day restart resumes today's counts rather than
+        // resetting them. The watchdog upserts + rolls it (see `tick_progress`).
+        let progress_path = progress_snapshots_path();
+        let mut tally = load_daily_tally(progress_path.as_deref(), now_ms());
+        tracing::info!(
+            "PROGRESS_LOADED date={} words={} slips={} coord={} precis={}",
+            tally.date_str(),
+            tally.words,
+            tally.slips,
+            tally.coord,
+            tally.precis
+        );
+        let mut last_progress_save_ms: u64 = 0;
         // L4 lexicon (Component 3a). Process-wide singleton — first touch
         // parses the ~50k-entry bundled list; subsequent reads are HashMap
         // lookups. Read-only this slice: scoring/correction come later.
@@ -1948,6 +2198,7 @@ pub fn spawn<R: Runtime>(
                                 &mut motor_map,
                                 &mut word_patterns,
                                 &mut funnel,
+                                &mut tally,
                             );
                             let snap = anchors.snapshot();
                             let _ = app_handle.emit(
@@ -2213,6 +2464,7 @@ pub fn spawn<R: Runtime>(
                                                 &mut motor_map,
                                                 &mut word_patterns,
                                                 &mut funnel,
+                                                &mut tally,
                                             );
                                             let snap = anchors.snapshot();
                                             let _ = app_handle.emit(
@@ -2478,6 +2730,7 @@ pub fn spawn<R: Runtime>(
                         &mut motor_map,
                         &mut word_patterns,
                         &mut funnel,
+                        &mut tally,
                     );
 
                     // Component 5c: maintain the live motor-map file on a
@@ -2503,6 +2756,16 @@ pub fn spawn<R: Runtime>(
                     ) {
                         funnel.word_pattern_saves += 1;
                     }
+
+                    // Progress Statistics: persist today's tally on the same
+                    // cadence and roll it at the calendar-day boundary. Watchdog
+                    // runs every 1s, so even an idle day rolls over promptly.
+                    tick_progress(
+                        &mut tally,
+                        progress_path.as_deref(),
+                        now_ms(),
+                        &mut last_progress_save_ms,
+                    );
 
                     // Capture-integrity funnel (Principle #8): auto-dump
                     // every 60s (watchdog ticks every 1s) so the funnel is
@@ -2678,6 +2941,19 @@ pub fn spawn<R: Runtime>(
                 ),
                 Err(e) => tracing::warn!("word-pattern store shutdown save failed: {e}"),
             }
+        }
+        // Progress Statistics: flush today's tally too, so a clean quit commits
+        // the tail of today's words/slips (best-effort — the watchdog's ~2s
+        // cadence is the primary durability, since this may not run under
+        // `tauri dev`). Forced by zeroing the save clock.
+        if tally.dirty {
+            last_progress_save_ms = 0;
+            tick_progress(
+                &mut tally,
+                progress_path.as_deref(),
+                now_ms(),
+                &mut last_progress_save_ms,
+            );
         }
     });
 
@@ -2954,5 +3230,153 @@ mod tests {
         let lex = correction_engine::Lexicon::shared();
         let row = lexicon_row_for("the", lex);
         assert_eq!(row.lexicon_version, correction_engine::LEXICON_VERSION);
+    }
+
+    // ---- Progress daily stats (Statistics tab) ---------------------------
+
+    /// A throwaway temp dir for one test, removed on drop. Unique per call so
+    /// parallel tests don't collide (no `tempfile` dev-dep needed).
+    struct ScratchDir(PathBuf);
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "ta-progress-{}-{}-{}",
+                tag,
+                std::process::id(),
+                n
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            ScratchDir(dir)
+        }
+        fn file(&self) -> PathBuf {
+            self.0.join("progress_snapshots.json")
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn daily_tally_slip_split_sums_to_slips() {
+        let mut t = DailyTally::new((2026, 6, 3));
+        t.add_word();
+        t.add_word();
+        t.add_word();
+        t.add_slip(SlipClass::Coordination);
+        t.add_slip(SlipClass::Precision);
+        assert_eq!(t.words, 3);
+        assert_eq!(t.slips, 2);
+        // The invariant the Statistics tab relies on: coord + precis == slips
+        // (so coord% + precis% == slip rate).
+        assert_eq!(t.coord + t.precis, t.slips);
+        assert!(t.dirty);
+    }
+
+    #[test]
+    fn write_progress_upserts_today_and_preserves_past() {
+        let scratch = ScratchDir::new("upsert");
+        let path = scratch.file();
+
+        // Day 1 lands.
+        let mut t = DailyTally::new((2026, 6, 1));
+        t.add_word();
+        write_progress(&path, &t).unwrap();
+
+        // Day 2 starts; updating it must not touch day 1.
+        let mut t2 = DailyTally::new((2026, 6, 2));
+        t2.add_word();
+        write_progress(&path, &t2).unwrap();
+        // ... and updating day 2 again REPLACES its row (not append).
+        t2.add_word();
+        write_progress(&path, &t2).unwrap();
+
+        let days = read_progress_days(&path);
+        assert_eq!(days.len(), 2, "two distinct days, no duplicate rows");
+        assert_eq!(days[0].date, "2026-06-01");
+        assert_eq!(days[0].words, 1, "past day untouched");
+        assert_eq!(days[1].date, "2026-06-02");
+        assert_eq!(days[1].words, 2, "today's row replaced, not appended");
+    }
+
+    #[test]
+    fn load_daily_tally_resumes_today() {
+        let scratch = ScratchDir::new("resume");
+        let path = scratch.file();
+        let now = epoch_ms_from_ymd(2026, 6, 3) + 5_000;
+
+        let mut t = DailyTally::new(ymd_from_epoch_ms(now));
+        t.add_word();
+        t.add_word();
+        t.add_slip(SlipClass::Precision);
+        write_progress(&path, &t).unwrap();
+
+        // A "restart" mid-day must resume today's counts, not zero them.
+        let resumed = load_daily_tally(Some(&path), now);
+        assert_eq!(resumed.date, (2026, 6, 3));
+        assert_eq!(resumed.words, 2);
+        assert_eq!(resumed.slips, 1);
+        assert_eq!(resumed.precis, 1);
+        assert!(!resumed.dirty, "a freshly loaded tally is clean");
+    }
+
+    #[test]
+    fn load_daily_tally_ignores_a_different_day() {
+        let scratch = ScratchDir::new("otherday");
+        let path = scratch.file();
+
+        let mut yesterday = DailyTally::new((2026, 6, 2));
+        yesterday.add_word();
+        write_progress(&path, &yesterday).unwrap();
+
+        // Loading on the 3rd starts today fresh (yesterday's row stays on disk).
+        let now = epoch_ms_from_ymd(2026, 6, 3) + 1_000;
+        let today = load_daily_tally(Some(&path), now);
+        assert_eq!(today.date, (2026, 6, 3));
+        assert_eq!(today.words, 0);
+    }
+
+    #[test]
+    fn tick_progress_rolls_the_day() {
+        let scratch = ScratchDir::new("roll");
+        let path = scratch.file();
+        let mut last_save = 0u64;
+
+        // A tally still on the 2nd, with data, ticked with a "now" on the 3rd:
+        // the old day must be flushed and the tally reset to the new day.
+        let mut t = DailyTally::new((2026, 6, 2));
+        t.add_word();
+        t.add_slip(SlipClass::Coordination);
+        let now = epoch_ms_from_ymd(2026, 6, 3) + 1_000;
+        let wrote = tick_progress(&mut t, Some(&path), now, &mut last_save);
+        assert!(wrote);
+        assert_eq!(t.date, (2026, 6, 3), "tally rolled to the new day");
+        assert_eq!(t.words, 0, "new day starts clean");
+
+        let days = read_progress_days(&path);
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].date, "2026-06-02");
+        assert_eq!(days[0].words, 1, "the completed day was persisted on roll");
+        assert_eq!(days[0].coord, 1);
+    }
+
+    #[test]
+    fn tick_progress_skips_empty_day_rows() {
+        let scratch = ScratchDir::new("empty");
+        let path = scratch.file();
+        let mut last_save = 0u64;
+
+        // An idle day (no words) rolling over must NOT write a zero row.
+        let mut t = DailyTally::new((2026, 6, 2));
+        let now = epoch_ms_from_ymd(2026, 6, 3) + 1_000;
+        tick_progress(&mut t, Some(&path), now, &mut last_save);
+        assert_eq!(t.date, (2026, 6, 3));
+        assert!(
+            read_progress_days(&path).is_empty(),
+            "empty days never clutter the history"
+        );
     }
 }

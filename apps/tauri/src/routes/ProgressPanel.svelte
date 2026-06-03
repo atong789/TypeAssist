@@ -31,6 +31,9 @@
     target: string;
     obs: number;
     ready: boolean;
+    // "coord" | "precis", derived engine-side from the pair; null for the rare
+    // pair that isn't a clean motor slip.
+    class: string | null;
   }
 
   // 12 catches = consent (brief): if the user didn't want it fixed, it wouldn't
@@ -254,6 +257,7 @@
                 <li class="row">
                   <span class="pair">{p.typed} → {p.target}</span>
                   <span class="meta">
+                    {#if p.class}<span class="tag">{p.class}</span>{/if}
                     <span class="obs">{Math.round(p.obs)} obs</span>
                     <span class="pill ready">Ready</span>
                   </span>
@@ -271,6 +275,7 @@
                 <li class="row">
                   <span class="pair">{p.typed} → {p.target}</span>
                   <span class="meta">
+                    {#if p.class}<span class="tag">{p.class}</span>{/if}
                     <span class="obs">{Math.round(p.obs)} / {READY_THRESHOLD}</span>
                     <span class="pill observing">Observing</span>
                   </span>
@@ -482,6 +487,14 @@
     align-items: center;
     gap: 0.6rem;
     flex-shrink: 0;
+  }
+  .tag {
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    letter-spacing: 0.02em;
+    padding: 0.1rem 0.4rem;
+    border-radius: 6px;
+    background: color-mix(in srgb, canvastext 6%, canvas);
   }
   .obs {
     color: var(--text-secondary);

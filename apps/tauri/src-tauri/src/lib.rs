@@ -105,7 +105,9 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let quit = PredefinedMenuItem::quit(app, Some("Quit TypeAssist"))?;
     let menu = Menu::with_items(
         app,
-        &[&open_main, &practice, &progress, &sep_a, &settings, &sep_b, &quit],
+        &[
+            &open_main, &practice, &progress, &sep_a, &settings, &sep_b, &quit,
+        ],
     )?;
 
     TrayIconBuilder::with_id("main-tray")
@@ -197,17 +199,30 @@ fn open_progress(app: AppHandle) {
     show_progress(&app);
 }
 
+/// The on-device data directory the read-only Progress commands resolve files
+/// against. Mirrors the engine's `typeassist_dir`: `TYPEASSIST_DATA_DIR`
+/// overrides (the dev-safety scratch valve), else `~/.typeassist`. `None` when
+/// neither is set — the caller treats that as "no data yet".
+fn typeassist_data_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("TYPEASSIST_DATA_DIR") {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".typeassist"))
+}
+
 /// One learned correction, flattened for the Progress → Impact ledger. `obs` is
 /// the pattern's **decayed** weight (the same number the kill-switch gates on),
 /// so a long-idle pattern reads as the lower weight the engine actually sees.
-/// `coord` is the coordination/precision class — `None` until the engine writes
-/// it into the store (M3 step 3); the UI shows the tag only when present.
+/// `class` is the coordination/precision tag, **derived on read** from the
+/// `typed→target` pair (`"coord"` / `"precis"`), so nothing new is persisted to
+/// the store; `None` for the rare pair that isn't a clean motor slip.
 #[derive(serde::Serialize)]
 struct ImpactPattern {
     typed: String,
     target: String,
     obs: f32,
     ready: bool,
+    class: Option<&'static str>,
 }
 
 /// Tauri command: read `~/.typeassist/word_patterns.json` straight off disk and
@@ -220,11 +235,9 @@ struct ImpactPattern {
 /// engine's view exactly; rows are sorted by weight desc (the brief's order).
 #[tauri::command]
 fn read_word_patterns() -> Result<Vec<ImpactPattern>, String> {
-    let path = match std::env::var_os("HOME") {
-        Some(home) => std::path::PathBuf::from(home)
-            .join(".typeassist")
-            .join("word_patterns.json"),
-        None => return Err("HOME is not set".into()),
+    let path = match typeassist_data_dir() {
+        Some(dir) => dir.join("word_patterns.json"),
+        None => return Err("no data directory (HOME unset)".into()),
     };
     if !path.exists() {
         return Ok(Vec::new());
@@ -234,11 +247,15 @@ fn read_word_patterns() -> Result<Vec<ImpactPattern>, String> {
     let mut out: Vec<ImpactPattern> = store
         .snapshots()
         .into_iter()
-        .map(|s| ImpactPattern {
-            typed: s.typed,
-            target: s.target,
-            obs: s.weight,
-            ready: s.weight >= correction_engine::TIER1_MIN_OBSERVATIONS,
+        .map(|s| {
+            let class = correction_engine::classify_slip(&s.typed, &s.target).map(|c| c.as_tag());
+            ImpactPattern {
+                typed: s.typed,
+                target: s.target,
+                obs: s.weight,
+                ready: s.weight >= correction_engine::TIER1_MIN_OBSERVATIONS,
+                class,
+            }
         })
         .collect();
     out.sort_by(|a, b| {
@@ -247,6 +264,46 @@ fn read_word_patterns() -> Result<Vec<ImpactPattern>, String> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(out)
+}
+
+/// One calendar day's typing rollup, as the Statistics tab reads it. Mirrors
+/// the engine's on-disk `DailyEntry`; `coord + precis == slips`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProgressDay {
+    date: String,
+    words: u64,
+    slips: u64,
+    coord: u64,
+    precis: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct ProgressFile {
+    #[allow(dead_code)]
+    version: u32,
+    days: Vec<ProgressDay>,
+}
+
+/// Tauri command: read `~/.typeassist/progress_snapshots.json` straight off
+/// disk for the Statistics tab — the accumulated daily history (oldest→newest),
+/// each day's words/slips/coord/precis. The engine flushes today's row live
+/// (~2s), so the most recent entry is "today" as soon as the user has typed.
+/// Read-only; a missing file (no typing yet) returns an empty list, not an
+/// error. The UI derives Words-today / Slip-rate from the last entry, the
+/// 7-day bars from the last 7, and the trend lines from the whole history.
+#[tauri::command]
+fn read_progress_stats() -> Result<Vec<ProgressDay>, String> {
+    let path = match typeassist_data_dir() {
+        Some(dir) => dir.join("progress_snapshots.json"),
+        None => return Err("no data directory (HOME unset)".into()),
+    };
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("could not read progress file: {e}"))?;
+    let parsed: ProgressFile = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("could not parse progress file: {e}"))?;
+    Ok(parsed.days)
 }
 
 pub fn run() {
@@ -268,7 +325,8 @@ pub fn run() {
             request_practice_trend,
             open_practice,
             open_progress,
-            read_word_patterns
+            read_word_patterns,
+            read_progress_stats
         ])
         .on_window_event(|window, event| match event {
             // Menu-bar app: a window's close button / Cmd+W must NOT quit the
