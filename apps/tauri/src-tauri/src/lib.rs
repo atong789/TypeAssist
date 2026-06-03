@@ -98,13 +98,14 @@ fn request_motor_stability(sender: tauri::State<EngineControlSender>) -> Result<
 fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let open_main = MenuItem::with_id(app, "open_main", "Open TypeAssist", true, None::<&str>)?;
     let practice = MenuItem::with_id(app, "practice", "Practice mode", true, None::<&str>)?;
+    let progress = MenuItem::with_id(app, "progress", "Progress", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let sep_a = PredefinedMenuItem::separator(app)?;
     let sep_b = PredefinedMenuItem::separator(app)?;
     let quit = PredefinedMenuItem::quit(app, Some("Quit TypeAssist"))?;
     let menu = Menu::with_items(
         app,
-        &[&open_main, &practice, &sep_a, &settings, &sep_b, &quit],
+        &[&open_main, &practice, &progress, &sep_a, &settings, &sep_b, &quit],
     )?;
 
     TrayIconBuilder::with_id("main-tray")
@@ -119,6 +120,7 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             "open_main" => show_main(app, "today"),
             "settings" => show_main(app, "settings"),
             "practice" => show_practice(app),
+            "progress" => show_progress(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -154,6 +156,18 @@ fn show_practice<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// Anchor the Progress dashboard panel under the tray icon, show + focus it.
+/// Same menu-bar-dropdown behaviour as Practice (hides on blur). The panel is
+/// read-only; `progress://open` tells it to (re)load its data on each open.
+fn show_progress<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(w) = app.get_webview_window("progress") {
+        let _ = w.move_window(Position::TrayBottomCenter);
+        let _ = w.show();
+        let _ = w.set_focus();
+        let _ = app.emit("progress://open", ());
+    }
+}
+
 /// Tauri command: ask the engine to reconstruct a per-key slip-rate trend
 /// from the weekly motor-map snapshots and emit it on `engine://practice-trend`.
 /// Practice calls this at the snapshot with the keys the round leaned into; the
@@ -176,6 +190,65 @@ fn open_practice(app: AppHandle) {
     show_practice(&app);
 }
 
+/// Tauri command: open the Progress dashboard panel from inside the app. Mirrors
+/// `open_practice` — same tray-anchored, hide-on-blur presentation.
+#[tauri::command]
+fn open_progress(app: AppHandle) {
+    show_progress(&app);
+}
+
+/// One learned correction, flattened for the Progress → Impact ledger. `obs` is
+/// the pattern's **decayed** weight (the same number the kill-switch gates on),
+/// so a long-idle pattern reads as the lower weight the engine actually sees.
+/// `coord` is the coordination/precision class — `None` until the engine writes
+/// it into the store (M3 step 3); the UI shows the tag only when present.
+#[derive(serde::Serialize)]
+struct ImpactPattern {
+    typed: String,
+    target: String,
+    obs: f32,
+    ready: bool,
+}
+
+/// Tauri command: read `~/.typeassist/word_patterns.json` straight off disk and
+/// return the learned patterns for the Impact tab. This is the read that
+/// **replaces** scraping `KILL_SWITCH_DUMP` from Console — fully read-only, no
+/// engine round-trip (the file is the source of truth, flushed every ~2s). A
+/// missing file (nothing learned yet) is not an error: it returns an empty list.
+///
+/// Decay is applied via the store's own `snapshots()` so "N obs" matches the
+/// engine's view exactly; rows are sorted by weight desc (the brief's order).
+#[tauri::command]
+fn read_word_patterns() -> Result<Vec<ImpactPattern>, String> {
+    let path = match std::env::var_os("HOME") {
+        Some(home) => std::path::PathBuf::from(home)
+            .join(".typeassist")
+            .join("word_patterns.json"),
+        None => return Err("HOME is not set".into()),
+    };
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let store = correction_engine::WordPatternStore::load_from(&path)
+        .map_err(|e| format!("could not read word_patterns.json: {e}"))?;
+    let mut out: Vec<ImpactPattern> = store
+        .snapshots()
+        .into_iter()
+        .map(|s| ImpactPattern {
+            typed: s.typed,
+            target: s.target,
+            obs: s.weight,
+            ready: s.weight >= correction_engine::TIER1_MIN_OBSERVATIONS,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.obs
+            .partial_cmp(&a.obs)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(out)
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -193,7 +266,9 @@ pub fn run() {
             restart_capture,
             request_motor_stability,
             request_practice_trend,
-            open_practice
+            open_practice,
+            open_progress,
+            read_word_patterns
         ])
         .on_window_event(|window, event| match event {
             // Menu-bar app: a window's close button / Cmd+W must NOT quit the
@@ -202,9 +277,12 @@ pub fn run() {
                 api.prevent_close();
                 let _ = window.hide();
             }
-            // The Practice panel is a dropdown: clicking away (losing focus)
-            // dismisses it. Typing keeps focus, so an active round never hides.
-            WindowEvent::Focused(false) if window.label() == "practice" => {
+            // The Practice and Progress panels are dropdowns: clicking away
+            // (losing focus) dismisses them. Practice keeps focus while typing,
+            // so an active round never hides; Progress is read-only.
+            WindowEvent::Focused(false)
+                if window.label() == "practice" || window.label() == "progress" =>
+            {
                 let _ = window.hide();
             }
             _ => {}

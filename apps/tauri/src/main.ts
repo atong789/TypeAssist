@@ -1,12 +1,19 @@
 import "./app.css";
 import App from "./App.svelte";
 import PracticePanel from "./routes/PracticePanel.svelte";
+import ProgressPanel from "./routes/ProgressPanel.svelte";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-// One build, two windows. The "practice" menu-bar panel mounts the calm
-// Practice surface; every other window (the "main" app) mounts the full app.
-// Branching here avoids a second Vite entry point.
-const Component = getCurrentWindow().label === "practice" ? PracticePanel : App;
+// One build, several windows. The "practice" and "progress" menu-bar panels
+// mount their own calm surfaces; every other window (the "main" app) mounts the
+// full app. Branching here avoids a separate Vite entry point per window.
+const label = getCurrentWindow().label;
+const Component =
+  label === "practice"
+    ? PracticePanel
+    : label === "progress"
+      ? ProgressPanel
+      : App;
 
 const app = new Component({
   target: document.getElementById("app")!,
