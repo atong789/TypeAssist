@@ -6,6 +6,7 @@
      backspace-always-works rule and Warm-up's smooth-and-advance behaviour. -->
 <script lang="ts">
   import { createEventDispatcher, tick } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
 
   const dispatch = createEventDispatcher<{ navigate: string }>();
 
@@ -126,7 +127,7 @@
     <p class="subtitle">Your hands are ready for the day.</p>
     <div class="actions">
       <button class="action" bind:this={warmAgainEl} on:click={restart}>Warm up again</button>
-      <button class="action" on:click={() => dispatch("navigate", "practice")}>Start practicing</button>
+      <button class="action" on:click={() => invoke("open_practice")}>Start practicing</button>
     </div>
   </div>
 {/if}

@@ -42,12 +42,41 @@ final class EventTap {
         case .shutdown:
             stop()
             exit(0)
+        case .restartTap:
+            // Soft capture restart — engine writes this when auto-
+            // re-enable hasn't recovered the tap (or the user clicked
+            // "Restart capture"). Tear down the current tap fully,
+            // then build a new one. Logged to stderr so a crash-loop
+            // is visible from the host's process inspector.
+            FileHandle.standardError.write(Data("restarting CGEventTap on request\n".utf8))
+            stop()
+            if !start() {
+                FileHandle.standardError.write(Data("CGEventTap restart failed\n".utf8))
+            }
+        case .axProbe:
+            // Phase 0 / M3 feasibility — content-blind geometry probe of the
+            // focused element, reported on stderr (stdout is the JSON event
+            // contract). Runs through the sidecar's working AX grant.
+            FileHandle.standardError.write(Data((Accessibility.probeFocusedGeometry() + "\n").utf8))
         }
+    }
+
+    /// Current view of the tap's enabled state — used by the
+    /// heartbeat emitter to tell the engine whether capture is
+    /// actually live. Reads the CGEvent state directly rather than
+    /// caching it, so a tap disabled OUT FROM UNDER US (by the OS,
+    /// without our callback firing for some reason) still reports
+    /// truthfully.
+    func isTapEnabled() -> Bool {
+        guard let tap = self.tap else { return false }
+        return CGEvent.tapIsEnabled(tap: tap)
     }
 
     private func stop() {
         if let tap = self.tap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let src = self.runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetCurrent(), src, .commonModes) }
+        self.tap = nil
+        self.runLoopSource = nil
     }
 
     private static let callback: CGEventTapCallBack = { _, type, event, userInfo in
@@ -58,6 +87,26 @@ final class EventTap {
     }
 
     private func process(type: CGEventType, event: CGEvent) {
+        // **Self-heal**: macOS disables our tap and delivers ONE of these
+        // event types when a callback runs long (`tapDisabledByTimeout`)
+        // or on certain user-input / system signals
+        // (`tapDisabledByUserInput`). Without action the tap stays dead
+        // and no keystrokes ever flow again — this was the long-session
+        // capture-death bug. Re-arm immediately.
+        //
+        // CGEventType's `.rawValue` is used here because the enum is
+        // sparsely populated; the disabled-* cases aren't always
+        // matched by `switch type` directly in older SDKs.
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let tap = self.tap {
+                CGEvent.tapEnable(tap: tap, enable: true)
+                FileHandle.standardError.write(
+                    Data("CGEventTap re-enabled after \(type == .tapDisabledByTimeout ? "timeout" : "user-input") disable\n".utf8)
+                )
+            }
+            return
+        }
+
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
         let timestampNs = event.timestamp
         let timestampMs = UInt64(timestampNs / 1_000_000)

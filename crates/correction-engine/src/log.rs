@@ -3,13 +3,14 @@
 //! An **in-memory, observe-only** rolling log of every L4 decision made on
 //! an UNKNOWN Word token. Each record carries enough context for Component
 //! 5 (outcome resolution) to come back later and tell the difference
-//! between four states:
+//! between five states:
+//!   * `Pending` — outcome not yet observed; the initial state.
 //!   * `Kept` — the engine left the word alone and the user kept it.
 //!   * `CorrectedToSuggestion` — the user backspaced and arrived at the
 //!     engine's `top_candidate`.
 //!   * `CorrectedToOther` — the user backspaced and arrived at something
 //!     else (engine was wrong about both *whether* and *what* to suggest).
-//!   * `Pending` — outcome not yet observed; the initial state.
+//!   * `Abandoned` — the user deleted the whole word.
 //!
 //! **Privacy and scope.** Process-memory only; capped at
 //! [`DEFAULT_LEDGER_CAPACITY`] most-recent records; cleared on restart.
@@ -51,7 +52,29 @@ use crate::ConfidenceTier;
 
 /// Version of the log record shape. Bump on any change to [`LogRecord`]
 /// or the [`Outcome`] / [`LogConfidence`] enums.
-pub const LOG_VERSION: u32 = 1;
+///
+/// v2 — Component 5a adds [`Outcome::Abandoned`] for the whole-word-delete
+/// terminal state.
+///
+/// v3 — Component 5b first cut adds `top_motor_evidence` (C3's
+/// candidate-dependent motor score) so the proposer could read motor
+/// info without re-fetching the score report.
+///
+/// v4 — Component 5b fix: `top_motor_evidence` was blank for the
+/// fast lane (no candidate → no edit-shape to score). Adds
+/// `token_motor`, a candidate-INDEPENDENT per-token motor signal
+/// computed from `line_dwells`. Every loggable record now carries a
+/// motor verdict; the proposer reads `token_motor.verdict` rather
+/// than `top_motor_evidence` to decide hold vs promote.
+///
+/// v5 — Component 5b Phase 2 follow-up: `credited: Option<bool>` — at
+/// Kept-resolution time the engine writes `Some(true)` if the
+/// proposer credited the contribution or `Some(false)` if learning
+/// was paused. `None` while Pending or for non-Kept resolutions
+/// (those never contribute, regardless of pause). The panel uses
+/// this to grey out + tag rows that were observed but not learned
+/// from — the missing signal in the original pause UX.
+pub const LOG_VERSION: u32 = 5;
 
 /// **PLACEHOLDER capacity.** A few hundred records — enough to span a
 /// typical writing session without growing unbounded. Tune from real
@@ -88,10 +111,15 @@ impl LogConfidence {
     }
 }
 
-/// Per-decision outcome slot. All four states are load-bearing — C5 will
-/// distinguish them when it watches the [`SpanAnchor`] for the user's
-/// subsequent edits. **C4 only ever writes [`Outcome::Pending`];**
-/// transitions are Component 5's job.
+/// Per-decision outcome slot. All five states are load-bearing — Component
+/// 5's [`crate::resolver::OutcomeResolver`] watches the [`SpanAnchor`] for
+/// the user's subsequent edits and transitions through these. **C4 only
+/// ever writes [`Outcome::Pending`];** transitions are Component 5's job.
+///
+/// Resolution is **revisable**: a record may flip back and forth (e.g.
+/// `Kept` → `CorrectedToOther` if the user later edits the span) until the
+/// anchor is retired by a line reset, at which point the last resolution
+/// stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Outcome {
@@ -105,8 +133,16 @@ pub enum Outcome {
     /// possible positive learning signal.
     CorrectedToSuggestion,
     /// User self-corrected, but to something other than the suggestion.
-    /// Engine was wrong about *what* to suggest.
+    /// Engine was wrong about *what* to suggest. Also catches the
+    /// `Void(Split)` / `Void(Merge)` cases where the original word
+    /// boundary is gone and there's no reliable single-word read-back —
+    /// the user clearly didn't keep it as-is, but the post-edit text
+    /// can't be matched against the suggestion.
     CorrectedToOther,
+    /// User deleted the whole word (anchor voided with `Deleted`). No
+    /// content remains at the original span. The engine learns nothing
+    /// about *what* to suggest, only that the user walked away.
+    Abandoned,
 }
 
 /// One row in the ledger — the full structured record of a single
@@ -132,13 +168,40 @@ pub struct LogRecord {
     /// the `WouldCorrect` arm (with `suggested` + confidence + score) or
     /// the `LeaveAlone` arm (with `reason`).
     pub decision: DecisionOutcome,
-    /// Engine's top candidate text. `Some` for `WouldCorrect`;
-    /// `None` for any `LeaveAlone` arm (including `NoCandidates`).
+    /// Engine's top candidate text — the strongest edit-1 neighbour the
+    /// score pass turned up, **regardless of whether the mode acted on
+    /// it**. Present whenever `score_candidates` produced at least one
+    /// candidate; `None` only for `LeaveAlone(NoCandidates)`. The
+    /// resolver matches the user's post-edit text against this string
+    /// to attribute `CorrectedToSuggestion` — crucially, that includes
+    /// the `LeaveAlone(BelowActiveTier)` arm where the mode declined to
+    /// suggest but the candidate was right anyway.
     pub top_candidate: Option<String>,
     /// Engine's top candidate raw score. Same nullability as
-    /// `top_candidate`: present on `WouldCorrect`, absent on
-    /// `LeaveAlone`. C5 uses this to weight learning later.
+    /// `top_candidate`: present whenever a candidate existed, absent
+    /// only when none did. C5 uses this to weight learning later.
     pub top_score: Option<f64>,
+    /// **Motor evidence** of the top candidate's edit shape (sub / trans
+    /// / ins / del) — the same `[0, 1]` value C3 uses to justify a
+    /// correction. High = the typed word is a plausible motor slip of
+    /// a real word; low = no slip-shape match against the candidate.
+    /// Same nullability as `top_candidate`. **Diagnostic** for the
+    /// debug panel; the C5b proposer reads [`Self::token_motor`]
+    /// instead (the candidate-independent signal) so the fast lane
+    /// has a verdict too.
+    pub top_motor_evidence: Option<f64>,
+    /// **Per-token motor cleanliness** computed from the keystrokes
+    /// themselves — `line_dwells[start..end]`. Candidate-independent,
+    /// present on every loggable record (fast lane included). The
+    /// C5b proposer reads `token_motor.verdict` to decide
+    /// hold-as-slip vs promote-as-clean; the proposer no longer
+    /// consults `top_motor_evidence` for the gate.
+    ///
+    /// `None` only when the engine couldn't read the dwell slice for
+    /// the token's span (defensive — should not happen in normal
+    /// flow). A 1-char token still gets `Some(_)` with verdict
+    /// `Insufficient` so the panel renders the right cell.
+    pub token_motor: Option<crate::motor_signal::TokenMotorSignal>,
     /// 4-state confidence band. See [`LogConfidence`]. Always present —
     /// `BelowFloor` covers both "below floor" and "no candidate".
     pub confidence: LogConfidence,
@@ -156,9 +219,49 @@ pub struct LogRecord {
     /// Outcome slot. C4 always writes [`Outcome::Pending`]; C5 calls
     /// [`DecisionLedger::resolve_outcome`] to transition.
     pub outcome: Outcome,
+    /// **C5b Phase 2 follow-up.** Was the proposer's credit step
+    /// active when this record's outcome was resolved?
+    ///
+    ///   * `None` — record is still `Pending`, OR resolved to a
+    ///     non-Kept outcome (`CorrectedToSuggestion` / `CorrectedToOther`
+    ///     / `Abandoned`). Non-Kept outcomes don't feed learning
+    ///     regardless of pause; the bit is "not applicable" rather
+    ///     than "not credited."
+    ///   * `Some(true)`  — outcome was `Kept` and learning was
+    ///     active at resolution time. The contribution counted.
+    ///   * `Some(false)` — outcome was `Kept` BUT the proposer was
+    ///     paused, so `note_record` short-circuited and the
+    ///     contribution did NOT count. The record still appears on
+    ///     the LOG so the user can see what the engine observed; the
+    ///     panel greys it + tags it "paused" so the difference from
+    ///     a credited Kept is visible.
+    ///
+    /// Filled by the engine in [`DecisionLedger::set_credited`] at
+    /// the same site that calls [`crate::LexiconProposer::note_record`],
+    /// reading [`crate::LexiconProposer::credit_paused`] for the
+    /// state-at-note-time.
+    pub credited: Option<bool>,
     /// Shape version — bump [`LOG_VERSION`] alongside any change to
     /// [`LogRecord`] / [`Outcome`] / [`LogConfidence`].
     pub log_version: u32,
+}
+
+impl crate::resolver::ResolvableRecord for LogRecord {
+    fn record_id(&self) -> u64 {
+        self.id
+    }
+    fn anchor_id(&self) -> u32 {
+        self.anchor_id
+    }
+    fn original_text(&self) -> &str {
+        &self.original_text
+    }
+    fn top_candidate(&self) -> Option<&str> {
+        self.top_candidate.as_deref()
+    }
+    fn current_outcome(&self) -> Outcome {
+        self.outcome
+    }
 }
 
 /// Bounded rolling decision ledger.
@@ -221,24 +324,41 @@ impl DecisionLedger {
     /// **Always writes [`Outcome::Pending`]** — the C4 contract. The
     /// caller is responsible for the upstream gating ([`should_log`] +
     /// [`has_motor_evidence`]); this method does not re-check them.
+    ///
+    /// `top_candidate`, `top_score`, and `top_motor_evidence` are
+    /// sourced from the engine's **score report**. `token_motor` is
+    /// sourced from the **per-char dwell slice** of the token's span
+    /// — a candidate-independent read that's present on every
+    /// loggable record (fast lane included).
+    ///
+    /// * C5a's resolver: classifies `CorrectedToSuggestion` when the
+    ///   user lands on a candidate Cautious wouldn't have suggested
+    ///   (reads `top_candidate`).
+    /// * C5b's lexicon proposer: gates promotion of Kept words by
+    ///   `token_motor.verdict` — clean execution promotes, slip
+    ///   execution holds. `top_motor_evidence` is no longer the gate;
+    ///   it's kept on the record as a diagnostic.
+    ///
+    /// Pass `None` for `top_*` whenever the score report had no
+    /// candidates. `token_motor` should always be `Some(_)`; a `None`
+    /// indicates a bug in the engine's dwell-tracking (defensive).
+    #[allow(clippy::too_many_arguments)]
     pub fn append(
         &mut self,
         timestamp_ms: u64,
         decision: DecisionOutcome,
         anchor_id: u32,
         active_tier: ConfidenceTier,
+        top_candidate: Option<String>,
+        top_score: Option<f64>,
+        top_motor_evidence: Option<f64>,
         top_confidence: Option<Confidence>,
+        token_motor: Option<crate::motor_signal::TokenMotorSignal>,
     ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
 
         let original_text = decision.original().to_string();
-        let (top_candidate, top_score) = match &decision {
-            DecisionOutcome::WouldCorrect {
-                suggested, score, ..
-            } => (Some(suggested.clone()), Some(*score)),
-            DecisionOutcome::LeaveAlone { .. } => (None, None),
-        };
         let confidence = LogConfidence::from_optional(top_confidence);
 
         let record = LogRecord {
@@ -248,10 +368,15 @@ impl DecisionLedger {
             decision,
             top_candidate,
             top_score,
+            top_motor_evidence,
+            token_motor,
             confidence,
             anchor_id,
             active_tier,
             outcome: Outcome::Pending,
+            // Pending → no contribution yet → no credited verdict.
+            // Filled in by `set_credited` at Kept-resolution time.
+            credited: None,
             log_version: LOG_VERSION,
         };
 
@@ -262,15 +387,16 @@ impl DecisionLedger {
         id
     }
 
-    /// Transition the outcome slot of record `id`. **Defined for C5;
-    /// C4 never calls this.** Returns `true` if the record was found
-    /// (and updated), `false` if `id` has already been evicted or
-    /// never existed.
+    /// Transition the outcome slot of record `id`. Called by Component 5
+    /// ([`crate::resolver::OutcomeResolver::tick`]) as the user's edits
+    /// reveal the outcome; **revisable** — may fire more than once on
+    /// the same record, latest write wins. Returns `true` if the record
+    /// was found (and updated), `false` if `id` has already been evicted
+    /// or never existed.
     ///
     /// O(n) scan — the ledger is small and resolution events are
     /// infrequent (one per real user correction). If the ledger ever
     /// outgrows that, switch to a (id → index) sidecar map.
-    #[allow(dead_code)]
     pub fn resolve_outcome(&mut self, id: u64, outcome: Outcome) -> bool {
         for r in self.records.iter_mut() {
             if r.id == id {
@@ -286,6 +412,27 @@ impl DecisionLedger {
     /// transitioning.
     pub fn get(&self, id: u64) -> Option<&LogRecord> {
         self.records.iter().find(|r| r.id == id)
+    }
+
+    /// Write the `credited` slot of record `id`. Called by the engine
+    /// at the same site that drives [`crate::LexiconProposer::note_record`],
+    /// using the proposer's `credit_paused` state to compute the bit:
+    ///
+    ///   * `Some(true)`  — outcome is `Kept` AND proposer was active.
+    ///   * `Some(false)` — outcome is `Kept` BUT proposer was paused.
+    ///   * `None`        — outcome is non-Kept (no contribution
+    ///                     possible) or record still Pending.
+    ///
+    /// Returns `true` iff the record was found. O(n) scan, same as
+    /// [`Self::resolve_outcome`].
+    pub fn set_credited(&mut self, id: u64, credited: Option<bool>) -> bool {
+        for r in self.records.iter_mut() {
+            if r.id == id {
+                r.credited = credited;
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -473,11 +620,55 @@ mod tests {
 
     // ---- DecisionLedger basics ------------------------------------------
 
+    /// Convenience for tests: append a `WouldCorrect`-shaped record and
+    /// also populate the matching candidate/score on the record (mirrors
+    /// what engine.rs does — sourced from the score report, not the
+    /// decision arm). Motor evidence defaults to 0.5 (a neutral
+    /// placeholder for tests that don't exercise the motor signal).
+    #[allow(clippy::too_many_arguments)]
+    fn append_would_correct(
+        ledger: &mut DecisionLedger,
+        timestamp_ms: u64,
+        original: &str,
+        suggested: &str,
+        score: f64,
+        anchor_id: u32,
+        tier: ConfidenceTier,
+        conf: Confidence,
+    ) -> u64 {
+        ledger.append(
+            timestamp_ms,
+            would_correct(original, suggested, score),
+            anchor_id,
+            tier,
+            Some(suggested.to_string()),
+            Some(score),
+            Some(0.5),
+            Some(conf),
+            // Test default: a 3-char clean span. Tests that want
+            // specific motor verdicts construct the signal explicitly.
+            Some(crate::motor_signal::TokenMotorSignal {
+                verdict: crate::motor_signal::TokenMotorVerdict::Clean,
+                slip_score: 0.0,
+                graze_count: 0,
+                char_count: 3,
+            }),
+        )
+    }
+
     #[test]
     fn append_initialises_outcome_to_pending() {
         let mut ledger = DecisionLedger::new();
-        let d = would_correct("teh", "the", 0.82);
-        let id = ledger.append(1_000, d, 42, ConfidenceTier::Cautious, Some(Confidence::High));
+        let id = append_would_correct(
+            &mut ledger,
+            1_000,
+            "teh",
+            "the",
+            0.82,
+            42,
+            ConfidenceTier::Cautious,
+            Confidence::High,
+        );
         let rec = ledger.get(id).unwrap();
         assert_eq!(rec.outcome, Outcome::Pending);
         assert_eq!(rec.anchor_id, 42);
@@ -486,6 +677,7 @@ mod tests {
         assert_eq!(rec.original_text, "teh");
         assert_eq!(rec.top_candidate.as_deref(), Some("the"));
         assert_eq!(rec.top_score, Some(0.82));
+        assert_eq!(rec.top_motor_evidence, Some(0.5));
         assert_eq!(rec.confidence, LogConfidence::High);
         assert_eq!(rec.log_version, LOG_VERSION);
     }
@@ -494,37 +686,93 @@ mod tests {
     fn append_for_leave_alone_no_candidates_sets_below_floor_band() {
         let mut ledger = DecisionLedger::new();
         let d = leave_alone("Soumyo", LeaveAloneReason::NoCandidates);
-        let id = ledger.append(2_000, d, 7, ConfidenceTier::Balanced, None);
+        // NoCandidates is the only arm where the score report had
+        // nothing — `top_candidate` / `top_score` are legitimately
+        // `None` here.
+        let id = ledger.append(
+            2_000,
+            d,
+            7,
+            ConfidenceTier::Balanced,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         let rec = ledger.get(id).unwrap();
-        // No candidate → no top fields, band is BelowFloor.
         assert!(rec.top_candidate.is_none());
         assert!(rec.top_score.is_none());
+        assert!(rec.top_motor_evidence.is_none());
+        // token_motor is independent of candidate availability — for
+        // a NoCandidates record we pass None defensively, the engine
+        // path actually populates it from line_dwells.
+        assert!(rec.token_motor.is_none());
         assert_eq!(rec.confidence, LogConfidence::BelowFloor);
+    }
+
+    #[test]
+    fn append_for_leave_alone_with_candidate_keeps_candidate() {
+        // C5a load-bearing: a `LeaveAlone(BelowActiveTier)` decision
+        // **still carries the candidate** so the resolver can attribute
+        // `CorrectedToSuggestion` when the user lands on a suggestion
+        // the mode wouldn't have fired. This is the change that fixes
+        // the "bullon → bullion" misclassification: the engine knows
+        // the candidate, only the mode declined to act.
+        let mut ledger = DecisionLedger::new();
+        let d = leave_alone("bullon", LeaveAloneReason::BelowActiveTier);
+        let id = ledger.append(
+            0,
+            d,
+            1,
+            ConfidenceTier::Cautious,
+            Some("bullion".to_string()),
+            Some(0.47),
+            Some(0.55),
+            Some(Confidence::Medium),
+            None,
+        );
+        let rec = ledger.get(id).unwrap();
+        assert_eq!(rec.top_candidate.as_deref(), Some("bullion"));
+        assert_eq!(rec.top_score, Some(0.47));
+        assert_eq!(rec.confidence, LogConfidence::Medium);
+        // Decision arm is still `LeaveAlone` — the candidate is a
+        // *score-report* field, orthogonal to the engine's action.
+        assert!(matches!(rec.decision, DecisionOutcome::LeaveAlone { .. }));
     }
 
     #[test]
     fn ids_are_monotonic_across_appends() {
         let mut ledger = DecisionLedger::new();
-        let id0 = ledger.append(
+        let id0 = append_would_correct(
+            &mut ledger,
             0,
-            would_correct("a", "an", 0.6),
+            "a",
+            "an",
+            0.6,
             1,
             ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+            Confidence::Medium,
         );
-        let id1 = ledger.append(
+        let id1 = append_would_correct(
+            &mut ledger,
             0,
-            would_correct("b", "be", 0.6),
+            "b",
+            "be",
+            0.6,
             2,
             ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+            Confidence::Medium,
         );
-        let id2 = ledger.append(
+        let id2 = append_would_correct(
+            &mut ledger,
             0,
-            would_correct("c", "cat", 0.6),
+            "c",
+            "cat",
+            0.6,
             3,
             ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+            Confidence::Medium,
         );
         assert_eq!((id0, id1, id2), (0, 1, 2));
     }
@@ -534,34 +782,46 @@ mod tests {
     #[test]
     fn capacity_evicts_oldest_when_full() {
         let mut ledger = DecisionLedger::with_capacity(3);
-        let id0 = ledger.append(
+        let id0 = append_would_correct(
+            &mut ledger,
             0,
-            would_correct("a", "an", 0.6),
+            "a",
+            "an",
+            0.6,
             1,
             ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+            Confidence::Medium,
         );
-        let id1 = ledger.append(
+        let id1 = append_would_correct(
+            &mut ledger,
             0,
-            would_correct("b", "be", 0.6),
+            "b",
+            "be",
+            0.6,
             2,
             ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+            Confidence::Medium,
         );
-        let id2 = ledger.append(
+        let id2 = append_would_correct(
+            &mut ledger,
             0,
-            would_correct("c", "cat", 0.6),
+            "c",
+            "cat",
+            0.6,
             3,
             ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+            Confidence::Medium,
         );
         // Capacity full; the next append should evict id0.
-        let id3 = ledger.append(
+        let id3 = append_would_correct(
+            &mut ledger,
             0,
-            would_correct("d", "do", 0.6),
+            "d",
+            "do",
+            0.6,
             4,
             ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+            Confidence::Medium,
         );
         assert_eq!(ledger.len(), 3);
         assert!(ledger.get(id0).is_none(), "oldest record should be evicted");
@@ -576,12 +836,15 @@ mod tests {
     fn iter_yields_oldest_first() {
         let mut ledger = DecisionLedger::with_capacity(3);
         for i in 0..3 {
-            ledger.append(
+            append_would_correct(
+                &mut ledger,
                 i,
-                would_correct(&format!("w{i}"), "x", 0.6),
+                &format!("w{i}"),
+                "x",
+                0.6,
                 i as u32,
                 ConfidenceTier::Eager,
-                Some(Confidence::Medium),
+                Confidence::Medium,
             );
         }
         let timestamps: Vec<u64> = ledger.iter().map(|r| r.timestamp_ms).collect();
@@ -593,12 +856,15 @@ mod tests {
     #[test]
     fn resolve_outcome_updates_existing_record() {
         let mut ledger = DecisionLedger::new();
-        let id = ledger.append(
+        let id = append_would_correct(
+            &mut ledger,
             0,
-            would_correct("teh", "the", 0.82),
+            "teh",
+            "the",
+            0.82,
             1,
             ConfidenceTier::Cautious,
-            Some(Confidence::High),
+            Confidence::High,
         );
         assert_eq!(ledger.get(id).unwrap().outcome, Outcome::Pending);
 
@@ -613,12 +879,15 @@ mod tests {
     #[test]
     fn resolve_outcome_returns_false_for_unknown_id() {
         let mut ledger = DecisionLedger::new();
-        ledger.append(
+        append_would_correct(
+            &mut ledger,
             0,
-            would_correct("teh", "the", 0.82),
+            "teh",
+            "the",
+            0.82,
             1,
             ConfidenceTier::Cautious,
-            Some(Confidence::High),
+            Confidence::High,
         );
         assert!(!ledger.resolve_outcome(9999, Outcome::Kept));
     }
@@ -627,27 +896,108 @@ mod tests {
     fn resolve_outcome_returns_false_for_evicted_id() {
         // Capacity 2 — the third append evicts id0; resolve_outcome on it fails.
         let mut ledger = DecisionLedger::with_capacity(2);
-        let id0 = ledger.append(
+        let id0 = append_would_correct(
+            &mut ledger,
             0,
-            would_correct("a", "an", 0.6),
+            "a",
+            "an",
+            0.6,
             1,
             ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+            Confidence::Medium,
         );
-        ledger.append(
+        append_would_correct(
+            &mut ledger,
             0,
-            would_correct("b", "be", 0.6),
+            "b",
+            "be",
+            0.6,
             2,
             ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+            Confidence::Medium,
         );
-        ledger.append(
+        append_would_correct(
+            &mut ledger,
             0,
-            would_correct("c", "cat", 0.6),
+            "c",
+            "cat",
+            0.6,
             3,
             ConfidenceTier::Eager,
-            Some(Confidence::Medium),
+            Confidence::Medium,
         );
         assert!(!ledger.resolve_outcome(id0, Outcome::Kept));
+    }
+
+    // ---- credited slot (LOG_VERSION v5) --------------------------------
+
+    #[test]
+    fn append_initialises_credited_to_none() {
+        // Pending records have no credited verdict yet — set_credited is
+        // called at outcome-resolution time, not at append time.
+        let mut ledger = DecisionLedger::new();
+        let id = append_would_correct(
+            &mut ledger,
+            0,
+            "teh",
+            "the",
+            0.8,
+            1,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
+        );
+        assert_eq!(ledger.get(id).unwrap().credited, None);
+    }
+
+    #[test]
+    fn set_credited_records_kept_with_pause_state() {
+        // The two halves of the user-visible bit:
+        //   * Some(true)  — Kept while learning was active → contribution counted.
+        //   * Some(false) — Kept while learning was paused → contribution skipped.
+        // Both shapes are valid; the panel uses them to grey out the
+        // paused row and keep the credited row normal.
+        let mut ledger = DecisionLedger::new();
+        let id_credited = append_would_correct(
+            &mut ledger,
+            0,
+            "alpha",
+            "alphax",
+            0.6,
+            1,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
+        );
+        let id_paused = append_would_correct(
+            &mut ledger,
+            0,
+            "beta",
+            "betax",
+            0.6,
+            2,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
+        );
+
+        assert!(ledger.set_credited(id_credited, Some(true)));
+        assert!(ledger.set_credited(id_paused, Some(false)));
+
+        assert_eq!(ledger.get(id_credited).unwrap().credited, Some(true));
+        assert_eq!(ledger.get(id_paused).unwrap().credited, Some(false));
+    }
+
+    #[test]
+    fn set_credited_returns_false_for_unknown_id() {
+        let mut ledger = DecisionLedger::new();
+        append_would_correct(
+            &mut ledger,
+            0,
+            "teh",
+            "the",
+            0.8,
+            1,
+            ConfidenceTier::Eager,
+            Confidence::Medium,
+        );
+        assert!(!ledger.set_credited(9_999, Some(true)));
     }
 }

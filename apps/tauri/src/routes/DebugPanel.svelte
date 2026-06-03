@@ -16,6 +16,7 @@
     engine://lexicon         — per Word token: known? + frequency (Component 3a)
     engine://candidates      — per unknown Word token: scored edit-1 candidates (3b + 3c-1)
     engine://log-record      — per appended decision-ledger record (Component 4)
+    engine://log-record-updated — per outcome transition on an existing record (Component 5a, revisable)
 
   Layout:
     [resize handle — drag to resize, height persisted in sessionStorage]
@@ -27,6 +28,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { invoke } from "@tauri-apps/api/core";
 
   type KeystrokePayload = {
     key: string;
@@ -148,6 +150,11 @@
     per_pair: PairSlipRow[];
     map_swap_pairs: number;
     map_key_confidence: number;
+    /// C5b kill-switch state — when false, confirmed slips tally but
+    /// don't write to the L3 volatility map. Defaulted off pending
+    /// motor-verdict validation; the SLIPS section reflects the live
+    /// state so the builder always knows whether learning is active.
+    map_writes_enabled: boolean;
   };
   type SlipPayload = {
     aimed_for: string;
@@ -235,16 +242,29 @@
   /// recorded on each ledger entry. `below_floor` covers both "top
   /// candidate below floor" and "no candidates at all".
   type LogConfidence = "high" | "medium" | "low" | "below_floor";
-  /// Mirrors `correction_engine::log::Outcome` — populated by C5; in
-  /// C4-only builds every record arrives as `pending`.
+  /// Mirrors `correction_engine::log::Outcome`. Component 5a resolves
+  /// records from `pending` to one of the four terminal states; further
+  /// edits on the same span can re-resolve (revisable).
   type Outcome =
     | { kind: "pending" }
     | { kind: "kept" }
     | { kind: "corrected_to_suggestion" }
-    | { kind: "corrected_to_other" };
+    | { kind: "corrected_to_other" }
+    | { kind: "abandoned" };
+  /// Mirrors `correction_engine::motor_signal::TokenMotorSignal` —
+  /// the candidate-INDEPENDENT per-token motor signal C5b reads.
+  /// Present on every loggable record (fast lane included).
+  type TokenMotorVerdict = "clean" | "slip" | "insufficient";
+  type TokenMotorSignal = {
+    verdict: TokenMotorVerdict;
+    slip_score: number;
+    graze_count: number;
+    char_count: number;
+  };
   /// Mirrors `correction_engine::log::LogRecord` — one decision ledger
   /// row. The full `decision` is the canonical outcome; `top_candidate`
-  /// / `top_score` are convenience projections for cheap rendering.
+  /// / `top_score` / `top_motor_evidence` are diagnostic projections;
+  /// `token_motor` is what the C5b proposer actually gates on.
   type LogRecord = {
     id: number;
     timestamp_ms: number;
@@ -252,17 +272,132 @@
     decision: DecisionOutcome;
     top_candidate: string | null;
     top_score: number | null;
+    top_motor_evidence: number | null;
+    token_motor: TokenMotorSignal | null;
     confidence: LogConfidence;
     anchor_id: number;
     active_tier: ConfidenceTier;
     outcome: Outcome;
+    /// LOG_VERSION v5 — was this Kept record actually credited to
+    /// the lexicon proposer, or did "Pause learning" suppress it?
+    ///   * null         — Pending OR resolved to a non-Kept outcome.
+    ///   * true         — Kept while learning was active.
+    ///   * false        — Kept while learning was paused (panel greys
+    ///                    the row + tags it "paused" to make the
+    ///                    distinction visible).
+    credited: boolean | null;
     log_version: number;
   };
+
+  // ---- Component 5b — lexicon proposals -------------------------------
+  /// Mirrors `correction_engine::lexicon_proposal::Lane`.
+  type Lane =
+    | { kind: "fast" }
+    | { kind: "slow"; rejected_confidence: LogConfidence };
+  type MotorVerdict = "clean" | "mixed" | "slip" | "unknown";
+  /// Mirrors the v3 `HoldReason` after the linguistic-gate stack.
+  /// Held is "this token's execution looks slip-like OR this token
+  /// is structurally unlike novel vocabulary" — motor + linguistic
+  /// signals, never lane-only.
+  type HoldReason =
+    | "obvious_fragment"
+    | "slip_signature"
+    | "ill_formed"
+    | "near_known_word"
+    | "segmentable_merge"
+    | "prefix_merge";
+  /// Mirrors `correction_engine::linguistic::ProximityVerdict`.
+  type ProximityVerdict =
+    | "far_from_known"
+    | "near_known_edit2"
+    | "segmentable"
+    | "prefix_merge";
+  type ProposalTier =
+    | { kind: "held"; reason: HoldReason }
+    | { kind: "provisional" }
+    | { kind: "confirmed" };
+  /// Mirrors `correction_engine::lexicon_proposal::CasingBaseline`.
+  /// Recency-weighted typing baseline + the derived rescue-active
+  /// flag. The all-caps brand rescue fires only when this user
+  /// hasn't been doing a lot of all-caps lately.
+  type CasingBaseline = {
+    all_caps_share: number;
+    sample_count: number;
+    rescue_active: boolean;
+  };
+
+  /// Mirrors `correction_engine::lexicon_proposal::LexiconProposal`.
+  /// v4 adds `norvig_freq` — the typed word's web-corpus frequency
+  /// (NOT through is_known). Combined with near-known proximity,
+  /// `norvig_freq === 0` is what catches `aduluts`-class typos while
+  /// letting `lol`-class informal real words through.
+  type LexiconProposal = {
+    word: string;
+    lane: Lane;
+    motor_verdict: MotorVerdict;
+    tier: ProposalTier;
+    occasions: number;
+    last_motor_evidence: number | null;
+    last_record_id: number;
+    last_seen_ms: number;
+    plausibility: number;
+    proximity: ProximityVerdict;
+    norvig_freq: number;
+    version: number;
+  };
+  /// Mirrors the `LexiconProposalEvent` engine payload — proposal=null
+  /// means the proposal was retracted (all contributing records rolled
+  /// back under C5a's revisable transitions).
+  type LexiconProposalEvent = {
+    word: string;
+    proposal: LexiconProposal | null;
+  };
+  // ---- C5c Layer A — MotorBaseline types ------------------------------
+  /// One row of the per-finger motor baseline table.
+  type MotorFingerRow = {
+    hand: Hand;
+    finger: Finger;
+    reliability_score: number;
+    n_eff: number;
+    dwell_mean_ms: number | null;
+    iki_mean_ms: number | null;
+  };
+  type MotorBaselineSnapshot = {
+    per_finger: MotorFingerRow[];
+  };
+  /// Per-keystroke anomaly probe — the engine sends one of these per
+  /// keystroke (before the baseline absorbs it).
+  type DwellAnomaly = {
+    z: number;
+    anomaly: number;
+    mean_used: number;
+    sigma_used: number;
+    certainty: number;
+  };
+  type IkiAnomaly = DwellAnomaly;
+  type CoActivation = { overlap_ms: number; anomaly: number };
+  type KeystrokeAnomaly = {
+    dwell: DwellAnomaly;
+    iki: IkiAnomaly | null;
+    coactivation: CoActivation | null;
+    combined: number;
+    certainty: number;
+  };
+  type MotorKeystrokeEvent = {
+    key: string;
+    timestamp_ms: number;
+    dwell_ms: number;
+    hand: Hand | null;
+    finger: Finger | null;
+    anomaly: KeystrokeAnomaly | null;
+  };
+
   type ModelSnapshot = {
     timing: { per_key: KeyTimingRow[]; per_finger: FingerTimingRow[] };
     asymmetry: AsymmetrySnapshot;
     ghost_keys: GhostKeysSnapshot;
     slips: SlipsSnapshot;
+    motor_baseline: MotorBaselineSnapshot;
   };
 
   /// Cap on the per-key ghost list — keep the worst offenders visible,
@@ -334,6 +469,88 @@
   /// own ledger has its own cap (the source of truth).
   const MAX_LOG_ROWS = 200;
   let logRows: LogRecord[] = [];
+
+  /// Component 5b lexicon proposals — keyed by word (case-preserved).
+  /// The engine is the source of truth (in-memory only); the panel
+  /// mirrors the snapshot via per-word update events. Phase 1 is
+  /// observe-only: nothing here writes to is_known.
+  let lexiconProposals: Record<string, LexiconProposal> = {};
+
+  /// Recency-weighted casing baseline. Updated on every fresh
+  /// Word/Acronym seal — surfaced in the LEXICON header so the
+  /// rescue's current state is visible.
+  let casingBaseline: CasingBaseline = {
+    all_caps_share: 0,
+    sample_count: 0,
+    rescue_active: true,
+  };
+
+  /// **C5b Phase 2** — set of words currently live in `is_known` via
+  /// the runtime-learned set. Updated wholesale on each
+  /// `engine://learned-snapshot` event. Used to mark Confirmed
+  /// proposals with a "LIVE" indicator and to flag LOG records whose
+  /// `top_candidate` targets a learned word.
+  let learnedSet: Set<string> = new Set();
+
+  /// **C5 capture-health** — engine-derived view of the sidecar's
+  /// event-tap state. Drives the header pill. Default `unknown` on
+  /// mount; first heartbeat from the sidecar (≤2s after engine
+  /// start) flips it to `live`. The shipped user surface needs this
+  /// silent-death warning to be impossible to miss — see commit M's
+  /// rationale.
+  type CaptureHealth = "unknown" | "live" | "unhealthy" | "stopped";
+  let captureHealth: CaptureHealth = "unknown";
+
+  /// **C5c motor map** — the `StabilityReport` read-model from
+  /// `engine://motor-stability`: kill-switch inputs (sample coverage,
+  /// overall slip rate) + the weakest-keys preview Practice mode would
+  /// build a curriculum from. Emitted periodically (~30s) and on demand
+  /// (`request_motor_stability`, fired on mount so the readout populates
+  /// immediately rather than waiting for the first periodic tick). `null`
+  /// until the first emit; the map starts empty on a fresh session.
+  interface StabilityReport {
+    total_observations: number;
+    keys_tracked: number;
+    keys_well_sampled: number;
+    min_samples: number;
+    overall_slip_rate: number;
+    weakest: [string, number][];
+    generated_at: number;
+  }
+  let stability: StabilityReport | null = null;
+
+  /// **C5c Layer A** — per-finger motor baseline snapshot, replaced
+  /// wholesale on each `engine://motor-baseline` event. Renders as a
+  /// stable 10-row table even before any data arrives.
+  let motorBaseline: MotorBaselineSnapshot = { per_finger: [] };
+  /// Rolling buffer of the last per-keystroke anomaly probes, newest
+  /// first. Capped so the panel doesn't grow unbounded.
+  const MOTOR_KEYSTROKE_HISTORY = 20;
+  let motorKeystrokes: MotorKeystrokeEvent[] = [];
+
+  /// **Meta-context pause** — manual only. An earlier prototype also
+  /// auto-paused on debug-window focus, but that mechanism guarded
+  /// the wrong thing: it fired while the user was merely WATCHING the
+  /// panel (the panel has no text input — keystrokes don't go INTO
+  /// it) and never fired in the actual pollution case (typing about
+  /// TypeAssist in another app's chat). Recency-reclaim is robust
+  /// enough as a backstop; this leaves one explicit knob the user
+  /// owns. `engineReportedPaused` mirrors what the engine actually
+  /// applied (echo from `engine://learning-paused`), so the indicator
+  /// can never silently drift from the engine's real flag.
+  let manualPaused = false;
+  let engineReportedPaused = false;
+
+  /// **Hard pause** — distinct from `manualPaused` above. When set,
+  /// the engine drops Key/Backspace events at its task boundary, so
+  /// the FEED freezes and the engine effectively sleeps. Used when
+  /// the user is talking ABOUT the system and wants the engine
+  /// quiet, not just suppressing the credit step. `engineReportedInputPaused`
+  /// mirrors what the engine applied (echo from
+  /// `engine://input-paused`), same drift-prevention rationale as
+  /// the learning-paused echo.
+  let inputPaused = false;
+  let engineReportedInputPaused = false;
 
   let feedEl: HTMLDivElement;
   let unlistens: UnlistenFn[] = [];
@@ -409,8 +626,79 @@
     // LOG is session-spanning, but Clear should reset the panel view —
     // the engine's ledger keeps its own copy as the source of truth.
     logRows = [];
+    // Same for LEXICON proposals: engine owns the truth, panel just
+    // mirrors. Clear wipes the local copy; the next proposal event
+    // will repopulate. learnedSet is similarly mirrored — the engine
+    // will resend a snapshot on the next learning event.
+    lexiconProposals = {};
+    learnedSet = new Set();
     // Note: Clear only resets the *view*. The L2 model in the backend keeps
     // its own counts — modelRows/fingerRows will repopulate on the next keystroke.
+  }
+
+  /// Engine-side LEXICON wipe. Distinct from `clear()` (panel mirrors
+  /// only): asks the Rust engine to drop every proposal, every per-
+  /// record contribution, every learned-at-ms entry, AND the lex's
+  /// learned set. The engine emits `engine://lexicon-reset` +
+  /// `engine://learned-snapshot` in response; the listeners above wipe
+  /// the local mirrors. Used to validate recency reclamation: confirm
+  /// a slip, reset, re-type the canonical, watch the cascade demote
+  /// the slip when the canonical confirms.
+  async function resetLexicon() {
+    try {
+      await invoke("reset_lexicon");
+    } catch (err) {
+      console.error("reset_lexicon failed:", err);
+    }
+  }
+
+  /// Ask the engine to soft-restart capture — sidecar tears down its
+  /// current event tap and creates a fresh one. The primary recovery
+  /// path when the CAPTURE pill goes amber (Unhealthy) or red
+  /// (Stopped). Stays clickable in all states so it's never the case
+  /// that "the only way out is to restart the app."
+  async function restartCapture() {
+    try {
+      await invoke("restart_capture");
+    } catch (err) {
+      console.error("restart_capture failed:", err);
+    }
+  }
+
+  /// Pause controls become aria-disabled when capture is Stopped —
+  /// clicking them would post to an engine that may have lost contact
+  /// with the sidecar. The Restart capture button is the visible
+  /// recovery path; once capture comes back, Pause buttons re-enable.
+  $: pauseControlsDisabled = captureHealth === "stopped";
+
+  /// Whenever the manual toggle flips, post the new state to the
+  /// engine. The engine's echo on `engine://learning-paused` then
+  /// drives the indicator — keeping the UI honest about the engine's
+  /// actual flag rather than the panel's optimistic guess.
+  $: {
+    void manualPaused;
+    void invoke("set_learning_paused", { paused: manualPaused }).catch((err) =>
+      console.error("set_learning_paused failed:", err),
+    );
+  }
+
+  /// Same shape for hard pause. Posted on every toggle; engine echoes
+  /// back via `engine://input-paused`. On transition to true, the
+  /// engine flushes its line state and emits `engine://line-reset` —
+  /// the panel's existing line-reset listener already handles that.
+  $: {
+    void inputPaused;
+    void invoke("set_input_paused", { paused: inputPaused }).catch((err) =>
+      console.error("set_input_paused failed:", err),
+    );
+  }
+
+  function togglePauseLearning() {
+    manualPaused = !manualPaused;
+  }
+
+  function togglePauseInput() {
+    inputPaused = !inputPaused;
   }
 
   onMount(async () => {
@@ -469,6 +757,37 @@
       }),
     );
     unlistens.push(
+      // C5 capture-health — only emitted on TRANSITION (not every
+      // heartbeat), so the default `unknown` stays until the engine
+      // tells us otherwise. A panel reload may miss earlier
+      // transitions; commit O's watchdog will re-emit the current
+      // state on a timer so reloads converge to truth.
+      await listen<{ state: CaptureHealth }>("engine://capture-health", (e) => {
+        captureHealth = e.payload.state;
+      }),
+    );
+    unlistens.push(
+      // C5c Layer A — per-finger motor baseline snapshot. Replaces
+      // wholesale on each emission. (Same data flows in
+      // engine://model-snapshot too, but a separate event lets
+      // future panels listen for just the motor info without
+      // re-parsing the whole model snapshot.)
+      await listen<MotorBaselineSnapshot>("engine://motor-baseline", (e) => {
+        motorBaseline = e.payload;
+      }),
+    );
+    unlistens.push(
+      // C5c Layer A — per-keystroke anomaly probe. Prepended to a
+      // rolling buffer; the table renders newest first and the
+      // buffer is capped so the panel doesn't grow unbounded.
+      await listen<MotorKeystrokeEvent>("engine://motor-keystroke", (e) => {
+        motorKeystrokes = [e.payload, ...motorKeystrokes].slice(
+          0,
+          MOTOR_KEYSTROKE_HISTORY,
+        );
+      }),
+    );
+    unlistens.push(
       await listen<SlipPayload>("engine://slip", (e) => {
         push({
           id: nextId++,
@@ -522,6 +841,99 @@
         });
       }),
     );
+    unlistens.push(
+      // Component 5b — casing baseline. Updated on every fresh
+      // Word/Acronym seal; the engine emits the full snapshot each
+      // time, so the panel just replaces wholesale.
+      await listen<CasingBaseline>("engine://casing-baseline", (e) => {
+        casingBaseline = e.payload;
+      }),
+    );
+    unlistens.push(
+      // Component 5b Phase 2 — runtime-learned-words snapshot.
+      // Lowercase keys; replace wholesale on each emission.
+      await listen<string[]>("engine://learned-snapshot", (e) => {
+        learnedSet = new Set(e.payload.map((w) => w.toLowerCase()));
+      }),
+    );
+    unlistens.push(
+      // Component 5b — per-word proposal updates. proposal=null means
+      // the proposal was retracted; remove from the local map so the
+      // panel matches the engine's state.
+      await listen<LexiconProposalEvent>("engine://lexicon-proposal", (e) => {
+        const { word, proposal } = e.payload;
+        if (proposal === null) {
+          const next = { ...lexiconProposals };
+          delete next[word];
+          lexiconProposals = next;
+        } else {
+          lexiconProposals = { ...lexiconProposals, [word]: proposal };
+        }
+      }),
+    );
+    unlistens.push(
+      // Component 5b Phase 2 follow-up — engine-side LEXICON wipe.
+      // Distinct from a panel-side Clear: the engine's proposer state
+      // and lex.learned have both been cleared (see Reset LEXICON
+      // button). The accompanying learned-snapshot will also fire and
+      // empty `learnedSet`; this listener wipes the per-word proposal
+      // mirror so the table doesn't keep ghost rows. Empty payload.
+      await listen("engine://lexicon-reset", () => {
+        lexiconProposals = {};
+        learnedSet = new Set();
+      }),
+    );
+    unlistens.push(
+      // Engine echoes the applied pause state after every
+      // set_learning_paused command. Read by the indicator so the UI
+      // can never silently drift from the engine's real flag (e.g.
+      // if the command channel is closed, the indicator stays where
+      // the engine left it rather than where the panel guessed).
+      await listen<{ paused: boolean }>("engine://learning-paused", (e) => {
+        engineReportedPaused = e.payload.paused;
+      }),
+    );
+    unlistens.push(
+      // Same echo for hard input-pause — drives the "input paused"
+      // indicator state. The engine's emitted line-reset that
+      // accompanies a pause-on transition is handled by the existing
+      // engine://line-reset listener, which already wipes the
+      // current-line panel state.
+      await listen<{ paused: boolean }>("engine://input-paused", (e) => {
+        engineReportedInputPaused = e.payload.paused;
+      }),
+    );
+    unlistens.push(
+      // Component 5a — outcome transition for an existing record.
+      // **Revisable**: the same id may receive several updates as the
+      // user revisits the word's span. Update in place by id; the
+      // engine is the source of truth (we never re-derive outcomes
+      // panel-side, only mirror what the resolver reports). If the
+      // updated record was evicted from our local window (rare —
+      // requires >200 records since first emit), drop the update.
+      await listen<LogRecord>("engine://log-record-updated", (e) => {
+        const updated = e.payload;
+        const i = logRows.findIndex((r) => r.id === updated.id);
+        if (i < 0) return;
+        // New array reference so Svelte picks up the change.
+        const next = logRows.slice();
+        next[i] = updated;
+        logRows = next;
+      }),
+    );
+    unlistens.push(
+      // C5c motor stability read-model. Replaced wholesale on each emit
+      // (periodic ~30s + on-demand). Drives the always-visible MOTOR
+      // readout so the slip map can be sanity-checked as it accumulates.
+      await listen<StabilityReport>("engine://motor-stability", (e) => {
+        stability = e.payload;
+      }),
+    );
+    // Pull a fresh report now so the readout isn't blank until the first
+    // periodic tick (it's a read-only request — emits, changes nothing).
+    void invoke("request_motor_stability").catch((err) =>
+      console.error("request_motor_stability failed:", err),
+    );
   });
 
   onDestroy(() => {
@@ -546,6 +958,10 @@
   function fmtKeyFinger(row: { hand: Hand | null; finger: Finger | null }): string {
     if (!row.hand || !row.finger) return "—";
     return fmtFinger(row.hand, row.finger);
+  }
+  /// Slip rate (0–1) → one-decimal percent for the MOTOR readout.
+  function fmtSlipPct(rate: number): string {
+    return `${(rate * 100).toFixed(1)}%`;
   }
   /// Compose a token's raw form for display: leading + core + trailing,
   /// with core highlighted (the brief: span anchor tracks core only).
@@ -631,8 +1047,8 @@
     }
     return `leave alone · ${fmtLeaveAloneReason(d.reason)}`;
   }
-  /// Outcome slot label. Pending dominates in C4-only builds; C5 will
-  /// flip records to one of the three terminal states.
+  /// Outcome slot label. Component 5a flips records out of `pending`
+  /// once the user moves on; revisits flip them again.
   function fmtOutcome(o: Outcome): string {
     switch (o.kind) {
       case "pending":
@@ -643,8 +1059,85 @@
         return "→ suggestion";
       case "corrected_to_other":
         return "→ other";
+      case "abandoned":
+        return "abandoned";
     }
   }
+  // ---- LEXICON (Component 5b) formatters --------------------------------
+  function fmtLane(l: Lane): string {
+    return l.kind === "fast"
+      ? "fast"
+      : `slow · rejected ${fmtLogConfidence(l.rejected_confidence)}`;
+  }
+  function fmtMotorVerdict(v: MotorVerdict): string {
+    switch (v) {
+      case "clean":
+        return "clean";
+      case "slip":
+        return "slip";
+      case "mixed":
+        return "mixed";
+      case "unknown":
+        return "—";
+    }
+  }
+  function fmtMotorEvidence(m: number | null): string {
+    return m === null ? "—" : m.toFixed(2);
+  }
+  function fmtHoldReason(r: HoldReason): string {
+    switch (r) {
+      case "obvious_fragment":
+        return "fragment";
+      case "slip_signature":
+        return "slip";
+      case "ill_formed":
+        return "ill-formed";
+      case "near_known_word":
+        return "near-known";
+      case "segmentable_merge":
+        return "segment";
+      case "prefix_merge":
+        return "prefix-merge";
+    }
+  }
+  function fmtProximity(p: ProximityVerdict): string {
+    switch (p) {
+      case "far_from_known":
+        return "far";
+      case "near_known_edit2":
+        return "near-edit2";
+      case "segmentable":
+        return "segment";
+      case "prefix_merge":
+        return "prefix";
+    }
+  }
+  function fmtPlausibility(p: number): string {
+    return p.toFixed(2);
+  }
+  /// Norvig web-corpus frequency, compact format. `—` when zero
+  /// (never seen on the web) — this is the signal the proposer
+  /// combines with near-known proximity to veto typos like `aduluts`.
+  function fmtNorvig(n: number): string {
+    if (n === 0) return "—";
+    return fmtFreqCompact(n);
+  }
+  function fmtProposalTier(t: ProposalTier): string {
+    switch (t.kind) {
+      case "held":
+        return `held · ${fmtHoldReason(t.reason)}`;
+      case "provisional":
+        return "provisional";
+      case "confirmed":
+        return "confirmed";
+    }
+  }
+  /// Most-recent-first ordering for the LEXICON table. Mirrors the
+  /// Rust-side snapshot() ordering so test reasoning carries over.
+  function sortedProposals(map: Record<string, LexiconProposal>): LexiconProposal[] {
+    return Object.values(map).sort((a, b) => b.last_seen_ms - a.last_seen_ms);
+  }
+  $: lexiconProposalList = sortedProposals(lexiconProposals);
   function fmtRatio(r: number): string {
     return `${r.toFixed(2)}×`;
   }
@@ -687,6 +1180,29 @@
   </div>
 
   <header class="strip">
+    <!-- C5 capture-health pill. Leftmost in the strip so silent
+         capture death is impossible to miss while glancing at the
+         panel. Color + text — never color-only. -->
+    <div class="stat" title="Capture health — sidecar event-tap state. Live = events flowing. Unhealthy = sidecar alive but tap disabled. Stopped = no heartbeats; restart needed.">
+      <span class="stat-label">CAPTURE</span>
+      <span class="stat-val capture-pill capture-pill-{captureHealth}">
+        <span class="capture-dot"></span>{captureHealth}
+      </span>
+    </div>
+    <!-- Restart capture — soft restart via OutboundCommand::RestartTap.
+         Always clickable; visually elevated (amber border) when the
+         pill is anything other than "live" so the recovery path is
+         obvious exactly when it's needed. Sits next to the pill so
+         the state + recovery action read as one unit. -->
+    <button
+      type="button"
+      class="restart-capture"
+      class:restart-capture-elevated={captureHealth !== "live"}
+      title="Tell the sidecar to tear down its current event tap and create a fresh one. Always available; use when CAPTURE pill is amber/red."
+      on:click={restartCapture}
+    >
+      Restart capture
+    </button>
     <div class="stat"><span class="stat-label">KEYS</span><span class="stat-val">{keystrokeCount}</span></div>
     <!-- MODE = active engine setting (Cautious / Balanced / Eager). Per
          3c-3, modes and per-candidate confidences use SEPARATE vocabularies
@@ -703,6 +1219,41 @@
     <div class="spacer" />
     <button type="button" class="clear" on:click={clear}>Clear</button>
   </header>
+
+  <!-- C5c MOTOR stability readout. Always visible (funnel spirit) so the
+       slip map can be sanity-checked as it accumulates. Updates on the
+       engine's periodic ~30s emit + the on-mount request. Headline numbers
+       are the kill-switch inputs; the weakest list is Practice's source. -->
+  <div class="motor-readout" aria-label="Motor map stability">
+    <span class="stat-label">MOTOR</span>
+    {#if stability}
+      <span class="motor-stat" title="Lifetime observations folded into the motor map">
+        obs <b>{stability.total_observations}</b>
+      </span>
+      <span
+        class="motor-stat"
+        title="Keys with ≥{stability.min_samples} decayed samples (earned a slip rate), of {stability.keys_tracked} tracked"
+      >
+        sampled <b>{stability.keys_well_sampled}/{stability.keys_tracked}</b>
+      </span>
+      <span class="motor-stat" title="Decayed slip rate across well-sampled keys">
+        slip <b>{fmtSlipPct(stability.overall_slip_rate)}</b>
+      </span>
+      <span class="motor-sep">·</span>
+      <span class="motor-stat">weakest</span>
+      {#if stability.weakest.length > 0}
+        {#each stability.weakest as [k, rate] (k)}
+          <span class="motor-key" title="{fmtKey(k)} slips {fmtSlipPct(rate)}"
+            >{fmtKey(k)} {fmtSlipPct(rate)}</span
+          >
+        {/each}
+      {:else}
+        <span class="motor-empty">no well-sampled keys yet</span>
+      {/if}
+    {:else}
+      <span class="motor-empty">waiting for first report…</span>
+    {/if}
+  </div>
 
   <div class="body">
     <!-- Left column: live event feed (scrolls independently). -->
@@ -964,7 +1515,7 @@
             <div class="empty">no decisions logged yet…</div>
           {:else}
             <div class="log-status">
-              <span class="num">{logRows.length}</span> shown · all pending until C5
+              <span class="num">{logRows.length}</span> shown · outcomes resolve when the user moves on
             </div>
             <div class="log-table">
               <div class="log-row log-head">
@@ -976,19 +1527,29 @@
                 <span class="col-lx">outcome</span>
               </div>
               {#each logRows as r (r.id)}
+                {@const targetsLearned = r.top_candidate !== null && learnedSet.has(r.top_candidate.toLowerCase())}
+                {@const wasPaused = r.credited === false}
                 <div
                   class="log-row"
                   class:log-would={r.decision.kind === "would_correct"}
                   class:log-leave={r.decision.kind === "leave_alone"}
+                  class:log-learned-target={targetsLearned}
+                  class:log-paused={wasPaused}
                 >
                   <span class="col-lo">{r.original_text}</span>
-                  <span class="col-ld">{fmtDecisionShort(r.decision)}</span>
+                  <span class="col-ld">
+                    {fmtDecisionShort(r.decision)}
+                    {#if targetsLearned}<span class="log-learned-marker" title="top_candidate is a runtime-learned word — would-correct against the learning lexicon, not bundled SCOWL.">★L</span>{/if}
+                  </span>
                   <span class="col-lc num">{fmtScore(r.top_score)}</span>
                   <span class="col-lb cand-conf cand-conf-{r.confidence === 'below_floor' ? 'none' : r.confidence}"
                     >{fmtLogConfidence(r.confidence)}</span
                   >
                   <span class="col-la num">#{r.anchor_id}</span>
-                  <span class="col-lx">{fmtOutcome(r.outcome)}</span>
+                  <span class="col-lx">
+                    {fmtOutcome(r.outcome)}
+                    {#if wasPaused}<span class="log-paused-tag" title="Kept, but learning was paused — this record was OBSERVED but did NOT contribute to the lexicon.">paused</span>{/if}
+                  </span>
                 </div>
               {/each}
               <!-- Tail anchor so the listener can scrollIntoView on append. -->
@@ -997,7 +1558,124 @@
           {/if}
         </div>
 
-        <div class="model-sub model-sub-sticky">SLIPS · strict-filtered candidates · writes to L3 map</div>
+        <div class="model-sub model-sub-sticky lex-sub">
+          <span class="lex-sub-label">
+            LEXICON · 5b proposals · observe-only · is_known untouched ·
+            all-caps <span class="num">{(casingBaseline.all_caps_share * 100).toFixed(0)}%</span>
+            {#if casingBaseline.rescue_active}
+              <span class="casing-rescue-on">rescue ✓</span>
+            {:else}
+              <span class="casing-rescue-off">rescue OFF</span>
+            {/if}
+            <span class="casing-samples">(n={casingBaseline.sample_count.toFixed(0)})</span>
+            {#if engineReportedInputPaused}
+              <span
+                class="lex-input-paused-tag"
+                title="input paused — engine drops Key/Backspace events at its task boundary. FEED is frozen; nothing observes."
+              >
+                · input paused
+              </span>
+            {:else if engineReportedPaused}
+              <span
+                class="lex-paused-tag"
+                title="learning paused — note_record short-circuits. Records still appear in FEED/LOG but contribute nothing to the lexicon."
+              >
+                · learning paused
+              </span>
+            {/if}
+          </span>
+          <button
+            type="button"
+            class="lex-pause"
+            class:lex-pause-on={manualPaused}
+            class:lex-pause-stuck={pauseControlsDisabled}
+            disabled={pauseControlsDisabled}
+            aria-disabled={pauseControlsDisabled}
+            title={pauseControlsDisabled
+              ? "Capture is stopped — Pause is unavailable until capture is restored. Click 'Restart capture' in the header."
+              : "Soft pause — suppress LEXICON credit but keep observing. FEED and decisions keep flowing; the lexicon just doesn't update. Use when watching the engine work without polluting vocabulary."}
+            on:click={togglePauseLearning}
+          >
+            {manualPaused ? "Resume learning" : "Pause learning"}
+          </button>
+          <button
+            type="button"
+            class="lex-pause lex-pause-input"
+            class:lex-pause-on={inputPaused}
+            class:lex-pause-stuck={pauseControlsDisabled}
+            disabled={pauseControlsDisabled}
+            aria-disabled={pauseControlsDisabled}
+            title={pauseControlsDisabled
+              ? "Capture is stopped — Pause is unavailable until capture is restored. Click 'Restart capture' in the header."
+              : "Hard pause — engine drops Key/Backspace events at its task boundary. FEED freezes; engine effectively sleeps. Use when typing about the system in chat. Toggling triggers a line-reset on the engine so resume starts on a clean boundary."}
+            on:click={togglePauseInput}
+          >
+            {inputPaused ? "Resume input" : "Pause input"}
+          </button>
+          <button
+            type="button"
+            class="lex-reset"
+            title="Engine-side wipe: drops every proposal AND every learned word. Distinct from the global Clear button (panel mirrors only)."
+            on:click={resetLexicon}
+          >
+            Reset LEXICON
+          </button>
+        </div>
+        <div class="lex-block">
+          {#if lexiconProposalList.length === 0}
+            <div class="empty">no proposals yet…</div>
+          {:else}
+            <div class="lex-status">
+              <span class="num">{lexiconProposalList.length}</span> candidate word{lexiconProposalList.length === 1 ? "" : "s"} ·
+              <span class="num">{lexiconProposalList.filter((p) => p.tier.kind === "confirmed").length}</span> confirmed ·
+              <span class="num">{lexiconProposalList.filter((p) => p.tier.kind === "provisional").length}</span> provisional ·
+              <span class="num">{lexiconProposalList.filter((p) => p.tier.kind === "held").length}</span> held
+            </div>
+            <div class="lex-table">
+              <div class="lex-row lex-head">
+                <span class="col-lxw">word</span>
+                <span class="col-lxl">lane</span>
+                <span class="col-lxm">motor</span>
+                <span class="col-lxs num" title="slip_score from the per-token motor signal: fraction of chars in span whose dwell ≤ graze threshold (≤30ms). 0.00 = all clean. 1.00 = all graze.">slip</span>
+                <span class="col-lxp num" title="Mean log10-probability of the word's character bigrams against the SCOWL distribution. Negative; higher = more well-formed.">plaus</span>
+                <span class="col-lxx" title="Proximity verdict: far / near-edit2 / segment / prefix.">prox</span>
+                <span class="col-lxn num" title="Norvig web-corpus frequency for the typed word. '—' = never seen on the web. Combined with near-known proximity, zero web freq vetoes the proposal as a typo (catches aduluts; lets lol-class informal words through).">web</span>
+                <span class="col-lxt">tier</span>
+                <span class="col-lxo num">×</span>
+              </div>
+              {#each lexiconProposalList as p (p.word)}
+                {@const live = learnedSet.has(p.word.toLowerCase())}
+                <div
+                  class="lex-row"
+                  class:lex-held={p.tier.kind === "held"}
+                  class:lex-confirmed={p.tier.kind === "confirmed"}
+                >
+                  <span class="col-lxw">{p.word}</span>
+                  <span class="col-lxl">{fmtLane(p.lane)}</span>
+                  <span class="col-lxm lex-motor-{p.motor_verdict}">{fmtMotorVerdict(p.motor_verdict)}</span>
+                  <span class="col-lxs num">{fmtMotorEvidence(p.last_motor_evidence)}</span>
+                  <span class="col-lxp num">{fmtPlausibility(p.plausibility)}</span>
+                  <span class="col-lxx lex-prox-{p.proximity}">{fmtProximity(p.proximity)}</span>
+                  <span class="col-lxn num" class:lex-no-web={p.norvig_freq === 0}>{fmtNorvig(p.norvig_freq)}</span>
+                  <span class="col-lxt">
+                    {fmtProposalTier(p.tier)}
+                    {#if live}<span class="lex-live" title="Live in is_known — stop-flagging + correction anchor.">LIVE</span>{/if}
+                  </span>
+                  <span class="col-lxo num">{p.occasions}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+
+        <div class="model-sub model-sub-sticky">
+          SLIPS · strict-filtered candidates ·
+          {#if slips?.map_writes_enabled}
+            <span class="slips-writes-on">writes to L3 map (live)</span>
+          {:else}
+            <span class="slips-writes-off">L3 map writes OFF (C5b kill-switch)</span>
+          {/if}
+        </div>
         <div class="slip-block">
           {#if slips === null}
             <div class="empty">no data yet…</div>
@@ -1150,6 +1828,80 @@
             {/each}
           {/if}
         </div>
+
+        <!-- C5c Layer A — MOTOR BASELINE. Per-finger reliability +
+             EWMA-pooled dwell/IKI means + rolling per-keystroke
+             anomaly probes. Observe-only this phase. -->
+        <div class="model-sub model-sub-sticky">
+          MOTOR BASELINE · 5c layer A · observe-only ·
+          <span class="motor-half-life">half-life ~5000 keystrokes</span>
+        </div>
+        <div class="motor-block">
+          <div class="motor-table">
+            <div class="motor-row motor-head">
+              <span class="col-mof">finger</span>
+              <span class="col-mor">reliability</span>
+              <span class="col-mon num">n_eff</span>
+              <span class="col-mod num">dwell μ</span>
+              <span class="col-moi num">IKI μ</span>
+            </div>
+            {#each motorBaseline.per_finger as f (`${f.hand}-${f.finger}`)}
+              <div
+                class="motor-row"
+                class:motor-left={f.hand === "left"}
+                class:motor-right={f.hand === "right"}
+                class:motor-cold={f.n_eff === 0}
+              >
+                <span class="col-mof">{fmtFinger(f.hand, f.finger)}</span>
+                <span class="col-mor">
+                  {#if f.n_eff > 0}
+                    <span
+                      class="motor-rel-bar"
+                      style:width="{(f.reliability_score * 100).toFixed(0)}%"
+                    ></span>
+                    <span class="motor-rel-num num">{(f.reliability_score * 100).toFixed(0)}%</span>
+                  {:else}
+                    <span class="motor-rel-dash">—</span>
+                  {/if}
+                </span>
+                <span class="col-mon num">{f.n_eff.toFixed(0)}</span>
+                <span class="col-mod num">
+                  {f.dwell_mean_ms === null ? "—" : `${fmtMs(f.dwell_mean_ms)} ms`}
+                </span>
+                <span class="col-moi num">
+                  {f.iki_mean_ms === null ? "—" : `${fmtMs(f.iki_mean_ms)} ms`}
+                </span>
+              </div>
+            {/each}
+          </div>
+
+          <!-- Rolling per-keystroke anomaly log. Newest first. -->
+          <div class="motor-recent">RECENT KEYSTROKES · newest first</div>
+          {#if motorKeystrokes.length === 0}
+            <div class="empty">no keystrokes scored yet…</div>
+          {:else}
+            <div class="motor-keys-table">
+              <div class="motor-keys-row motor-keys-head">
+                <span class="col-mkk">key</span>
+                <span class="col-mkc num" title="combined anomaly = max(dwell, IKI, co-activation)">combined</span>
+                <span class="col-mkd num" title="dwell anomaly: 1 - exp(-z²/2)">dwell</span>
+                <span class="col-mki num" title="IKI anomaly (null on first keystroke / after pause)">IKI</span>
+                <span class="col-mko num" title="co-activation overlap in ms (null if no overlap)">co-act</span>
+                <span class="col-mkr num" title="certainty: how much data backs this score">cert</span>
+              </div>
+              {#each motorKeystrokes as k (k.timestamp_ms)}
+                <div class="motor-keys-row" class:motor-anom={k.anomaly !== null && k.anomaly.combined > 0.5}>
+                  <span class="col-mkk">{fmtKey(k.key)}</span>
+                  <span class="col-mkc num">{k.anomaly === null ? "—" : k.anomaly.combined.toFixed(2)}</span>
+                  <span class="col-mkd num">{k.anomaly === null ? "—" : k.anomaly.dwell.anomaly.toFixed(2)}</span>
+                  <span class="col-mki num">{k.anomaly?.iki ? k.anomaly.iki.anomaly.toFixed(2) : "—"}</span>
+                  <span class="col-mko num">{k.anomaly?.coactivation ? `${k.anomaly.coactivation.overlap_ms}ms` : "—"}</span>
+                  <span class="col-mkr num">{k.anomaly === null ? "—" : k.anomaly.certainty.toFixed(2)}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
       </div>
     </section>
   </div>
@@ -1237,6 +1989,31 @@
   }
   .clear:hover { background: #353c45; }
   .clear:focus { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+
+  /* ---- C5c motor stability readout (always-visible bar) ---------------- */
+  .motor-readout {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0.45rem 0.9rem;
+    padding: 0.4rem 0.9rem;
+    background: #12161b;
+    border-bottom: 1px solid #2a2f36;
+    color: #c9d1d9;
+  }
+  .motor-stat { color: #7f8a96; }
+  .motor-stat b { color: #e6e6e6; font-weight: 600; }
+  .motor-sep { color: #3a414a; }
+  .motor-key {
+    color: #e6e6e6;
+    background: #2a2f36;
+    border: 1px solid #3a414a;
+    border-radius: 4px;
+    padding: 0.05rem 0.4rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .motor-empty { color: #7f8a96; font-style: italic; }
 
   /* ---- Two equal columns: feed | model state --------------------------- */
   .body {
@@ -1624,6 +2401,85 @@
     color: #d6b69b;
     border: 1px solid #5a432e;
   }
+  /* Capture-health pill. Same chrome as the mode pill but its own
+     state palette (semantic colors so the dot's meaning is
+     readable). Each state ALSO carries text — never color-only. */
+  .capture-pill {
+    padding: 0 0.5rem;
+    border-radius: 3px;
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .capture-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 4px currentColor;
+  }
+  .capture-pill-unknown {
+    background: #2a2f36;
+    color: #7f8a96;
+    border: 1px solid #3a414a;
+  }
+  .capture-pill-live {
+    background: #1f2a23;
+    color: #6ea76e;
+    border: 1px solid #2e4a35;
+  }
+  .capture-pill-unhealthy {
+    background: #2f261f;
+    color: #d2885d;
+    border: 1px solid #5a3a2a;
+  }
+  .capture-pill-stopped {
+    background: #2f1f22;
+    color: #c8553d;
+    border: 1px solid #5a2a2e;
+    /* Stopped is the must-act state — gently pulse so a glance
+       catches it even if the user wasn't looking. */
+    animation: capture-stopped-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes capture-stopped-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(200, 85, 61, 0); }
+    50%      { box-shadow: 0 0 0 2px rgba(200, 85, 61, 0.25); }
+  }
+
+  /* Restart capture button — always visible, always clickable. The
+     elevated variant (amber border) fires when CAPTURE is anything
+     other than "live" so the recovery path stands out exactly when
+     it's needed. Stays the same color even in Stopped state — never
+     dimmed, never disabled, by intent: when everything else looks
+     dead, this is the path forward. */
+  .restart-capture {
+    font: inherit;
+    font-size: 11px;
+    color: #e6e6e6;
+    background: #2a2f36;
+    border: 1px solid #3a414a;
+    border-radius: 4px;
+    padding: 0.2rem 0.6rem;
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
+  }
+  .restart-capture:hover { background: #353c45; }
+  .restart-capture:focus { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+  .restart-capture-elevated {
+    background: #3a2b22;
+    color: #f0c0a0;
+    border-color: #c8553d;
+    box-shadow: 0 0 0 1px rgba(200, 85, 61, 0.4);
+  }
+  .restart-capture-elevated:hover { background: #4a352a; }
+
   .mode-pill-none {
     background: #2a2f36;
     color: #7f8a96;
@@ -1725,6 +2581,210 @@
   }
   .col-la { color: #8aa1b8; }
   .col-lx { color: #d5d5d5; }
+
+  /* LEXICON proposals (Component 5b) — same visual family as LOG but its
+     own column shape: word | lane | motor verdict | motor score | tier |
+     occasions. Held rows fade slightly; confirmed rows get a green rail
+     to mirror the "promote" intent. is_known is untouched in Phase 1 — the
+     panel only exposes what the proposer would judge. */
+  .lex-block {
+    padding: 0.25rem 0 0.5rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .lex-status {
+    color: #8893a0;
+    padding: 0.15rem 0.75rem 0.3rem;
+    font-size: 11px;
+  }
+  .lex-table {
+    padding: 0 0 0.2rem;
+  }
+  .lex-row {
+    display: grid;
+    grid-template-columns:
+      minmax(0, 1.2fr) /* word */
+      minmax(0, 1.1fr) /* lane */
+      52px            /* motor */
+      44px            /* slip */
+      48px            /* plaus */
+      72px            /* prox */
+      48px            /* web */
+      minmax(0, 1.3fr) /* tier */
+      32px;           /* × */
+    column-gap: 0.5rem;
+    align-items: baseline;
+    padding: 0.2rem 0.75rem;
+    white-space: nowrap;
+  }
+  .lex-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.25rem;
+    margin-bottom: 0.1rem;
+  }
+  .lex-row:not(.lex-head):nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
+  }
+  .lex-held {
+    opacity: 0.65;
+  }
+  .lex-confirmed {
+    border-left: 2px solid #2e5a2e;
+    padding-left: calc(0.75rem - 2px);
+  }
+  .col-lxw {
+    color: #e6e6e6;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .col-lxl {
+    color: #d5d5d5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .col-lxm { text-align: center; }
+  .col-lxs { color: #8aa1b8; }
+  .col-lxt {
+    color: #d5d5d5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .col-lxo { color: #8aa1b8; }
+  /* Motor-verdict colors mirror the cand-conf badge palette so the eye
+     reads "clean = green-ish, slip = warning" at a glance. */
+  .lex-motor-clean  { color: #6ea76e; font-weight: 600; }
+  .lex-motor-mixed  { color: #d2c87b; font-weight: 600; }
+  .lex-motor-slip   { color: #d2885d; font-weight: 600; }
+  .lex-motor-unknown { color: #7f8a96; }
+  /* Proximity-verdict colors: far = green (clear to promote);
+     non-far = warning shades (a gate would fire). */
+  .col-lxp { color: #8aa1b8; }
+  .col-lxx { color: #d5d5d5; }
+  .lex-prox-far_from_known   { color: #6ea76e; }
+  .lex-prox-near_known_edit2 { color: #d2885d; font-weight: 600; }
+  .lex-prox-segmentable      { color: #d2885d; font-weight: 600; }
+  .lex-prox-prefix_merge     { color: #d2c87b; font-weight: 600; }
+  /* Norvig column — '—' (no web presence) renders in the same warning
+     shade as near-known proximity so the eye reads the combo at a glance. */
+  .col-lxn { color: #8aa1b8; }
+  .lex-no-web { color: #d2885d; font-weight: 600; }
+  /* Casing baseline annotation — green when the rescue is firing for
+     this user, amber when suppressed (all-caps is their norm or a
+     burst is in progress). */
+  .casing-rescue-on  { color: #6ea76e; font-weight: 600; }
+  .casing-rescue-off { color: #d2885d; font-weight: 600; }
+  .casing-samples    { color: #7f8a96; }
+
+  /* LEXICON sub-header lays out as label + right-aligned Reset button. */
+  .lex-sub {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .lex-sub-label { flex: 1; min-width: 0; }
+  /* Reset LEXICON button — engine-side wipe. Sized like other buttons in
+     the strip but flagged amber so it's not confused with the panel-side
+     Clear (different semantics: this kills learned vocabulary). */
+  .lex-reset {
+    font: inherit;
+    font-size: 11px;
+    color: #e6e6e6;
+    background: #3a2b22;
+    border: 1px solid #5a3a2a;
+    border-radius: 4px;
+    padding: 0.2rem 0.6rem;
+    cursor: pointer;
+  }
+  .lex-reset:hover { background: #4a352a; }
+  .lex-reset:focus { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+
+  /* Pause learning button — same chrome as Reset LEXICON but a quieter
+     palette since the action is reversible and frequent. When manually
+     ON, swap to an amber background so the running state is obvious. */
+  .lex-pause {
+    font: inherit;
+    font-size: 11px;
+    color: #e6e6e6;
+    background: #2a2f36;
+    border: 1px solid #3a414a;
+    border-radius: 4px;
+    padding: 0.2rem 0.6rem;
+    cursor: pointer;
+  }
+  .lex-pause:hover { background: #353c45; }
+  .lex-pause:focus { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+  .lex-pause-on {
+    background: #3a2b22;
+    border-color: #5a3a2a;
+  }
+  .lex-pause-on:hover { background: #4a352a; }
+  /* When capture is Stopped, the Pause buttons get the disabled
+     attribute + a visual de-emphasis so the user sees the difference
+     between "click did nothing" (pre-fix) and "this control is not
+     available right now; Restart capture is what you need." */
+  .lex-pause-stuck {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .lex-pause-stuck:hover { background: #2a2f36; }
+  /* Quiet inline tag rendered next to the casing baseline when the
+     engine reports learning is currently paused. */
+  .lex-paused-tag {
+    color: #d2885d;
+    font-weight: 600;
+  }
+  /* Stronger tone — hard pause (engine asleep) is more severe than
+     soft pause (engine watching but not crediting). */
+  .lex-input-paused-tag {
+    color: #c8553d;
+    font-weight: 700;
+  }
+
+  /* C5b Phase 2 — LIVE indicator on confirmed proposals + star
+     marker on LOG records targeting learned words. */
+  .lex-live {
+    color: #6ea76e;
+    font-weight: 600;
+    font-size: 10px;
+    margin-left: 0.35rem;
+    letter-spacing: 0.5px;
+  }
+  .log-learned-marker {
+    color: #d2c87b;
+    font-weight: 600;
+    font-size: 10px;
+    margin-left: 0.35rem;
+  }
+  .log-learned-target {
+    border-left: 2px solid #c89a3d;
+    padding-left: calc(0.75rem - 2px);
+  }
+  /* LOG_VERSION v5 — Kept records that landed while learning was
+     paused. The row text dims to make it visually obvious the
+     record was OBSERVED but did NOT contribute; a small inline tag
+     in the outcome column carries the explicit "paused" label so
+     the dim isn't ambiguous. */
+  .log-paused {
+    opacity: 0.55;
+  }
+  .log-paused-tag {
+    margin-left: 0.4rem;
+    padding: 0 0.3rem;
+    background: #3a2b22;
+    color: #d2885d;
+    border: 1px solid #5a3a2a;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  /* SLIPS section header annotation for the C5b L3-map kill-switch.
+     Bright when live, dim/warning when off. */
+  .slips-writes-on  { color: #6ea76e; }
+  .slips-writes-off { color: #d2885d; }
 
   /* ANCHORS — L4 Observing, Component 2. Sibling of TOKENS; one row per
      live anchor on the current line. Voided rows get a faded look but
@@ -1966,4 +3026,96 @@
     text-align: right;
     font-variant-numeric: tabular-nums;
   }
+
+  /* MOTOR BASELINE — C5c Layer A. Per-finger reliability + rolling
+     per-keystroke anomaly probes. Sticky sub-header matches the
+     other model sections; uses the same left/right hand tints as
+     PER FINGER so they read as a family. */
+  .motor-half-life {
+    color: #7f8a96;
+    font-weight: 400;
+  }
+  .motor-block {
+    padding: 0 0 0.6rem;
+    border-bottom: 1px solid #2a2f36;
+  }
+  .motor-table { padding: 0 0 0.35rem; }
+  .motor-row {
+    display: grid;
+    grid-template-columns: 90px minmax(120px, 1fr) 50px 70px 70px;
+    column-gap: 0.6rem;
+    align-items: baseline;
+    padding: 0.22rem 0.75rem;
+    white-space: nowrap;
+  }
+  .motor-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.3rem;
+    margin-bottom: 0.15rem;
+  }
+  .motor-left:not(.motor-head)  { background: rgba(120, 160, 220, 0.045); }
+  .motor-right:not(.motor-head) { background: rgba(220, 160, 120, 0.045); }
+  .motor-cold { opacity: 0.55; }
+  .col-mof { color: #e6e6e6; font-weight: 600; }
+  .col-mod, .col-moi, .col-mon { color: #8aa1b8; }
+  .col-mor {
+    position: relative;
+    height: 12px;
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  /* Reliability bar — green when high, fading to amber via opacity
+     reduction handled by the .motor-cold row class. Width is set
+     inline from `style:width=...`. */
+  .motor-rel-bar {
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    background: #6ea76e;
+    border-radius: 2px;
+  }
+  .motor-rel-num {
+    position: absolute;
+    right: 0.4rem;
+    top: 0;
+    color: #d5d5d5;
+    font-size: 10px;
+    line-height: 12px;
+  }
+  .motor-rel-dash {
+    color: #7f8a96;
+    font-style: italic;
+  }
+
+  .motor-recent {
+    color: #7f8a96;
+    padding: 0.4rem 0.75rem 0.3rem;
+    border-top: 1px solid #1d2228;
+    margin-top: 0.4rem;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .motor-keys-table { padding: 0 0 0.35rem; }
+  .motor-keys-row {
+    display: grid;
+    grid-template-columns: 36px 70px 60px 60px 70px 50px;
+    column-gap: 0.55rem;
+    align-items: baseline;
+    padding: 0.2rem 0.75rem;
+    white-space: nowrap;
+  }
+  .motor-keys-head {
+    color: #7f8a96;
+    border-bottom: 1px solid #2a2f36;
+    padding-bottom: 0.3rem;
+  }
+  .motor-keys-row:not(.motor-keys-head):nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
+  }
+  /* Rows where the combined anomaly is high — visually flag them. */
+  .motor-anom .col-mkc { color: #c8553d; font-weight: 700; }
+  .col-mkk { color: #e6e6e6; font-weight: 600; }
+  .col-mkc, .col-mkd, .col-mki, .col-mko, .col-mkr { color: #8aa1b8; }
 </style>

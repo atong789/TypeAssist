@@ -13,8 +13,20 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `tray-icon` — the menu-bar entry point (built into core, not a plugin).
+# `macos-private-api` — transparent/vibrant Practice panel (rounded floating
+# look). Local app, never App-Store-distributed, so the private-API caveat is
+# moot here; paired with `"macOSPrivateApi": true` in tauri.conf.json.
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-shell = "2"
+# Anchors the Practice panel under the menu-bar icon (TrayBottomCenter).
+tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
+# tokio is already pulled in transitively via tauri/tauri-plugin-shell;
+# declared directly here because the engine loop uses `tokio::select!`
+# (Tauri's `async_runtime::spawn` wrapper does not re-export the macro)
+# and `tokio::sync::mpsc` for the control channel between Tauri
+# commands and the engine task.
+tokio = { version = "1", features = ["sync", "macros"] }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

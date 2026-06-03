@@ -37,7 +37,7 @@
 //! same contract as [`crate::tokenizer::TOKENIZER_VERSION`].
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 /// Version of the loaded lexicon (clean dict + freq table + seed fixture).
 ///
@@ -78,12 +78,27 @@ const SEED_FREQUENCY: u64 = 1;
 
 pub struct Lexicon {
     /// Membership set — clean SCOWL dict + seed proper nouns, all lowercase.
-    /// `is_known` consults this and nothing else.
+    /// Bundled; immutable after `load`.
     clean: HashSet<String>,
     /// Frequency table — Norvig web unigrams, all lowercase. May contain
     /// entries that are *not* in `clean` (typos, noise); those still
-    /// expose their count via `frequency`, but `is_known` returns false.
+    /// expose their count via `frequency`, but `is_known` returns false
+    /// for them unless they're in `clean` or `learned`.
     freq: HashMap<String, u64>,
+    /// **C5b Phase 2** — runtime-learned vocabulary. The
+    /// [`crate::LexiconProposer`] adds a word here when its proposal
+    /// reaches `Confirmed`, removes it on demotion. Interior mutability
+    /// (`RwLock`) so the `'static` shared singleton can host live
+    /// learning without changing every caller's signature. Reads are
+    /// fast (RwLock favours readers); writes happen at most once per
+    /// proposal-tier transition and are followed by a single re-eval
+    /// pass.
+    ///
+    /// `is_known` returns true for membership in EITHER set — that's
+    /// the "one wiring, three effects" the brief asked for: every
+    /// caller (linguistic gate, candidate gen, decision pipeline) sees
+    /// the live lexicon without a separate code path.
+    learned: RwLock<HashSet<String>>,
 }
 
 impl Lexicon {
@@ -119,7 +134,11 @@ impl Lexicon {
             freq.insert(word.to_ascii_lowercase(), count);
         }
 
-        Self { clean, freq }
+        Self {
+            clean,
+            freq,
+            learned: RwLock::new(HashSet::new()),
+        }
     }
 
     /// Process-wide singleton. Loading is ~140k inserts on first call;
@@ -129,15 +148,104 @@ impl Lexicon {
         LEX.get_or_init(Lexicon::load)
     }
 
-    /// True iff the word is a member of the clean spelling dictionary or
-    /// the seed fixture. Frequency is *not* consulted — a corpus typo like
-    /// `teh` with millions of web occurrences is still unknown. Case-
-    /// insensitive.
+    /// Iterate every word in the clean membership set — lowercase, no
+    /// guaranteed order. Used by C5b's bigram plausibility model to
+    /// build its frequency table at module load. Not for hot-path use.
+    pub fn iter_clean(&self) -> impl Iterator<Item = &str> {
+        self.clean.iter().map(|s| s.as_str())
+    }
+
+    /// True iff the word is a member of the clean spelling dictionary,
+    /// the seed fixture, OR the runtime-learned set (see
+    /// [`Self::learn`]). Frequency is *not* consulted — a corpus typo
+    /// like `teh` with millions of web occurrences is still unknown.
+    /// Case-insensitive.
+    ///
+    /// **C5b Phase 2:** the union with `learned` is the single wiring
+    /// that gives every consumer (linguistic gate, candidate
+    /// generation, decision pipeline) live access to the user's
+    /// learned vocabulary without a separate code path.
     pub fn is_known(&self, word: &str) -> bool {
         if word.is_empty() {
             return false;
         }
+        let key = word.to_ascii_lowercase();
+        self.clean.contains(&key) || self.learned.read().unwrap().contains(&key)
+    }
+
+    /// True iff the word is in the **runtime-learned** set
+    /// specifically (NOT in the bundled clean dict). Used by
+    /// callers that need to distinguish learned from bundled
+    /// vocabulary — e.g. the linguistic gate's proximity check
+    /// treats learned words as anchors regardless of Norvig
+    /// frequency (they're user-specific by construction). Case-
+    /// insensitive.
+    pub fn is_learned(&self, word: &str) -> bool {
+        if word.is_empty() {
+            return false;
+        }
+        self.learned.read().unwrap().contains(&word.to_ascii_lowercase())
+    }
+
+    /// True iff the word is in the **bundled clean dict** ONLY (SCOWL
+    /// + seed). Does NOT consult the runtime-learned set, and so does
+    /// NOT acquire the RwLock. Used by hot inner loops (the linguistic
+    /// gate's edit-2 proximity check runs ~120k membership probes per
+    /// call) that already check the learned side via a passed-in
+    /// snapshot. Case-insensitive.
+    pub fn is_in_clean(&self, word: &str) -> bool {
+        if word.is_empty() {
+            return false;
+        }
         self.clean.contains(&word.to_ascii_lowercase())
+    }
+
+    /// Add a word to the runtime-learned set. Case-insensitive
+    /// (lowercased on insert). Idempotent — re-adding a learned
+    /// word is a no-op. Called by [`crate::LexiconProposer`] on a
+    /// `Confirmed` tier transition. Returns true iff this call
+    /// changed the set (the word wasn't there before).
+    pub fn learn(&self, word: &str) -> bool {
+        if word.is_empty() {
+            return false;
+        }
+        self.learned
+            .write()
+            .unwrap()
+            .insert(word.to_ascii_lowercase())
+    }
+
+    /// Remove a word from the runtime-learned set. Case-
+    /// insensitive. No-op if it wasn't there. Returns true iff
+    /// this call changed the set. Called on a tier transition
+    /// out of `Confirmed` (demotion).
+    pub fn unlearn(&self, word: &str) -> bool {
+        if word.is_empty() {
+            return false;
+        }
+        self.learned
+            .write()
+            .unwrap()
+            .remove(&word.to_ascii_lowercase())
+    }
+
+    /// Drop every learned word. Used by tests to reset state
+    /// between cases; not called in production.
+    pub fn clear_learned(&self) {
+        self.learned.write().unwrap().clear();
+    }
+
+    /// Snapshot of the learned set, lowercase, no guaranteed order.
+    /// Surfaced to the debug panel so the builder can see which
+    /// words are live in `is_known` and how that's affecting
+    /// proximity verdicts elsewhere.
+    pub fn learned_snapshot(&self) -> Vec<String> {
+        self.learned.read().unwrap().iter().cloned().collect()
+    }
+
+    /// Number of words in the learned set. Cheap (single read lock).
+    pub fn learned_len(&self) -> usize {
+        self.learned.read().unwrap().len()
     }
 
     /// Raw unigram count used for ranking candidates of unknown words.

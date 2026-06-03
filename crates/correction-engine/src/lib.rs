@@ -18,26 +18,65 @@ pub mod anchor;
 pub mod candidates;
 pub mod decision;
 pub mod keyboard;
+pub mod kill_switch;
 pub mod lexicon;
+pub mod lexicon_proposal;
+pub mod linguistic;
 pub mod log;
+pub mod motor_ledger;
+pub mod motor_map;
+pub mod motor_signal;
+pub mod resolver;
 pub mod score;
+pub mod slip_class;
 pub mod tokenizer;
+pub mod word_pattern;
 pub use anchor::{AnchorState, AnchorTracker, AnchorsSnapshot, SpanAnchor, VoidReason};
 pub use candidates::{ranked_known_candidates, KnownCandidate, CANDIDATES_VERSION};
 pub use decision::{
-    decide, mode_min_confidence, DecisionOutcome, LeaveAloneReason, ACTIVE_TIER,
-    DECISION_VERSION, SEPARATION_MARGIN,
+    decide, mode_min_confidence, DecisionOutcome, LeaveAloneReason, ACTIVE_TIER, DECISION_VERSION,
+    SEPARATION_MARGIN,
+};
+pub use kill_switch::{
+    classify, classify_pattern, PatternFacts, PatternReadiness, SilentReason, Tier2Reason,
+    COMMON_TARGET_MIN_FREQUENCY, KILL_SWITCH_VERSION, STALE_AFTER_MS,
 };
 pub use lexicon::{Lexicon, LEXICON_VERSION};
+pub use lexicon_proposal::{
+    HoldReason, Lane, LexiconProposal, LexiconProposer, MotorVerdict, ProposalTier, ProposalUpdate,
+    LEXICON_PROPOSAL_VERSION,
+};
+pub use linguistic::{
+    is_well_formed, linguistic_signal, plausibility, proximity_verdict, LinguisticSignal,
+    ProximityVerdict, MAX_PROXIMITY_LEN, PLAUSIBILITY_FLOOR,
+};
 pub use log::{
     has_motor_evidence, should_log, DecisionLedger, LogConfidence, LogRecord, Outcome,
     DEFAULT_LEDGER_CAPACITY, LOG_VERSION,
+};
+pub use motor_ledger::{MotorLedger, MotorRecord, DEFAULT_MOTOR_LEDGER_CAPACITY};
+pub use motor_map::{
+    MotorMap, ObserveReport, SlipDistribution, StabilityReport, Timestamp, HALF_LIFE_MS,
+    MAX_SLIP_EDIT_DISTANCE, MAX_SLIP_LENGTH_DIFF, MOTOR_MAP_VERSION, PERSIST_EVERY,
+};
+pub use motor_signal::{
+    measure_token_motor, TokenMotorSignal, TokenMotorVerdict, GRAZE_DWELL_MS, MIN_SAMPLE_CHARS,
+};
+pub use resolver::{
+    OutcomeResolver, ResolvableRecord, ABANDONED_CARET_MARGIN, ABANDONED_IDLE_THRESHOLD_MS,
+    KEPT_IDLE_THRESHOLD_MS, RESOLVER_VERSION,
 };
 pub use score::{
     confidence_for, score_candidates, Confidence, ConfidenceReport, EditType, ScoredCandidate,
     CONFIDENCE_HIGH_FLOOR, CONFIDENCE_LOW_FLOOR, CONFIDENCE_MEDIUM_FLOOR, SCORE_VERSION,
 };
+pub use slip_class::{classify_slip, SlipClass, SLIP_CLASS_VERSION};
 pub use tokenizer::{Token, TokenKind, Tokenizer, TOKENIZER_VERSION};
+pub use word_pattern::{
+    PatternObserveReport, PatternSnapshot, PatternStat, WordPatternStore, MAX_PATTERN_EDIT_DISTANCE,
+    MAX_PATTERN_LENGTH_DIFF, PATTERN_PERSIST_EVERY, TIER1_MIN_OBSERVATIONS, UNDO_BRAKE_STRIKES,
+    WORD_PATTERN_VERSION,
+};
 
 /// **Engine MODE.** Names how aggressive the user wants the engine to be.
 /// The mode gates whether a candidate's confidence is high enough to fire

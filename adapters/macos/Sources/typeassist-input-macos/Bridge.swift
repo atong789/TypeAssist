@@ -21,11 +21,26 @@ enum InputEvent {
     case permissionRequired
     case ready
     case shutdown
+    /// Periodic proof-of-life — engine watchdog uses these to detect a
+    /// silent sidecar (no events flowing) independent of whether the
+    /// user is currently typing. `tapEnabled` is our own view of the
+    /// CGEvent tap state.
+    case heartbeat(timestampMs: UInt64, tapEnabled: Bool)
 }
 
 enum OutboundCommand {
     case injectCorrection(deleteCount: Int, replacement: String)
     case shutdown
+    /// Tear down the current event tap and create a fresh one. Soft
+    /// recovery path for the case where auto-re-enable hasn't worked
+    /// (e.g. the tap port itself is in a bad state); the engine's
+    /// "Restart capture" button drives this.
+    case restartTap
+    /// Phase 0 / M3 debug: run one content-blind text-geometry probe of the
+    /// currently focused element and report the result on stderr. Rides the
+    /// same proven command path as `injectCorrection`, so it exercises AX
+    /// through the sidecar's working Accessibility grant.
+    case axProbe
 }
 
 /// Line-delimited JSON over stdout (events) and stdin (commands).
@@ -89,6 +104,12 @@ final class Bridge {
             payload = ["type": "ready"]
         case .shutdown:
             payload = ["type": "shutdown"]
+        case let .heartbeat(ts, tapEnabled):
+            payload = [
+                "type": "heartbeat",
+                "timestamp_ms": ts,
+                "tap_enabled": tapEnabled,
+            ]
         }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
               let s = String(data: data, encoding: .utf8) else {
@@ -107,6 +128,10 @@ final class Bridge {
             return .injectCorrection(deleteCount: deleteCount, replacement: replacement)
         case "shutdown":
             return .shutdown
+        case "restart_tap":
+            return .restartTap
+        case "ax_probe":
+            return .axProbe
         default:
             return nil
         }

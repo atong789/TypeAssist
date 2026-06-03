@@ -1,3 +1,4 @@
+import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
@@ -54,5 +55,120 @@ enum Accessibility {
         }
         down.post(tap: .cgSessionEventTap)
         up.post(tap: .cgSessionEventTap)
+    }
+
+    // MARK: - Phase 0 / M3 overlay feasibility probe
+
+    private static var axPrimed = false
+
+    /// Connect this faceless CLI sidecar to the WindowServer so AX IPC works.
+    /// A tool with no `NSApplication` can pass `AXIsProcessTrusted()` and run a
+    /// `CGEventTap`, yet still get `kAXErrorCannotComplete` (-25204) on every
+    /// `AXUIElement` *read* — the system-wide focused-element query needs the
+    /// app-server connection that instantiating `NSApplication` establishes.
+    /// Touching `NSApplication.shared` forces that connection (the Swift
+    /// equivalent of the old `NSApplicationLoad()`). Must run on the main
+    /// thread — both probe entry points (the run-loop timer and the
+    /// main-dispatched stdin command) do. Lazy; never on the normal capture
+    /// path. Idempotent.
+    static func primeAXConnection() {
+        if axPrimed { return }
+        axPrimed = true
+        _ = NSApplication.shared
+    }
+
+    /// Content-blind text-geometry probe of the currently focused element,
+    /// tried two ways so Phase 0 can see which path an app vends geometry on:
+    ///   A. the **system-wide** element (`AXUIElementCreateSystemWide`)
+    ///   B. the **frontmost app's own** element (`AXUIElementCreateApplication`)
+    /// On Tahoe (macOS 26) the system-wide path returns -25204 from a sidecar
+    /// even with a working Accessibility grant (its `CGEventTap` captures
+    /// fine); the per-app path is the robust route. Reporting both, with each
+    /// path's `AXError`, turns "it failed" into a per-app feasibility matrix.
+    /// (-25204=cannotComplete, -25208=notImplemented, -25211=APIDisabled,
+    /// -25212=noValue — i.e. the app vends no focused UI element.)
+    ///
+    /// CONTENT-BLIND BY CONSTRUCTION (Principle #9): reads role,
+    /// `AXSelectedTextRange` (positions only) and `AXBoundsForRange` (rects
+    /// only). Never calls `AXStringForRange`; never reads, returns, or logs
+    /// typed text — only motor/geometry shape. Emits nothing itself (caller
+    /// routes it to stderr), so the stdout JSON event contract is untouched.
+    static func probeFocusedGeometry() -> String {
+        primeAXConnection()
+
+        let front = NSWorkspace.shared.frontmostApplication
+        let bundle = front?.bundleIdentifier ?? "?"
+        let pid = front?.processIdentifier ?? 0
+
+        let a = focusedGeometry(of: AXUIElementCreateSystemWide())
+        let b = pid != 0
+            ? focusedGeometry(of: AXUIElementCreateApplication(pid))
+            : GeomResult(role: "—", word: nil, err: 0)
+
+        let verdict: String
+        if a.word != nil || b.word != nil {
+            verdict = "WORD-RECT ✓ (\(a.word != nil ? "sysWide" : "appEl"))"
+        } else {
+            verdict = "UNAVAILABLE"
+        }
+        return "AXPROBE app=\(bundle)"
+            + " sysWide[role=\(a.role) word=\(rectStr(a.word)) err=\(a.err)]"
+            + " appEl[role=\(b.role) word=\(rectStr(b.word)) err=\(b.err)]"
+            + " ⇒ \(verdict)"
+    }
+
+    private struct GeomResult {
+        var role: String
+        var word: CGRect?
+        var err: Int32
+    }
+
+    /// Focused element under `root` → its role + the on-screen rect of the
+    /// 4 chars before the caret (the unit a per-word mark anchors to).
+    private static func focusedGeometry(of root: AXUIElement) -> GeomResult {
+        var focusedRef: CFTypeRef?
+        let ferr = AXUIElementCopyAttributeValue(root, kAXFocusedUIElementAttribute as CFString, &focusedRef)
+        guard ferr == .success, let fref = focusedRef, CFGetTypeID(fref) == AXUIElementGetTypeID() else {
+            return GeomResult(role: "NONE", word: nil, err: ferr.rawValue)
+        }
+        let focused = fref as! AXUIElement
+        let role = (copyAttr(focused, kAXRoleAttribute as String) as? String) ?? "?"
+        guard let sel = selectedRange(focused) else {
+            return GeomResult(role: role, word: nil, err: 0)  // no caret/selection range
+        }
+        let word = boundsForRange(focused, CFRange(location: max(0, sel.location - 4), length: 4))
+        return GeomResult(role: role, word: word, err: 0)
+    }
+
+    private static func copyAttr(_ el: AXUIElement, _ attr: String) -> CFTypeRef? {
+        var v: CFTypeRef?
+        return AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success ? v : nil
+    }
+
+    private static func asAXValue(_ v: CFTypeRef?) -> AXValue? {
+        guard let v = v, CFGetTypeID(v) == AXValueGetTypeID() else { return nil }
+        return (v as! AXValue)
+    }
+
+    private static func selectedRange(_ el: AXUIElement) -> CFRange? {
+        guard let axv = asAXValue(copyAttr(el, kAXSelectedTextRangeAttribute as String)) else { return nil }
+        var r = CFRange()
+        return AXValueGetValue(axv, .cfRange, &r) ? r : nil
+    }
+
+    private static func boundsForRange(_ el: AXUIElement, _ range: CFRange) -> CGRect? {
+        var r = range
+        guard let axRange = AXValueCreate(.cfRange, &r) else { return nil }
+        var out: CFTypeRef?
+        let err = AXUIElementCopyParameterizedAttributeValue(
+            el, kAXBoundsForRangeParameterizedAttribute as CFString, axRange, &out)
+        guard err == .success, let axv = asAXValue(out) else { return nil }
+        var rect = CGRect.zero
+        return AXValueGetValue(axv, .cgRect, &rect) ? rect : nil
+    }
+
+    private static func rectStr(_ r: CGRect?) -> String {
+        guard let r = r else { return "—" }
+        return String(format: "(%.0f,%.0f %.0f×%.0f)", r.origin.x, r.origin.y, r.size.width, r.size.height)
     }
 }

@@ -12,6 +12,7 @@ pub mod asymmetry;
 pub mod events;
 pub mod fatigue;
 pub mod ghost_keys;
+pub mod motor_baseline;
 pub mod slip_detector;
 pub mod temporal;
 pub mod timing;
@@ -48,6 +49,12 @@ pub struct BehaviouralModel {
     /// First L3 learning loop: detects backspace-correction slips and
     /// writes them into a live `VolatilityMap`.
     pub slip_detector: slip_detector::SlipDetector,
+    /// **C5c Layer A.** Per-user motor baseline — recency-weighted
+    /// dwell + IKI per (hand, finger, key) with hierarchical
+    /// shrinkage and a population prior. Observe-only this phase;
+    /// L4's `measure_token_motor` does NOT consume it yet (that's
+    /// Phase 2 of 5c).
+    pub motor_baseline: motor_baseline::MotorBaseline,
 }
 
 impl BehaviouralModel {
@@ -65,6 +72,7 @@ impl BehaviouralModel {
         self.fatigue.observe(event);
         self.temporal.observe(event);
         self.slip_detector.observe(event);
+        self.motor_baseline.observe(event);
     }
 
     /// Drain slips detected during ingest since the last call. The engine
@@ -83,6 +91,7 @@ impl BehaviouralModel {
             asymmetry: self.asymmetry.snapshot(),
             ghost_keys: self.ghost_keys.snapshot(),
             slips: self.slip_detector.snapshot(),
+            motor_baseline: self.motor_baseline.snapshot(),
         }
     }
 }
@@ -93,6 +102,7 @@ pub struct ModelSnapshot {
     pub asymmetry: asymmetry::AsymmetrySnapshot,
     pub ghost_keys: ghost_keys::GhostKeysSnapshot,
     pub slips: slip_detector::SlipsSnapshot,
+    pub motor_baseline: motor_baseline::MotorBaselineSnapshot,
 }
 
 #[cfg(test)]
@@ -134,5 +144,67 @@ mod tests {
         ] {
             model.ingest(&ev);
         }
+    }
+
+    #[test]
+    fn ingest_routes_key_events_to_motor_baseline() {
+        // C5c Layer A wiring — same shape as the timing routing test
+        // but checks the new MotorBaseline. Snapshot must surface a
+        // per-finger row for left-pinky (`a`), with a positive n_eff
+        // after one keystroke.
+        let mut model = BehaviouralModel::new();
+        model.ingest(&InputEvent::Key {
+            key: "a".into(),
+            timestamp_ms: 100,
+            modifiers: Modifiers::default(),
+            dwell_ms: 80,
+        });
+        let snap = model.snapshot();
+        // Snapshot always includes all 10 fingers in anatomical order.
+        assert_eq!(snap.motor_baseline.per_finger.len(), 10);
+        let lpinky = snap
+            .motor_baseline
+            .per_finger
+            .iter()
+            .find(|r| {
+                r.hand == volatility_map::Hand::Left
+                    && r.finger == volatility_map::Finger::Pinky
+            })
+            .expect("left pinky row must exist");
+        assert!(lpinky.n_eff > 0.0, "n_eff = {}", lpinky.n_eff);
+        assert!(lpinky.dwell_mean_ms.is_some());
+        // First keystroke → no prior → IKI is None.
+        assert!(lpinky.iki_mean_ms.is_none());
+    }
+
+    #[test]
+    fn motor_baseline_per_finger_rows_in_anatomical_order() {
+        let model = BehaviouralModel::new();
+        let snap = model.snapshot();
+        // Anatomical order: left pinky first, right pinky last. We just
+        // verify the ordering invariant — the panel relies on it.
+        let order: Vec<_> = snap
+            .motor_baseline
+            .per_finger
+            .iter()
+            .map(|r| (r.hand, r.finger))
+            .collect();
+        use volatility_map::Finger::{Index, Middle, Pinky, Ring, Thumb};
+        use volatility_map::Hand::{Left, Right};
+        assert_eq!(
+            order,
+            vec![
+                (Left, Pinky),
+                (Left, Ring),
+                (Left, Middle),
+                (Left, Index),
+                (Left, Thumb),
+                (Right, Thumb),
+                (Right, Index),
+                (Right, Middle),
+                (Right, Ring),
+                (Right, Pinky),
+            ]
+        );
     }
 }
