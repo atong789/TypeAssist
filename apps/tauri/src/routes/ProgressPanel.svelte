@@ -70,8 +70,17 @@
       });
   }
 
-  function selectTab(tab: Tab) {
+  // `moveFocus` is set for keyboard switching (1/2/←/→) so the focus ring
+  // follows the selected tab — roving tabindex keeps the inactive tab out of
+  // the tab order, and we move focus onto the newly selected one. A click
+  // already focuses its button natively, so it doesn't need this.
+  function selectTab(tab: Tab, moveFocus = false) {
     activeTab = tab;
+    if (moveFocus) {
+      tick().then(() => {
+        (tab === "statistics" ? statTabEl : impactTabEl)?.focus();
+      });
+    }
   }
 
   function close() {
@@ -106,17 +115,17 @@
     // scroll the ledger natively.
     if (event.key === "1") {
       event.preventDefault();
-      selectTab("statistics");
+      selectTab("statistics", true);
       return;
     }
     if (event.key === "2") {
       event.preventDefault();
-      selectTab("impact");
+      selectTab("impact", true);
       return;
     }
     if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
       event.preventDefault();
-      selectTab(activeTab === "statistics" ? "impact" : "statistics");
+      selectTab(activeTab === "statistics" ? "impact" : "statistics", true);
       return;
     }
 
@@ -235,7 +244,8 @@
           </p>
         {:else}
           <p class="summary">
-            {ready.length} patterns ready · {observing.length} still observing
+            {ready.length} {ready.length === 1 ? "pattern" : "patterns"} ready ·
+            {observing.length} still observing
           </p>
 
           {#if ready.length > 0}
