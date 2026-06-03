@@ -21,6 +21,12 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { LogicalSize } from "@tauri-apps/api/dpi";
   import { pickSentence, weakKeysIn, type WeakKey } from "../lib/sentenceBank";
+  import {
+    loadSpellingPref,
+    resolveVariant,
+    localizeSentence,
+    type SpellingVariant,
+  } from "../lib/locale";
   import { copy } from "../lib/practiceCopy";
 
   type Phase = "ready" | "typing" | "continue" | "snapshot";
@@ -182,6 +188,11 @@
   }
 
   // Open / re-open always returns to the intention moment ("Ready?").
+  // Spelling variant for the word bank, resolved from the user's Settings
+  // override (or the macOS locale). Re-read on each open so a change in Settings
+  // takes effect the next time Practice is opened.
+  let spellingVariant: SpellingVariant = resolveVariant(loadSpellingPref());
+
   function resetSession() {
     phase = "ready";
     sentencesDone = 0;
@@ -194,6 +205,7 @@
     typed = [];
     sentencesInBlock = 0;
     trend = [];
+    spellingVariant = resolveVariant(loadSpellingPref());
     requestStability();
   }
 
@@ -207,7 +219,9 @@
       parts.push(s);
     }
     sentencesInBlock = parts.length;
-    sentence = parts.join(" ");
+    // Localize the passage to the resolved spelling variant (e.g. grey→gray on
+    // a US Mac) before it's rendered/typed.
+    sentence = localizeSentence(parts.join(" "), spellingVariant);
     chars = [...sentence];
     segments = computeSegments(chars);
     typed = [];
