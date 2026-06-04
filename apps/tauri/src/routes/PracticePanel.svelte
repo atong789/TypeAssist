@@ -455,9 +455,6 @@
         <button class="primary" bind:this={doneEl} aria-label={copy.snapshot.doneLabel} on:click={done}>
           {copy.snapshot.done}
         </button>
-        <button class="secondary" aria-label={copy.snapshot.againLabel} on:click={resetSession}>
-          {copy.snapshot.again}
-        </button>
       </div>
     </div>
   {/if}

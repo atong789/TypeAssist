@@ -35,9 +35,7 @@ export const copy = {
 
   snapshot: {
     title: "Nicely done.",
-    again: "Again",
     done: "Done",
-    againLabel: "Start another round",
     doneLabel: "Close practice",
 
     /** "what happened": which weak keys the round leaned into. Capability
