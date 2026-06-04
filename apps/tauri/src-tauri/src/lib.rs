@@ -3,13 +3,15 @@
 //! Hosts the Svelte webview and the engine (Swift sidecar + walking-skeleton
 //! loop). See `engine.rs`.
 
+mod allow_list;
 mod engine;
 
+use allow_list::AllowList;
 use engine::{EngineControl, EngineControlSender};
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    ActivationPolicy, AppHandle, Emitter, Manager, Runtime, WindowEvent,
+    ActivationPolicy, AppHandle, Emitter, Listener, Manager, Runtime, WindowEvent,
 };
 use tauri_plugin_positioner::{Position, WindowExt};
 
@@ -95,21 +97,52 @@ fn request_motor_stability(sender: tauri::State<EngineControlSender>) -> Result<
 /// The menu is a native `NSMenu`, so it opens even while another app is
 /// fullscreen — unlike the Practice webview panel, which is a normal window
 /// (acceptable: "nobody practices typing during a fullscreen call").
-fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>> {
     let open_main = MenuItem::with_id(app, "open_main", "Open TypeAssist", true, None::<&str>)?;
     let practice = MenuItem::with_id(app, "practice", "Practice mode", true, None::<&str>)?;
     let progress = MenuItem::with_id(app, "progress", "Progress", true, None::<&str>)?;
+    // M3 correction Step 1 — the menu-bar master gate (instant, one-action
+    // global on/off, the brief's "global off") + the curation panel opener. The
+    // check's initial state is read off disk so it reflects the persisted gate;
+    // it then tracks the engine's authoritative echo (see `setup`). Default is
+    // OFF — the feature ships dark.
+    let corr_enabled = read_allow_list()
+        .map(|al| al.correction_enabled)
+        .unwrap_or(false);
+    let corr_toggle = CheckMenuItem::with_id(
+        app,
+        "corr_toggle",
+        "Enable corrections",
+        true,
+        corr_enabled,
+        None::<&str>,
+    )?;
+    let corrections = MenuItem::with_id(app, "corrections", "Corrections…", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let sep_a = PredefinedMenuItem::separator(app)?;
     let sep_b = PredefinedMenuItem::separator(app)?;
+    let sep_c = PredefinedMenuItem::separator(app)?;
     let quit = PredefinedMenuItem::quit(app, Some("Quit TypeAssist"))?;
     let menu = Menu::with_items(
         app,
         &[
-            &open_main, &practice, &progress, &sep_a, &settings, &sep_b, &quit,
+            &open_main,
+            &practice,
+            &progress,
+            &sep_a,
+            &corr_toggle,
+            &corrections,
+            &sep_b,
+            &settings,
+            &sep_c,
+            &quit,
         ],
     )?;
 
+    // The check item toggles itself on click; read its (already-flipped) state
+    // and post it to the engine, which persists + echoes the authoritative
+    // value back (keeping the check honest even if the post is dropped).
+    let toggle_for_menu = corr_toggle.clone();
     TrayIconBuilder::with_id("main-tray")
         // Template image: macOS recolors it for the light/dark menu bar. The
         // "weak keys worth practicing" state is shown by SHAPE (a badge dot in
@@ -117,12 +150,19 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .icon(tauri::include_image!("icons/tray-icon.png"))
         .icon_as_template(true)
         .menu(&menu)
-        .on_menu_event(|app, event| match event.id.as_ref() {
+        .on_menu_event(move |app, event| match event.id.as_ref() {
             // Quit is a PredefinedMenuItem and handled by the OS.
             "open_main" => show_main(app, "today"),
             "settings" => show_main(app, "settings"),
             "practice" => show_practice(app),
             "progress" => show_progress(app),
+            "corrections" => show_corrections(app),
+            "corr_toggle" => {
+                let enabled = toggle_for_menu.is_checked().unwrap_or(false);
+                if let Some(sender) = app.try_state::<EngineControlSender>() {
+                    let _ = sender.send(EngineControl::SetCorrectionEnabled(enabled));
+                }
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -131,7 +171,7 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
         })
         .build(app)?;
-    Ok(())
+    Ok(corr_toggle)
 }
 
 /// Show + focus the main window and route it. The main window starts hidden
@@ -197,6 +237,79 @@ fn open_practice(app: AppHandle) {
 #[tauri::command]
 fn open_progress(app: AppHandle) {
     show_progress(&app);
+}
+
+/// Anchor the Corrections (allow-list) panel under the tray icon, show + focus
+/// it. Same menu-bar-dropdown behaviour as Practice/Progress (hides on blur).
+/// `corrections://open` tells it to (re)load its state on each open.
+fn show_corrections<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(w) = app.get_webview_window("allowlist") {
+        let _ = w.move_window(Position::TrayBottomCenter);
+        let _ = w.show();
+        let _ = w.set_focus();
+        let _ = app.emit("corrections://open", ());
+    }
+}
+
+/// Tauri command: open the Corrections allow-list panel from inside the app.
+#[tauri::command]
+fn open_corrections(app: AppHandle) {
+    show_corrections(&app);
+}
+
+/// Tauri command: flip the global correction master gate. The panel's master
+/// switch posts this; the engine persists + echoes `corrections://state`, which
+/// the panel and the tray check both render from. (The tray check has its own
+/// one-click path in `build_tray`.)
+#[tauri::command]
+fn set_correction_enabled(
+    enabled: bool,
+    sender: tauri::State<EngineControlSender>,
+) -> Result<(), String> {
+    sender
+        .send(EngineControl::SetCorrectionEnabled(enabled))
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
+/// Tauri command: enable (add) or disable (remove) one `typed → target` pattern
+/// in the allow-list. The panel's per-pattern toggle posts this; the engine
+/// persists + echoes `corrections://state`.
+#[tauri::command]
+fn set_pattern_enabled(
+    typed: String,
+    target: String,
+    enabled: bool,
+    sender: tauri::State<EngineControlSender>,
+) -> Result<(), String> {
+    sender
+        .send(EngineControl::SetPatternEnabled {
+            typed,
+            target,
+            enabled,
+        })
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
+/// Tauri command: ask the engine to (re)emit the current allow-list on
+/// `corrections://state`. The panel calls this on open.
+#[tauri::command]
+fn request_allow_list(sender: tauri::State<EngineControlSender>) -> Result<(), String> {
+    sender
+        .send(EngineControl::RequestAllowList)
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
+/// Tauri command: read `~/.typeassist/allow_list.json` straight off disk for the
+/// panel's first paint (so it shows the right state before the engine echo
+/// arrives). Read-only; a missing file is the shipped-dark default (gate off, no
+/// patterns), not an error. The engine remains the sole *writer*.
+#[tauri::command]
+fn read_allow_list() -> Result<AllowList, String> {
+    let path = match typeassist_data_dir() {
+        Some(dir) => dir.join("allow_list.json"),
+        None => return Ok(AllowList::new()),
+    };
+    AllowList::load_from(&path).map_err(|e| format!("could not read allow_list.json: {e}"))
 }
 
 /// The on-device data directory the read-only Progress commands resolve files
@@ -325,6 +438,11 @@ pub fn run() {
             request_practice_trend,
             open_practice,
             open_progress,
+            open_corrections,
+            set_correction_enabled,
+            set_pattern_enabled,
+            request_allow_list,
+            read_allow_list,
             read_word_patterns,
             read_progress_stats
         ])
@@ -339,7 +457,9 @@ pub fn run() {
             // (losing focus) dismisses them. Practice keeps focus while typing,
             // so an active round never hides; Progress is read-only.
             WindowEvent::Focused(false)
-                if window.label() == "practice" || window.label() == "progress" =>
+                if window.label() == "practice"
+                    || window.label() == "progress"
+                    || window.label() == "allowlist" =>
             {
                 let _ = window.hide();
             }
@@ -351,7 +471,45 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             let _ = app.set_activation_policy(ActivationPolicy::Accessory);
 
-            build_tray(app.handle())?;
+            let corr_toggle = build_tray(app.handle())?;
+
+            // Keep the menu-bar master-gate check in sync with the engine's
+            // authoritative state: the engine echoes the whole allow-list on
+            // `corrections://state` after any mutation (panel toggle, tray
+            // click, or an Escape teach-stop). The tray check follows that, so
+            // it's correct even when the gate is flipped from the panel.
+            {
+                let toggle = corr_toggle.clone();
+                app.handle()
+                    .listen(engine::EVT_CORRECTION_STATE, move |event| {
+                        if let Ok(al) = serde_json::from_str::<AllowList>(event.payload()) {
+                            let _ = toggle.set_checked(al.correction_enabled);
+                        }
+                    });
+            }
+
+            // M3 correction Step 1 — the visible cue. On every applied
+            // correction (and its undo) briefly show the small HUD near the
+            // top-right of the screen, then hide it. Rust owns show / position /
+            // hide so the cue needs no positioner JS dependency and is shown
+            // WITHOUT focus (the window is also `focus: false`), so it never
+            // steals the caret from the app the user is typing in. The cue
+            // webview renders the `typed → target` text from the same event.
+            {
+                let handle = app.handle().clone();
+                app.handle()
+                    .listen(engine::EVT_CORRECTION_APPLIED, move |_| {
+                        if let Some(w) = handle.get_webview_window("cue") {
+                            let _ = w.move_window(Position::TopRight);
+                            let _ = w.show();
+                            let w_hide = w.clone();
+                            tauri::async_runtime::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+                                let _ = w_hide.hide();
+                            });
+                        }
+                    });
+            }
 
             match engine::spawn(&app.handle()) {
                 Ok(control_tx) => {

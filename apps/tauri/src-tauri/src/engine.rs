@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::path::{Path, PathBuf};
 
-use behavioural_model::{BehaviouralModel, InputEvent};
+use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
 use correction_engine::{
     classify_slip, decide, has_motor_evidence, measure_token_motor, ranked_known_candidates,
     score_candidates, should_log, AnchorTracker, Confidence, ConfidenceTier, DecisionLedger,
@@ -165,6 +165,16 @@ pub const EVT_PRACTICE_TREND: &str = "engine://practice-trend";
 /// menu-bar surface will subscribe to the same event without a panel
 /// rewrite. Payload is [`CaptureHealthEvent`].
 pub const EVT_CAPTURE_HEALTH: &str = "engine://capture-health";
+/// **M3 correction Step 1.** The current correction allow-list + master gate,
+/// emitted whenever the engine mutates it (toggle from the panel/tray, or an
+/// Escape teach-stop) and on an explicit `RequestAllowList`. The allow-list
+/// panel and the tray master toggle render from this so the UI always reflects
+/// the engine's authoritative state. Payload is [`crate::allow_list::AllowList`].
+pub const EVT_CORRECTION_STATE: &str = "corrections://state";
+/// **M3 correction Step 1.** A live correction was just injected — fired once
+/// per applied fix so the HUD cue can show `typed → target` briefly. Payload is
+/// [`CorrectionAppliedEvent`]. (Principle #8: every correction is observable.)
+pub const EVT_CORRECTION_APPLIED: &str = "corrections://applied";
 
 /// Engine-derived view of the sidecar's capture state. Transitions
 /// are observation-only this phase — driven by the Heartbeat
@@ -265,6 +275,21 @@ pub enum EngineControl {
     /// keys the round leaned into. Read-only: reads on-disk history, changes
     /// nothing.
     RequestPracticeTrend { keys: Vec<char> },
+    /// **M3 correction Step 1 — master gate.** Flip `correction_enabled` on the
+    /// allow-list. The instant global on/off the tray toggle posts. The engine
+    /// persists and echoes the new state on [`EVT_CORRECTION_STATE`].
+    SetCorrectionEnabled(bool),
+    /// **M3 correction Step 1 — per-pattern toggle.** Enable (add) or disable
+    /// (remove) one `typed → target` pattern in the allow-list, from the panel.
+    /// Persists + echoes [`EVT_CORRECTION_STATE`].
+    SetPatternEnabled {
+        typed: String,
+        target: String,
+        enabled: bool,
+    },
+    /// **M3 correction Step 1.** Ask the engine to emit the current allow-list
+    /// on [`EVT_CORRECTION_STATE`] — the panel/tray pull fresh state on open.
+    RequestAllowList,
 }
 
 /// Tauri-managed handle for sending [`EngineControl`] messages to
@@ -395,6 +420,40 @@ struct KeystrokePayload {
     ingest_latency_ms: f64,
 }
 
+/// Payload for [`EVT_CORRECTION_APPLIED`] — what the HUD cue shows. Carries the
+/// before/after words and whether this event is a fix or its undo, so one cue
+/// component renders both (`teh → the` on apply, `the → teh` reverting on undo).
+#[derive(Serialize, Clone)]
+struct CorrectionAppliedEvent {
+    typed: String,
+    target: String,
+    /// `false` for an injected fix, `true` for an Escape teach-stop revert.
+    undo: bool,
+}
+
+/// The just-fired correction, retained so a single Escape can revert it within
+/// [`UNDO_WINDOW_MS`]. `typed`/`target` are normalized (allow-list form);
+/// `boundary` is the terminator char that sealed the word (re-typed verbatim on
+/// both inject and revert). `fired_at_ms` arms the window.
+#[derive(Debug, Clone)]
+struct LastCorrection {
+    typed: String,
+    target: String,
+    boundary: char,
+    fired_at_ms: u64,
+}
+
+/// How long after a correction an Escape still reverts it. Sized for slow /
+/// stroke-survivor reaction time — generous, but the window also closes the
+/// moment the user types any other character (an implicit accept), so a long
+/// timeout doesn't keep Escape hijacked. **Tunable.**
+const UNDO_WINDOW_MS: u64 = 6_000;
+
+/// Escape's codepoint (U+001B). The engine sees it as a `Key` event (the L1 tap
+/// streams every keystroke); within an armed undo window it reverts the last
+/// correction instead of being a caret-only no-op.
+const KEY_ESCAPE: char = '\u{001B}';
+
 /// Per-Word-token decision (Component 3c-2). Observe-only — `would-correct`
 /// is a *proposal*, not an injection. `outcome` is the full
 /// [`DecisionOutcome`] tagged enum (`would_correct` / `leave_alone` with
@@ -484,6 +543,12 @@ struct Funnel {
     word_pattern_skipped: u64,
     /// Successful `word_patterns.json` flushes.
     word_pattern_saves: u64,
+    /// M3 correction Step 1 (Principle #8: a live correction is an action on
+    /// the user's text — it must never be silent). `applied` counts injections
+    /// fired from the manual allow-list; `undone` counts Escape teach-stops
+    /// that reverted one. A healthy run reconciles `undone ≤ applied`.
+    corrections_applied: u64,
+    corrections_undone: u64,
     /// Session start (ms since epoch), stamped at task spawn.
     session_started_ms: u64,
 }
@@ -504,7 +569,8 @@ impl Funnel {
              c_tokens_sealed: {}, c_records_admitted: {}, c_verdicts_resolved: {{kept: {}, \
              corr_sug: {}, corr_oth: {}, abandoned: {}}}, c_motor_observations: {{kept: {}, \
              slip: {}}}, c_motor_saves: {}, c_word_patterns: {{observed: {}, skipped: {}}}, \
-             c_word_pattern_saves: {}, session_started_at: {} }}",
+             c_word_pattern_saves: {}, c_corrections: {{applied: {}, undone: {}}}, \
+             session_started_at: {} }}",
             self.keystrokes_received,
             self.keystrokes_accepted,
             self.tokens_sealed,
@@ -519,6 +585,8 @@ impl Funnel {
             self.word_patterns_observed,
             self.word_pattern_skipped,
             self.word_pattern_saves,
+            self.corrections_applied,
+            self.corrections_undone,
             self.session_started_ms,
         );
     }
@@ -571,6 +639,15 @@ fn word_patterns_path() -> Option<PathBuf> {
 /// `~/.typeassist/snapshots` — the daily dated archive directory.
 fn snapshots_dir() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("snapshots"))
+}
+
+/// `~/.typeassist/allow_list.json` — the manual correction allow-list + master
+/// gate (M3 correction Step 1). The engine task is its sole writer; the UI
+/// reads it read-only. Its own file beside the learning stores — it is config,
+/// not learned data. `None` when HOME is unset (corrections then run from an
+/// in-memory default that ships dark, so nothing fires).
+fn allow_list_path() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("allow_list.json"))
 }
 
 /// Minimum interval between live motor-map flushes when there are unsaved
@@ -1263,6 +1340,56 @@ fn flush_word_patterns(
     }
 }
 
+/// Persist the allow-list (the engine is its sole writer) and broadcast the new
+/// state on [`EVT_CORRECTION_STATE`] so the panel + tray master toggle reflect
+/// the engine's authoritative state. A save failure is logged but not fatal —
+/// the in-memory state stays correct for this session, and the next mutation
+/// retries the write.
+fn persist_and_emit_allow_list<R: Runtime>(
+    app: &AppHandle<R>,
+    allow_list: &crate::allow_list::AllowList,
+    path: Option<&Path>,
+) {
+    if let Some(path) = path {
+        if let Err(e) = allow_list.save_to(path) {
+            tracing::warn!("allow-list save failed: {e}");
+        }
+    }
+    let _ = app.emit(EVT_CORRECTION_STATE, allow_list.clone());
+}
+
+/// Write an `InjectCorrection` to the sidecar's stdin: delete the last
+/// `delete_count` characters back from the caret, then type `replacement`
+/// (which already carries the trailing boundary char). The sidecar tags the
+/// synthesized CGEvents (`eventSourceUserData`) so the tap drops their echo —
+/// the engine never sees its own injection, so it can't re-learn or re-correct
+/// it. Returns whether the command was written (a dead stdin returns false).
+fn send_inject_correction(
+    child: &mut tauri_plugin_shell::process::CommandChild,
+    delete_count: u32,
+    replacement: String,
+) -> bool {
+    let cmd = OutboundCommand::InjectCorrection {
+        delete_count,
+        replacement,
+    };
+    let mut line = match serde_json::to_string(&cmd) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("failed to serialize InjectCorrection: {e}");
+            return false;
+        }
+    };
+    line.push('\n');
+    match child.write(line.as_bytes()) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("InjectCorrection write to sidecar failed: {e}");
+            false
+        }
+    }
+}
+
 /// Read-only (kill-switch OFF): classify every learned pattern and log a
 /// summary, so the M3 decision is observable against real accumulating data
 /// BEFORE anything is ever injected. Counts by readiness and lists the
@@ -1826,6 +1953,33 @@ pub fn spawn<R: Runtime>(
             _ => WordPatternStore::new(),
         };
         let mut last_word_patterns_save_ms: u64 = 0;
+        // M3 correction Step 1 — the manual correction allow-list + master
+        // gate. The engine task is its sole writer; loaded once here, mutated
+        // in-memory on EngineControl + Escape-undo, flushed atomically. A
+        // load failure keeps going with the shipped-dark default (gate off, no
+        // patterns) rather than clobbering the user's curated file — but, since
+        // the default would silently disable corrections, it is logged loud.
+        let allow_list_path = allow_list_path();
+        let mut allow_list = match allow_list_path.as_deref() {
+            Some(path) => match crate::allow_list::AllowList::load_from(path) {
+                Ok(al) => {
+                    tracing::info!(
+                        "ALLOW_LIST_LOADED enabled={} patterns={} path={:?}",
+                        al.correction_enabled,
+                        al.patterns.len(),
+                        path
+                    );
+                    al
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "allow-list load failed ({e}); corrections OFF this session (shipped-dark default)"
+                    );
+                    crate::allow_list::AllowList::new()
+                }
+            },
+            None => crate::allow_list::AllowList::new(),
+        };
         // C5c motor ledger — the motor map's own record stream: EVERY
         // motor-evidenced sealed word (known included), lean records the
         // shared resolver verdicts. Decouples the motor map from the
@@ -1866,6 +2020,22 @@ pub fn spawn<R: Runtime>(
         // Capture-integrity funnel (Principle #8). Per-session boundary
         // counters; dumped on the Cmd+Shift+F chord and every 60s.
         let mut funnel = Funnel::new(now_ms());
+        // M3 correction Step 1: the last fix, retained so a single Escape
+        // within `UNDO_WINDOW_MS` reverts it (and teach-stops the pattern).
+        // Disarmed on revert, on any other keystroke (implicit accept), and on
+        // window timeout (watchdog).
+        let mut last_correction: Option<LastCorrection> = None;
+        // Count of injected events (backspaces + replacement chars) we still
+        // expect to see echoed back through the L1 tap. The tap re-captures our
+        // own injection (`.cgSessionEventTap` sees posted events), so each
+        // correction's keystrokes stream back in; we skip exactly this many so
+        // they never reach the pipeline (no re-learn, no buffer desync, and —
+        // critically — they don't disarm the undo before the user's Escape).
+        // Counting-based on purpose: an `eventSourceUserData` tag did NOT
+        // survive the post→tap round-trip in practice. The echo arrives
+        // back-to-back (~1 ms apart), far faster than a human, so it always
+        // drains before the next real key.
+        let mut pending_echo: u32 = 0;
         // Progress Statistics: the current day's live word/slip tally, seeded
         // from disk so a mid-day restart resumes today's counts rather than
         // resetting them. The watchdog upserts + rolls it (see `tick_progress`).
@@ -2001,6 +2171,23 @@ pub fn spawn<R: Runtime>(
                     // telling us what state it's in. Continues the outer
                     // 'engine_loop so the next sidecar event (or control
                     // command) is awaited.
+                    // M3 correction Step 1 — drop our own injection echo. The
+                    // tap re-captures the keystrokes we posted to apply a
+                    // correction (or its undo); skip exactly the number we
+                    // injected so they never enter the pipeline. Echo is NOT
+                    // user input, so this is BEFORE the funnel counts it — and
+                    // before the undo block, so the echo can't disarm a pending
+                    // Escape undo. See `pending_echo`.
+                    if pending_echo > 0
+                        && matches!(
+                            parsed,
+                            InputEvent::Key { .. } | InputEvent::Backspace { .. }
+                        )
+                    {
+                        pending_echo -= 1;
+                        continue;
+                    }
+
                     // Funnel L1 boundary: count every raw typing event from
                     // the sidecar BEFORE any filtering (pause / modifier /
                     // non-text), so `received` is the true denominator.
@@ -2273,6 +2460,86 @@ pub fn spawn<R: Runtime>(
                                 }
                             }
 
+                            // M3 correction Step 1 — Escape-windowed undo +
+                            // teach-stop. While a correction is armed, the FIRST
+                            // real user keystroke decides its fate (the tap
+                            // suppresses our own injection echo, so the next key
+                            // we see is genuinely the user's): a bare Escape
+                            // within the window reverts the fix and removes the
+                            // pattern from the allow-list so it won't recur;
+                            // anything else is an implicit accept and just
+                            // disarms. `take()` disarms in every branch.
+                            if let Some(lc) = last_correction.take() {
+                                let expired =
+                                    now_ms().saturating_sub(lc.fired_at_ms) > UNDO_WINDOW_MS;
+                                let is_escape = matches!(single_char, Some(KEY_ESCAPE))
+                                    && !modifiers.command
+                                    && !modifiers.control;
+                                if !expired && is_escape {
+                                    // Revert: delete the target + boundary we
+                                    // injected, retype the original word +
+                                    // boundary.
+                                    let delete_count = (lc.target.chars().count() + 1) as u32;
+                                    let replacement = format!("{}{}", lc.typed, lc.boundary);
+                                    let echo_len =
+                                        delete_count + replacement.chars().count() as u32;
+                                    if send_inject_correction(
+                                        &mut sidecar_child,
+                                        delete_count,
+                                        replacement,
+                                    ) {
+                                        // Skip the revert's own echo too.
+                                        pending_echo += echo_len;
+                                        funnel.corrections_undone += 1;
+                                        tracing::info!(
+                                            "CORRECTION_UNDONE typed={:?} target={:?}",
+                                            lc.typed,
+                                            lc.target
+                                        );
+                                        // Cue shows the revert direction.
+                                        let _ = app_handle.emit(
+                                            EVT_CORRECTION_APPLIED,
+                                            CorrectionAppliedEvent {
+                                                typed: lc.target.clone(),
+                                                target: lc.typed.clone(),
+                                                undo: true,
+                                            },
+                                        );
+                                    }
+                                    // Teach-stop: a wrong fix is a one-key fix
+                                    // that won't recur. Remove + persist + echo
+                                    // so the panel/tray reflect the removal.
+                                    if allow_list.disable(&lc.typed) {
+                                        tracing::info!(
+                                            "ALLOW_LIST_TEACH_STOP removed typed={:?}",
+                                            lc.typed
+                                        );
+                                        persist_and_emit_allow_list(
+                                            &app_handle,
+                                            &allow_list,
+                                            allow_list_path.as_deref(),
+                                        );
+                                    }
+                                    // The revert's echo is suppressed too; reset
+                                    // the line to mirror the restored text.
+                                    tokenizer.reset_line();
+                                    line_buf.clear();
+                                    line_dwells.clear();
+                                    caret = 0;
+                                    anchors.clear();
+                                    let _ = app_handle.emit(EVT_LINE_RESET, ());
+                                    let snap = anchors.snapshot();
+                                    let _ = app_handle.emit(
+                                        EVT_ANCHOR_SNAPSHOT,
+                                        anchor_emit_payload(&snap, &line_buf),
+                                    );
+                                    continue;
+                                }
+                                // Not an undo — implicit accept. `lc` is dropped
+                                // (disarmed); fall through to process this key
+                                // normally.
+                            }
+
                             if is_non_text {
                                 // Caret-only handling. Left/Right/Home/End
                                 // map to caret moves; Up/Down and every
@@ -2397,8 +2664,31 @@ pub fn spawn<R: Runtime>(
                                             anchors.apply_insert(caret, c);
                                             caret = new_caret;
 
+                                            // M3 Step 1: set when a correction
+                                            // fired and reset the line, so the
+                                            // trailing resolver tick is skipped
+                                            // (mirrors the newline-reset path,
+                                            // which also doesn't tick after).
+                                            let mut corrected = false;
                                             if was_end_of_line {
                                                 if let Some(tok) = tokenizer.observe_char(c) {
+                                                    // M3 correction Step 1: a word
+                                                    // just completed at a boundary
+                                                    // (space / punctuation — NOT
+                                                    // Return; see note below). If
+                                                    // the master gate is on and the
+                                                    // word is an enabled allow-list
+                                                    // pattern, fire a correction.
+                                                    // Capture what injection needs
+                                                    // BEFORE `tok` moves into
+                                                    // emit_sealed_token.
+                                                    let fire = if matches!(tok.kind, TokenKind::Word) {
+                                                        allow_list.target_for(&tok.core).map(|t| {
+                                                            (tok.core.clone(), t.to_string(), tok.end - tok.start)
+                                                        })
+                                                    } else {
+                                                        None
+                                                    };
                                                     emit_sealed_token(
                                                         &app_handle,
                                                         tok,
@@ -2411,6 +2701,79 @@ pub fn spawn<R: Runtime>(
                                                         &mut proposer,
                                                         &mut funnel,
                                                     );
+                                                    if let Some((typed, target, word_len)) = fire {
+                                                        // Delete the word + the
+                                                        // boundary char we just
+                                                        // typed, then retype the
+                                                        // target + the same
+                                                        // boundary. Caret is at the
+                                                        // end of the line here
+                                                        // (was_end_of_line), so a
+                                                        // plain backspace-count
+                                                        // delete is correct.
+                                                        let delete_count = (word_len + 1) as u32;
+                                                        let replacement = format!("{target}{c}");
+                                                        let echo_len = delete_count
+                                                            + replacement.chars().count() as u32;
+                                                        if send_inject_correction(
+                                                            &mut sidecar_child,
+                                                            delete_count,
+                                                            replacement,
+                                                        ) {
+                                                            // Skip this fix's echo
+                                                            // (backspaces + retyped
+                                                            // chars) when it streams
+                                                            // back through the tap.
+                                                            pending_echo += echo_len;
+                                                            funnel.corrections_applied += 1;
+                                                            tracing::info!(
+                                                                "CORRECTION_APPLIED typed={:?} target={:?} delete={}",
+                                                                typed,
+                                                                target,
+                                                                delete_count
+                                                            );
+                                                            let _ = app_handle.emit(
+                                                                EVT_CORRECTION_APPLIED,
+                                                                CorrectionAppliedEvent {
+                                                                    typed: typed.clone(),
+                                                                    target: target.clone(),
+                                                                    undo: false,
+                                                                },
+                                                            );
+                                                            last_correction = Some(LastCorrection {
+                                                                typed,
+                                                                target,
+                                                                boundary: c,
+                                                                fired_at_ms: now_ms(),
+                                                            });
+                                                            // The tap suppresses the
+                                                            // injection's echo, so
+                                                            // the engine won't see
+                                                            // the text change — reset
+                                                            // the line to mirror the
+                                                            // corrected state (same
+                                                            // precedent as the
+                                                            // newline reset). This
+                                                            // also drops the
+                                                            // just-sealed typed word's
+                                                            // Pending record (it
+                                                            // idle-abandons), so the
+                                                            // engine never learns from
+                                                            // its own fix.
+                                                            tokenizer.reset_line();
+                                                            line_buf.clear();
+                                                            line_dwells.clear();
+                                                            caret = 0;
+                                                            anchors.clear();
+                                                            let _ = app_handle.emit(EVT_LINE_RESET, ());
+                                                            let snap = anchors.snapshot();
+                                                            let _ = app_handle.emit(
+                                                                EVT_ANCHOR_SNAPSHOT,
+                                                                anchor_emit_payload(&snap, &line_buf),
+                                                            );
+                                                            corrected = true;
+                                                        }
+                                                    }
                                                 }
                                             } else {
                                                 // Mid-line insert: forward
@@ -2450,27 +2813,31 @@ pub fn spawn<R: Runtime>(
                                             // and the revisit case (a
                                             // mid-line edit may have
                                             // flipped a previously-resolved
-                                            // record).
-                                            tick_resolver(
-                                                &app_handle,
-                                                &mut resolver,
-                                                &mut motor_resolver,
-                                                &anchors,
-                                                &line_buf,
-                                                caret,
-                                                &mut ledger,
-                                                &mut motor_ledger,
-                                                &mut proposer,
-                                                &mut motor_map,
-                                                &mut word_patterns,
-                                                &mut funnel,
-                                                &mut tally,
-                                            );
-                                            let snap = anchors.snapshot();
-                                            let _ = app_handle.emit(
-                                                EVT_ANCHOR_SNAPSHOT,
-                                                anchor_emit_payload(&snap, &line_buf),
-                                            );
+                                            // record). Skipped when a
+                                            // correction just reset the line
+                                            // (it emitted its own snapshot).
+                                            if !corrected {
+                                                tick_resolver(
+                                                    &app_handle,
+                                                    &mut resolver,
+                                                    &mut motor_resolver,
+                                                    &anchors,
+                                                    &line_buf,
+                                                    caret,
+                                                    &mut ledger,
+                                                    &mut motor_ledger,
+                                                    &mut proposer,
+                                                    &mut motor_map,
+                                                    &mut word_patterns,
+                                                    &mut funnel,
+                                                    &mut tally,
+                                                );
+                                                let snap = anchors.snapshot();
+                                                let _ = app_handle.emit(
+                                                    EVT_ANCHOR_SNAPSHOT,
+                                                    anchor_emit_payload(&snap, &line_buf),
+                                                );
+                                            }
                                         }
                                     }
                                     _ => {
@@ -2698,6 +3065,51 @@ pub fn spawn<R: Runtime>(
                                 now_ms(),
                             );
                             let _ = app_handle.emit(EVT_PRACTICE_TREND, trend);
+                        }
+                        EngineControl::SetCorrectionEnabled(enabled) => {
+                            // M3 Step 1 master gate — the instant global on/off.
+                            // Persist + echo so the tray check and panel switch
+                            // converge on the engine's authoritative state. Turn
+                            // OFF disarms any pending undo (no fix to revert).
+                            if allow_list.set_enabled(enabled) {
+                                if !enabled {
+                                    last_correction = None;
+                                }
+                                tracing::info!("CORRECTION_GATE enabled={enabled}");
+                                persist_and_emit_allow_list(
+                                    &app_handle,
+                                    &allow_list,
+                                    allow_list_path.as_deref(),
+                                );
+                            } else {
+                                // No change, but still echo so an optimistic UI
+                                // that diverged reconverges.
+                                let _ = app_handle.emit(EVT_CORRECTION_STATE, allow_list.clone());
+                            }
+                        }
+                        EngineControl::SetPatternEnabled { typed, target, enabled } => {
+                            // M3 Step 1 — the panel's per-pattern toggle. Enable
+                            // adds (idempotent), disable removes; either way
+                            // persist + echo so the panel reflects the truth.
+                            let changed = if enabled {
+                                allow_list.enable(&typed, &target)
+                            } else {
+                                allow_list.disable(&typed)
+                            };
+                            if changed {
+                                tracing::info!(
+                                    "ALLOW_LIST_TOGGLE typed={typed:?} target={target:?} enabled={enabled}"
+                                );
+                            }
+                            persist_and_emit_allow_list(
+                                &app_handle,
+                                &allow_list,
+                                allow_list_path.as_deref(),
+                            );
+                        }
+                        EngineControl::RequestAllowList => {
+                            // Panel/tray pull fresh state on open. Read-only.
+                            let _ = app_handle.emit(EVT_CORRECTION_STATE, allow_list.clone());
                         }
                     }
                 }

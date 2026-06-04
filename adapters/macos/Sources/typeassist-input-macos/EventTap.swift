@@ -107,6 +107,12 @@ final class EventTap {
             return
         }
 
+        // NOTE: our own injection echo is dropped on the ENGINE side by an exact
+        // count of injected events (see `pending_echo` in engine.rs), NOT here —
+        // an `eventSourceUserData` tag did not survive the post→tap round-trip
+        // in practice, so this tap forwards everything and the engine filters
+        // deterministically.
+
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
         let timestampNs = event.timestamp
         let timestampMs = UInt64(timestampNs / 1_000_000)
@@ -125,6 +131,19 @@ final class EventTap {
             // Keycode 51 = delete/backspace
             if keycode == 51 {
                 bridge.emit(.backspace(timestampMs: timestampMs))
+            } else if keycode == 53 {
+                // Keycode 53 = Escape. `keyboardGetUnicodeString` returns an
+                // EMPTY string for it (it's not a text-producing key), so the
+                // engine would never see it. Emit an explicit U+001B — the
+                // codepoint the engine's M3 correction-undo window matches on
+                // (KEY_ESCAPE). Modifiers are carried so the engine can require
+                // a *bare* Escape.
+                bridge.emit(.key(
+                    key: "\u{1b}",
+                    timestampMs: timestampMs,
+                    modifiers: Self.modifiers(for: event),
+                    dwellMs: dwellMs
+                ))
             } else {
                 let key = Self.keyString(for: event)
                 bridge.emit(.key(

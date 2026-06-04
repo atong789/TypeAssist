@@ -34,7 +34,8 @@ enum Accessibility {
         }
     }
 
-    /// Post a key-down/key-up pair for a hardware key code.
+    /// Post a key-down/key-up pair for a hardware key code. The echo is dropped
+    /// engine-side by count (see `pending_echo` in engine.rs).
     private static func tapKey(_ keyCode: CGKeyCode, source: CGEventSource) {
         CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true)?
             .post(tap: .cgSessionEventTap)
