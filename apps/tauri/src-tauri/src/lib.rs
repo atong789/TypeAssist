@@ -419,6 +419,107 @@ fn read_progress_stats() -> Result<Vec<ProgressDay>, String> {
     Ok(parsed.days)
 }
 
+/// One letter key's two trouble scores for the Progress keyboard view — the
+/// per-key expansion of the Statistics Coordination/Precision numbers. Both are
+/// **raw decayed rates in `0..=1`**; the Svelte side scales colour intensity
+/// *relative to the user's own worst key* (the brief), so no absolute scale is
+/// baked in here.
+///
+/// - `precision` — the motor map's per-key mis-hit rate (`slips / productions`):
+///   "right key, clean hit" targeting.
+/// - `coordination` — the share of this key's productions implicated in a
+///   learned adjacent-transposition correction (letter-order slips). Sourced
+///   from `word_patterns.json`, attributed to both swapped keys.
+/// - `productions` — decayed times the key was typed: the figure revealed on
+///   tap, and the denominator behind both rates.
+/// - `well_sampled` — `productions >= MIN_SAMPLES`. Below the bar the UI paints
+///   the key neutral rather than inventing a (falsely good) score.
+#[derive(serde::Serialize)]
+struct KeyScore {
+    key: String,
+    precision: f32,
+    coordination: f32,
+    productions: f32,
+    well_sampled: bool,
+}
+
+/// Tauri command: read `motor_map.json` (precision) and `word_patterns.json`
+/// (coordination) straight off disk and return a per-key score for **every**
+/// QWERTY letter `a..=z` — the data behind the Progress keyboard map. Fully
+/// read-only; missing files (nothing learned yet) yield all-neutral keys, not an
+/// error. Decay is whatever the engine last flushed (values are decayed to each
+/// store's `last_now`, ~2s fresh) — a true "now" snapshot, no re-decay here.
+///
+/// Letters the motor map has never seen stay at zero / `well_sampled = false`,
+/// so the board always renders a full keyboard with honest empty keys.
+#[tauri::command]
+fn read_key_scores() -> Result<Vec<KeyScore>, String> {
+    use std::collections::BTreeMap;
+
+    let dir = match typeassist_data_dir() {
+        Some(d) => d,
+        None => return Ok(Vec::new()),
+    };
+
+    // Seed all 26 letters neutral so the keyboard is always complete; the data
+    // files only ever upgrade a key away from "no evidence".
+    let mut keys: BTreeMap<char, KeyScore> = ('a'..='z')
+        .map(|c| {
+            (
+                c,
+                KeyScore {
+                    key: c.to_string(),
+                    precision: 0.0,
+                    coordination: 0.0,
+                    productions: 0.0,
+                    well_sampled: false,
+                },
+            )
+        })
+        .collect();
+
+    // Precision: per-key mis-hit rate straight from the motor map. Punctuation
+    // / digits the map tracks have no key on the board, so they're skipped.
+    let motor_path = dir.join("motor_map.json");
+    if motor_path.exists() {
+        let map = correction_engine::MotorMap::load_from(&motor_path)
+            .map_err(|e| format!("could not read motor_map.json: {e}"))?;
+        for s in map.key_stats() {
+            if let Some(entry) = keys.get_mut(&s.key) {
+                entry.precision = s.slip_rate;
+                entry.productions = s.total;
+                entry.well_sampled = s.total >= correction_engine::MIN_SAMPLES;
+            }
+        }
+    }
+
+    // Coordination: attribute each learned adjacent-transposition pattern's
+    // decayed weight to BOTH intended keys whose order slipped, then divide by
+    // that key's productions so it reads on the same "share of presses" scale as
+    // precision. A key with no productions stays at 0 (can't be a rate).
+    let pattern_path = dir.join("word_patterns.json");
+    if pattern_path.exists() {
+        let store = correction_engine::WordPatternStore::load_from(&pattern_path)
+            .map_err(|e| format!("could not read word_patterns.json: {e}"))?;
+        let mut coord_weight: BTreeMap<char, f32> = BTreeMap::new();
+        for p in store.snapshots() {
+            if let Some((a, b)) = correction_engine::transposition_keys(&p.typed, &p.target) {
+                *coord_weight.entry(a).or_insert(0.0) += p.weight;
+                *coord_weight.entry(b).or_insert(0.0) += p.weight;
+            }
+        }
+        for (k, w) in coord_weight {
+            if let Some(entry) = keys.get_mut(&k) {
+                if entry.productions > 0.0 {
+                    entry.coordination = (w / entry.productions).min(1.0);
+                }
+            }
+        }
+    }
+
+    Ok(keys.into_values().collect())
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -444,7 +545,8 @@ pub fn run() {
             request_allow_list,
             read_allow_list,
             read_word_patterns,
-            read_progress_stats
+            read_progress_stats,
+            read_key_scores
         ])
         .on_window_event(|window, event| match event {
             // Menu-bar app: a window's close button / Cmd+W must NOT quit the

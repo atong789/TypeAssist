@@ -78,6 +78,25 @@ pub fn classify_slip(typed: &str, target: &str) -> Option<SlipClass> {
     None
 }
 
+/// For an adjacent transposition `typed → target`, the two **intended** keys
+/// whose order slipped — the `target` characters at the swap positions, in
+/// `target` order. `None` when the pair is not a single adjacent transposition
+/// (i.e. exactly when [`classify_slip`] would not call it `Coordination`).
+///
+/// Used by the Progress keyboard view to attribute one coordination slip to the
+/// specific keys it implicates: `teh → the` ⇒ `('h', 'e')` (the hand had `h`
+/// and `e`; their sequencing slipped). Both keys carry the slip's weight.
+pub fn transposition_keys(typed: &str, target: &str) -> Option<(char, char)> {
+    let t: Vec<char> = typed.chars().collect();
+    let g: Vec<char> = target.chars().collect();
+    if t.len() != g.len() || !is_adjacent_transposition(&t, &g) {
+        return None;
+    }
+    // The first disagreeing position is `i`; the swap is over `i, i+1`.
+    let i = (0..t.len()).find(|&i| t[i] != g[i])?;
+    Some((g[i], g[i + 1]))
+}
+
 /// True iff `t` and `g` are equal length and differ by exactly one swap of two
 /// *adjacent* characters (a classic transposition): they disagree at exactly
 /// two positions `i, i+1`, with `t[i] == g[i+1]` and `t[i+1] == g[i]`.
@@ -158,6 +177,18 @@ mod tests {
         // precision guard, which rejects it (distance 2 ok, but it's two subs
         // at non-adjacent positions: still within dist 2, len_diff 0 → Precision)
         assert_eq!(classify_slip("dab", "bad"), Some(SlipClass::Precision));
+    }
+
+    #[test]
+    fn transposition_keys_are_the_intended_pair() {
+        // `teh → the`: the `h` and `e` are the keys whose order slipped.
+        assert_eq!(transposition_keys("teh", "the"), Some(('h', 'e')));
+        assert_eq!(transposition_keys("adn", "and"), Some(('n', 'd')));
+        assert_eq!(transposition_keys("form", "from"), Some(('r', 'o')));
+        // Not an adjacent transposition → no key pair (matches classify_slip).
+        assert_eq!(transposition_keys("wprd", "word"), None);
+        assert_eq!(transposition_keys("word", "word"), None);
+        assert_eq!(transposition_keys("dab", "bad"), None);
     }
 
     #[test]

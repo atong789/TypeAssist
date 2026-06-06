@@ -56,8 +56,8 @@ pub use log::{
 };
 pub use motor_ledger::{MotorLedger, MotorRecord, DEFAULT_MOTOR_LEDGER_CAPACITY};
 pub use motor_map::{
-    MotorMap, ObserveReport, SlipDistribution, StabilityReport, Timestamp, HALF_LIFE_MS,
-    MAX_SLIP_EDIT_DISTANCE, MAX_SLIP_LENGTH_DIFF, MOTOR_MAP_VERSION, PERSIST_EVERY,
+    KeyStat, MotorMap, ObserveReport, SlipDistribution, StabilityReport, Timestamp, HALF_LIFE_MS,
+    MAX_SLIP_EDIT_DISTANCE, MAX_SLIP_LENGTH_DIFF, MIN_SAMPLES, MOTOR_MAP_VERSION, PERSIST_EVERY,
 };
 pub use motor_signal::{
     measure_token_motor, TokenMotorSignal, TokenMotorVerdict, GRAZE_DWELL_MS, MIN_SAMPLE_CHARS,
@@ -70,7 +70,7 @@ pub use score::{
     confidence_for, score_candidates, Confidence, ConfidenceReport, EditType, ScoredCandidate,
     CONFIDENCE_HIGH_FLOOR, CONFIDENCE_LOW_FLOOR, CONFIDENCE_MEDIUM_FLOOR, SCORE_VERSION,
 };
-pub use slip_class::{classify_slip, SlipClass, SLIP_CLASS_VERSION};
+pub use slip_class::{classify_slip, transposition_keys, SlipClass, SLIP_CLASS_VERSION};
 pub use tokenizer::{Token, TokenKind, Tokenizer, TOKENIZER_VERSION};
 pub use word_pattern::{
     PatternObserveReport, PatternSnapshot, PatternStat, WordPatternStore, MAX_PATTERN_EDIT_DISTANCE,

@@ -221,6 +221,22 @@ impl SlipDistribution {
     }
 }
 
+/// One intended key's decayed targeting stats — the read shape returned by
+/// [`MotorMap::key_stats`]. `slip_rate = slips / total` (0 when `total` is 0),
+/// the per-key "right key, clean hit" miss rate the Progress keyboard view
+/// paints as Precision. Raw and ungated: the caller gates on `total` itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyStat {
+    /// The intended (normalized, lowercase) character.
+    pub key: char,
+    /// Decayed total productions of this key (correct + all mis-hits).
+    pub total: f32,
+    /// Decayed mis-hits (the key came out as some other character).
+    pub slips: f32,
+    /// `slips / total ∈ [0, 1]`, or `0.0` when `total` is `0`.
+    pub slip_rate: f32,
+}
+
 /// The motor map. Owned by the engine; serialized to JSON for persistence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MotorMap {
@@ -500,6 +516,36 @@ impl MotorMap {
             .collect()
     }
 
+    /// Per-key targeting stats for the Progress keyboard view — one [`KeyStat`]
+    /// per intended key the map has ever seen, decayed to [`Self::last_now`].
+    /// Unlike [`Self::query_weakest_keys`] this is **ungated and unsorted**: it
+    /// returns *every* key with its raw decayed counts so the caller can paint a
+    /// full keyboard and decide for itself which keys have too little data to
+    /// mean anything (`total < MIN_SAMPLES`) — rendering those neutral rather
+    /// than inventing a "good" score. Read-only; no decay is written back.
+    pub fn key_stats(&self) -> Vec<KeyStat> {
+        let now = self.last_now;
+        self.dists
+            .iter()
+            .map(|(&key, dist)| {
+                let total = dist.decayed_total(now);
+                let correct = dist.decayed_correct(now);
+                let slips = (total - correct).max(0.0);
+                let slip_rate = if total > 0.0 {
+                    (slips / total).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                KeyStat {
+                    key,
+                    total,
+                    slips,
+                    slip_rate,
+                }
+            })
+            .collect()
+    }
+
     /// How reliably the user produces `intended` — `correct / total ∈ [0, 1]`,
     /// decayed to [`Self::last_now`]. `0.0` when there's no data for the key
     /// (rather than NaN), so callers can treat unknown keys as "no evidence."
@@ -757,6 +803,29 @@ mod tests {
         assert_eq!(map.confidence('a'), 0.0);
         let intent = map.query_probable_intent('s');
         assert_eq!(intent, vec![('a', 1.0)]);
+    }
+
+    #[test]
+    fn key_stats_reports_raw_per_key_rates_ungated() {
+        let mut map = MotorMap::new();
+        // 'a': 3 correct (cat, can, car) + 1 mis-hit (typed 's' for 'a').
+        map.observe_outcome(Outcome::Kept, "cat", None, T0);
+        map.observe_outcome(Outcome::Kept, "can", None, T0);
+        map.observe_outcome(Outcome::Kept, "car", None, T0);
+        map.observe_outcome(Outcome::CorrectedToOther, "cst", Some("cat"), T0);
+
+        let stats = map.key_stats();
+        let a = stats.iter().find(|s| s.key == 'a').expect("'a' tracked");
+        // 4 productions of 'a' (3 kept + 1 in the corrected word), 1 a mis-hit.
+        assert!((a.total - 4.0).abs() < 1e-3, "total = {}", a.total);
+        assert!((a.slips - 1.0).abs() < 1e-3, "slips = {}", a.slips);
+        assert!((a.slip_rate - 0.25).abs() < 1e-3, "rate = {}", a.slip_rate);
+
+        // Ungated: a key with a single observation is still returned (the
+        // caller decides it's below MIN_SAMPLES), with slip_rate 0 when clean.
+        let t = stats.iter().find(|s| s.key == 't').expect("'t' tracked");
+        assert_eq!(t.slip_rate, 0.0);
+        assert!(t.total < MIN_SAMPLES); // caller would render 't' neutral
     }
 
     #[test]
