@@ -370,7 +370,7 @@
 <svelte:window on:keydown={onRootKeydown} />
 
 <div class="panel" bind:this={rootEl}>
-  <button class="close" aria-label="Close practice" on:click={done}>
+  <button class="close" aria-label="Close warm-up" on:click={done}>
     <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
       <line x1="6" y1="6" x2="18" y2="18" /><line x1="18" y1="6" x2="6" y2="18" />
     </svg>

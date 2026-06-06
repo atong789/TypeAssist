@@ -99,13 +99,20 @@ fn request_motor_stability(sender: tauri::State<EngineControlSender>) -> Result<
 /// (acceptable: "nobody practices typing during a fullscreen call").
 fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>> {
     let open_main = MenuItem::with_id(app, "open_main", "Open TypeAssist", true, None::<&str>)?;
-    let practice = MenuItem::with_id(app, "practice", "Practice mode", true, None::<&str>)?;
+    let practice = MenuItem::with_id(app, "practice", "Warm-up", true, None::<&str>)?;
     let progress = MenuItem::with_id(app, "progress", "Progress", true, None::<&str>)?;
     // M3 correction Step 1 — the menu-bar master gate (instant, one-action
     // global on/off, the brief's "global off") + the curation panel opener. The
     // check's initial state is read off disk so it reflects the persisted gate;
     // it then tracks the engine's authoritative echo (see `setup`). Default is
     // OFF — the feature ships dark.
+    //
+    // HIDDEN FOR NOW (display-only): correction isn't ready to suggest yet, so
+    // neither the "Enable corrections" toggle nor the "Corrections…" opener is
+    // added to the menu. The code is kept intact — `corr_toggle` is still built
+    // and returned so the engine-echo sync in `setup` keeps working — and both
+    // resurface (as a confidence-gated on/off switch) by re-adding the
+    // commented `&corr_toggle` / `&corrections` (+ a separator) to the menu.
     let corr_enabled = read_allow_list()
         .map(|al| al.correction_enabled)
         .unwrap_or(false);
@@ -117,10 +124,10 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
         corr_enabled,
         None::<&str>,
     )?;
-    let corrections = MenuItem::with_id(app, "corrections", "Corrections…", true, None::<&str>)?;
+    // let corrections = MenuItem::with_id(app, "corrections", "Corrections…", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let sep_a = PredefinedMenuItem::separator(app)?;
-    let sep_b = PredefinedMenuItem::separator(app)?;
+    // let sep_b = PredefinedMenuItem::separator(app)?; // divided the (now hidden) corrections section
     let sep_c = PredefinedMenuItem::separator(app)?;
     let quit = PredefinedMenuItem::quit(app, Some("Quit TypeAssist"))?;
     let menu = Menu::with_items(
@@ -130,9 +137,9 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
             &practice,
             &progress,
             &sep_a,
-            &corr_toggle,
-            &corrections,
-            &sep_b,
+            // &corr_toggle,  // hidden for now — see note above
+            // &corrections,  // hidden for now — see note above
+            // &sep_b,
             &settings,
             &sep_c,
             &quit,

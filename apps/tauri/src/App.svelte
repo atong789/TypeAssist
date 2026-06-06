@@ -17,7 +17,11 @@
   const items: { route: Route; label: string }[] = [
     { route: "home", label: "Home" },
     { route: "today", label: "Today" },
-    { route: "warmup", label: "Warm-up" },
+    // The in-app "Warm-up" screen is hidden for now: "Warm-up" is being used
+    // for the menu-bar panel (the renamed Practice), so we surface only that one
+    // to avoid two things called "Warm-up". The route, import, and render branch
+    // below are kept intact — restore this entry to bring the in-app screen back.
+    // { route: "warmup", label: "Warm-up" },
     { route: "settings", label: "Settings" },
   ];
 

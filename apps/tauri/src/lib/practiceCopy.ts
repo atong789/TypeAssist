@@ -14,13 +14,13 @@ export const copy = {
     sub: "a short, calm round — no scores, no clock",
     hint: "press space or tap begin to start",
     /** aria label on the begin control */
-    beginLabel: "Begin a practice round",
+    beginLabel: "Begin a warm-up round",
   },
 
   typing: {
     /** aria label on the typing surface */
     surfaceLabel:
-      "Practice sentence. Type the words shown; a slip is marked but never scored — backspace to redo.",
+      "Warm-up sentence. Type the words shown; a slip is marked but never scored — backspace to redo.",
     reassurance: "a slip just shows, gently — backspace to redo, nothing is scored",
   },
 
@@ -29,14 +29,14 @@ export const copy = {
     again: "Another",
     finish: "Finish",
     hint: "press space or tap another",
-    againLabel: "Practice another sentence",
+    againLabel: "Warm up another sentence",
     finishLabel: "Finish and see what happened",
   },
 
   snapshot: {
     title: "Nicely done.",
     done: "Done",
-    doneLabel: "Close practice",
+    doneLabel: "Close warm-up",
 
     /** "what happened": which weak keys the round leaned into. Capability
      *  framing — these are keys the user *worked*, never keys they "failed". */

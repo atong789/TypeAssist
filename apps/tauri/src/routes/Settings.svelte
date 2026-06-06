@@ -33,10 +33,10 @@
 <header class="screen-header"><h1>Settings</h1></header>
 
 <section class="group">
-  <h2 class="group-title">Practice language</h2>
-  <p class="group-help">Which spelling the Practice word bank uses.</p>
+  <h2 class="group-title">Warm-up language</h2>
+  <p class="group-help">Which spelling the Warm-up word bank uses.</p>
   <fieldset class="card-group">
-    <legend class="sr-only">Practice language</legend>
+    <legend class="sr-only">Warm-up language</legend>
     {#each options as o}
       <label class="opt-card" class:selected={pref === o.value}>
         <input type="radio" name="practice-spelling" value={o.value} bind:group={pref} />

@@ -6,6 +6,13 @@
 
   const dispatch = createEventDispatcher<{ navigate: string }>();
 
+  // HIDDEN FOR NOW (display-only): the "Home invites" warm-up card below opens
+  // the in-app Warm-up screen, which is hidden so only the menu-bar "Warm-up"
+  // (the renamed Practice) shows. Flip to `true` to bring the card back, or
+  // repoint its click at the menu-bar Warm-up panel later. Kept as a flag (not
+  // deleted markup) so its styles and the `dispatch` wiring stay intact.
+  const showWarmupCard = false;
+
   // TODO: wire to the real user name later.
   const name = "Soumyo";
 
@@ -23,7 +30,7 @@
 <div class="home">
   <header>
     <h1>{greeting()}, {name}.</h1>
-    <p class="subline">TypeAssist is quietly helping as you type, everywhere on your Mac.</p>
+    <p class="subline">TypeAssist is quietly learning as you type, everywhere on your Mac.</p>
   </header>
 
   <div class="today">
@@ -35,18 +42,21 @@
        start. The "Start" pill is a visible affordance only — the card itself
        is the control, so there is a single tab stop, activatable with
        Enter and Space. Keeping it a <button> (with phrasing-content spans, no
-       nested button or heading) keeps the markup valid and accessible. -->
-  <button class="warmup" on:click={() => dispatch("navigate", "warmup")}>
-    <span class="warmup-copy">
-      <span class="warmup-title">A quick warm-up?</span>
-      <span class="warmup-desc">30 seconds to help me tune to your hands today. Entirely optional.</span>
-    </span>
-    <span class="start" aria-hidden="true">Start</span>
-  </button>
+       nested button or heading) keeps the markup valid and accessible.
+       Gated off for now (see `showWarmupCard`). -->
+  {#if showWarmupCard}
+    <button class="warmup" on:click={() => dispatch("navigate", "warmup")}>
+      <span class="warmup-copy">
+        <span class="warmup-title">A quick warm-up?</span>
+        <span class="warmup-desc">30 seconds to help me tune to your hands today. Entirely optional.</span>
+      </span>
+      <span class="start" aria-hidden="true">Start</span>
+    </button>
+  {/if}
 
   <p class="status">
     <span class="dot" aria-hidden="true"></span>
-    TypeAssist is active and helping
+    Jordan is here, quietly learning.
   </p>
 </div>
 
