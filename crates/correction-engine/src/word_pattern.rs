@@ -295,7 +295,8 @@ impl WordPatternStore {
         let distance = edit_distance(&typed, &target);
         let length_diff = typed.chars().count().abs_diff(target.chars().count());
         if distance > MAX_PATTERN_EDIT_DISTANCE || length_diff > MAX_PATTERN_LENGTH_DIFF {
-            tracing::info!(
+            // debug!, not info!: prints raw typed + target words (privacy).
+            tracing::debug!(
                 target: "word_pattern",
                 "WORD_PATTERN_SKIP_REWRITE typed={:?} target={:?} distance={} length_diff={}",
                 typed, target, distance, length_diff
@@ -309,7 +310,8 @@ impl WordPatternStore {
 
         self.total_observations += 1;
         self.obs_since_persist += 1;
-        tracing::info!(
+        // debug!, not info!: prints raw typed + target words (privacy).
+        tracing::debug!(
             target: "word_pattern",
             "WORD_PATTERN_OBSERVE typed={:?} target={:?} weight={:.2}",
             typed, target, weight
@@ -335,7 +337,8 @@ impl WordPatternStore {
             Some(stat) => {
                 stat.consecutive_undos = stat.consecutive_undos.saturating_add(1);
                 let n = stat.consecutive_undos;
-                tracing::info!(
+                // debug!, not info!: prints raw typed + target words (privacy).
+                tracing::debug!(
                     target: "word_pattern",
                     "WORD_PATTERN_UNDO typed={:?} target={:?} consecutive={}",
                     typed, target, n

@@ -333,7 +333,10 @@ impl MotorMap {
                 if chars > 0 {
                     self.total_observations += 1;
                     self.obs_since_persist += 1;
-                    tracing::info!(
+                    // debug!, not info!: prints the actual typed word, so it
+                    // must stay below the default log level (privacy — raw text
+                    // off the console in normal operation; RUST_LOG=debug shows it).
+                    tracing::debug!(
                         target: "motor_map",
                         "MOTOR_OBSERVE_KEPT typed={:?} chars={}",
                         typed,
@@ -369,7 +372,8 @@ impl MotorMap {
                     .count();
                 let length_diff = typed_chars.len().abs_diff(corrected_chars.len());
                 if edit_distance > MAX_SLIP_EDIT_DISTANCE || length_diff > MAX_SLIP_LENGTH_DIFF {
-                    tracing::info!(
+                    // debug!, not info!: prints raw typed + corrected words (privacy).
+                    tracing::debug!(
                         target: "motor_map",
                         "MOTOR_OBSERVE_SKIP_REWRITE typed={:?} corrected={:?} edit_distance={} length_diff={}",
                         typed,
@@ -391,7 +395,8 @@ impl MotorMap {
                         AlignOp::Sub { typed, intended } => {
                             self.bump_incorrect(intended, typed, now);
                             slips += 1;
-                            tracing::info!(
+                            // debug!, not info!: prints the actual characters (privacy).
+                            tracing::debug!(
                                 target: "motor_map",
                                 "MOTOR_OBSERVE_SLIP intended={:?} typed={:?}",
                                 intended,
@@ -408,7 +413,8 @@ impl MotorMap {
                 if slips == 0 {
                     // All matches (e.g. a pure capitalisation fix that
                     // normalises away) — recorded as positive, no slip line.
-                    tracing::info!(
+                    // debug!, not info!: prints the actual typed word (privacy).
+                    tracing::debug!(
                         target: "motor_map",
                         "MOTOR_OBSERVE_KEPT typed={:?} chars={} (corrected, no slip)",
                         typed,

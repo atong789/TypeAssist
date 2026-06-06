@@ -1229,7 +1229,8 @@ fn tick_resolver<R: Runtime>(
                                         word_patterns,
                                         Lexicon::shared(),
                                     );
-                                    tracing::info!(
+                                    // debug!, not info!: prints raw typed + target words (privacy).
+                                    tracing::debug!(
                                         "KILL_SWITCH_CLASSIFY typed={:?} target={:?} -> {:?}",
                                         rec.original_text,
                                         c,
@@ -1422,7 +1423,9 @@ fn dump_classifications(store: &WordPatternStore) {
             PatternReadiness::Silent { .. } => silent += 1,
         }
     }
-    tracing::info!(
+    // debug!, not info!: `actionable` lists raw typed→target word pairs (privacy).
+    // Counts live in FUNNEL_DUMP (text-free), which stays at info.
+    tracing::debug!(
         "KILL_SWITCH_DUMP patterns={} tier1={} tier2={} silent={} actionable={:?}",
         store.len(),
         tier1,
@@ -1517,7 +1520,8 @@ fn emit_sealed_token<R: Runtime>(
         // bursts on every backspace, with the same N anchor ids
         // repeating across three back-to-back backspace replays.
         let Some(anchor_id) = anchors.try_register(tok.start, tok.end, &tok.core) else {
-            tracing::info!("REPLAY-SKIP-EMIT tok_core={:?}", tok.core);
+            // debug!, not info!: tok.core is the raw typed word (privacy).
+            tracing::debug!("REPLAY-SKIP-EMIT tok_core={:?}", tok.core);
             let _ = app.emit(EVT_TOKEN, tok);
             return;
         };
@@ -1583,7 +1587,8 @@ fn emit_sealed_token<R: Runtime>(
         // DECISION fires for every Word token (known included — its reason
         // is `known`). The FEED needs one row per word so the builder can
         // see why each token did or didn't fire.
-        tracing::info!("EMIT_DECISION tok_core={:?}", tok.core);
+        // debug!, not info!: tok.core is the raw typed word (privacy).
+        tracing::debug!("EMIT_DECISION tok_core={:?}", tok.core);
         let _ = app.emit(
             EVT_DECISION,
             DecisionPayload {
@@ -1627,7 +1632,8 @@ fn emit_sealed_token<R: Runtime>(
                 &[][..]
             };
             let token_motor = Some(measure_token_motor(span_dwells));
-            tracing::info!("LEDGER_APPEND anchor_id={} core={:?}", anchor_id, tok.core);
+            // debug!, not info!: tok.core is the raw typed word (privacy).
+            tracing::debug!("LEDGER_APPEND anchor_id={} core={:?}", anchor_id, tok.core);
             let new_id = ledger.append(
                 ts,
                 outcome,
@@ -2396,10 +2402,11 @@ pub fn spawn<R: Runtime>(
                         InputEvent::Key { key, dwell_ms, modifiers, .. } => {
                             // Diagnostic log of the raw incoming codepoint(s)
                             // and modifier flags, so we can verify what the
-                            // sidecar is actually emitting. INFO level on
-                            // purpose — load-bearing while the nav-key story
-                            // settles; demote once stable.
-                            tracing::info!(
+                            // sidecar is actually emitting. DEBUG level: this
+                            // prints the raw keystroke, so it must stay below the
+                            // default log level — never on the console in normal
+                            // operation, only under RUST_LOG=debug (privacy).
+                            tracing::debug!(
                                 "key in: {:?} chars=[{}] fn={} shift={} ctrl={} opt={} cmd={}",
                                 key,
                                 key.chars()
