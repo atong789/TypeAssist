@@ -37,12 +37,13 @@ use std::path::{Path, PathBuf};
 
 use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
 use correction_engine::{
-    classify_slip, decide, has_motor_evidence, measure_token_motor, ranked_known_candidates,
-    score_candidates, should_log, AnchorTracker, Confidence, ConfidenceTier, DecisionLedger,
-    DecisionOutcome, Lexicon, LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome,
-    OutcomeResolver, PatternReadiness, ScoredCandidate, SlipClass, StabilityReport, Token,
-    TokenKind, Tokenizer, WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION,
-    LEXICON_VERSION, SCORE_VERSION,
+    classify_slip, decide, has_motor_evidence, measure_token_motor, normalize_word,
+    ranked_known_candidates, score_candidates, should_log, AnchorTracker, Confidence,
+    ConfidenceTier, DecisionLedger, DecisionOutcome, GuessLedger, Lexicon, LexiconProposer,
+    MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver, PatternReadiness,
+    ScoredCandidate, SlipClass, StabilityReport, Token, TokenKind, Tokenizer, WordPatternStore,
+    ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION, MAX_PATTERN_EDIT_DISTANCE,
+    MAX_PATTERN_LENGTH_DIFF, SCORE_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime};
@@ -636,6 +637,13 @@ fn word_patterns_path() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("word_patterns.json"))
 }
 
+/// `~/.typeassist/guess_accuracy.json` — the observe-only guesser accuracy
+/// scoreboard (M3 accuracy-gated suggestion work, Phase 1). Its OWN file beside
+/// the word-pattern store; measurement only, never read back into correction.
+fn guess_accuracy_path() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("guess_accuracy.json"))
+}
+
 /// `~/.typeassist/snapshots` — the daily dated archive directory.
 fn snapshots_dir() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("snapshots"))
@@ -1136,6 +1144,7 @@ fn tick_resolver<R: Runtime>(
     proposer: &mut LexiconProposer,
     motor_map: &mut MotorMap,
     word_patterns: &mut WordPatternStore,
+    guess_ledger: &mut GuessLedger,
     funnel: &mut Funnel,
     tally: &mut DailyTally,
 ) {
@@ -1206,6 +1215,67 @@ fn tick_resolver<R: Runtime>(
                         // skipped so the rewrite-filter drop is auditable.
                         match corrected.as_deref() {
                             Some(c) => {
+                                // --- Guesser accuracy scoreboard (M3 Phase 1,
+                                // observe-only) — PREDICT, then learn. Ask the
+                                // guesser for its top guess of `typed` using the
+                                // word-pattern model AS IT STANDS NOW, BEFORE
+                                // this correction is folded in below, so the
+                                // score is genuinely out-of-sample. Measurement
+                                // only: nothing fires, the master gate is
+                                // untouched, the existing stores are unchanged.
+                                // Runs only on a resolved CorrectedToOther (rare,
+                                // human-paced) — never on the typing hot path.
+                                {
+                                    let typed_n = normalize_word(&rec.original_text);
+                                    let target_n = normalize_word(c);
+                                    if !typed_n.is_empty() && !target_n.is_empty() {
+                                        let snaps = word_patterns.snapshots();
+                                        let model = correction_engine::guesser::build_model(
+                                            snaps.iter().map(|s| {
+                                                (
+                                                    s.target.as_str(),
+                                                    s.typed.as_str(),
+                                                    s.weight as f64,
+                                                )
+                                            }),
+                                        );
+                                        let g = correction_engine::guesser::guess(
+                                            &model,
+                                            &typed_n,
+                                            Lexicon::shared(),
+                                        );
+                                        // Within-guard = the ≤2-edit typo-fix
+                                        // population the store learns / the
+                                        // offline benchmark runs on; tagged so
+                                        // both populations are readable.
+                                        let len_diff = typed_n
+                                            .chars()
+                                            .count()
+                                            .abs_diff(target_n.chars().count());
+                                        let within_guard =
+                                            correction_engine::edit_distance(&typed_n, &target_n)
+                                                <= MAX_PATTERN_EDIT_DISTANCE
+                                                && len_diff <= MAX_PATTERN_LENGTH_DIFF;
+                                        guess_ledger.record(
+                                            &typed_n,
+                                            g.as_ref(),
+                                            &target_n,
+                                            within_guard,
+                                            now,
+                                        );
+                                        // debug!, not info!: prints raw typed +
+                                        // guess + target words (privacy).
+                                        tracing::debug!(
+                                            "GUESS_SCORED typed={:?} guess={:?} conf={:.2} target={:?} hit={} within_guard={}",
+                                            typed_n,
+                                            g.as_ref().map(|g| g.word.as_str()),
+                                            g.as_ref().map(|g| g.confidence).unwrap_or(0.0),
+                                            target_n,
+                                            g.as_ref().map(|g| g.word == target_n).unwrap_or(false),
+                                            within_guard,
+                                        );
+                                    }
+                                }
                                 // Same-day slip rate (Statistics): a motor typo
                                 // (not a semantic rewrite) is a slip, split
                                 // coordination vs precision. Derived from the
@@ -1338,6 +1408,98 @@ fn flush_word_patterns(
             tracing::warn!("word-pattern store flush save failed: {e}");
             false
         }
+    }
+}
+
+/// Flush the guesser accuracy scoreboard to its own file on the same time
+/// cadence as the other live stores. Observe-only measurement — no pruning (an
+/// accuracy row is history, not a decayed learner). Returns whether a write
+/// succeeded this call.
+fn flush_guess_ledger(
+    ledger: &mut GuessLedger,
+    path: Option<&Path>,
+    now: u64,
+    last_save_ms: &mut u64,
+) -> bool {
+    if !ledger.has_unsaved() {
+        return false;
+    }
+    if now.saturating_sub(*last_save_ms) < MOTOR_FLUSH_INTERVAL_MS {
+        return false;
+    }
+    let Some(path) = path else {
+        return false; // no HOME — in-memory only this session
+    };
+    match ledger.save_to(path) {
+        Ok(()) => {
+            *last_save_ms = now;
+            tracing::info!(
+                "GUESS_LEDGER_SAVED (flush) patterns={} tries={} hits={} path={:?}",
+                ledger.len(),
+                ledger.overall().tries,
+                ledger.overall().hits,
+                path
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!("guess-accuracy ledger flush save failed: {e}");
+            false
+        }
+    }
+}
+
+/// Observe-only accuracy readout (M3 Phase 1). Counts-only at `info!` (text-free
+/// — safe at the default level): overall and within-guard hit-rate plus the
+/// τ-sweep. The per-pattern `typed → guess` rows carry raw words, so they go at
+/// `debug!` only (privacy — mirrors the word-pattern dumps). No-op when empty.
+/// Emitted alongside the 60s funnel dump.
+fn dump_guess_accuracy(ledger: &GuessLedger) {
+    let o = ledger.overall();
+    if o.tries == 0 {
+        return;
+    }
+    let rate = |hits: u64, tries: u64| {
+        if tries == 0 {
+            0.0
+        } else {
+            100.0 * hits as f64 / tries as f64
+        }
+    };
+    let by_tau: Vec<String> = o
+        .by_tau
+        .iter()
+        .map(|b| {
+            format!(
+                "{:.1}:{:.0}%({}/{})",
+                b.tau,
+                rate(b.hits, b.fired),
+                b.hits,
+                b.fired
+            )
+        })
+        .collect();
+    tracing::info!(
+        "GUESS_ACCURACY_DUMP tries={} hits={} rate={:.0}% within_guard={{tries: {}, hits: {}, rate: {:.0}%}} by_tau=[{}]",
+        o.tries,
+        o.hits,
+        rate(o.hits, o.tries),
+        o.within_guard_tries,
+        o.within_guard_hits,
+        rate(o.within_guard_hits, o.within_guard_tries),
+        by_tau.join(" "),
+    );
+    // debug!, not info!: per-pattern rows print raw typed + guess words.
+    for (typed, acc) in ledger.rows() {
+        tracing::debug!(
+            "GUESS_ACCURACY_ROW typed={:?} tries={} hits={} last_guess={:?} last_conf={:.2} last_target={:?}",
+            typed,
+            acc.tries,
+            acc.hits,
+            acc.last_guess.as_deref(),
+            acc.last_confidence,
+            acc.last_target,
+        );
     }
 }
 
@@ -1959,6 +2121,32 @@ pub fn spawn<R: Runtime>(
             _ => WordPatternStore::new(),
         };
         let mut last_word_patterns_save_ms: u64 = 0;
+        // Guesser accuracy scoreboard (M3 Phase 1, observe-only) — measures how
+        // often the guesser's top guess matches the user's actual fix. Its own
+        // file beside the word-pattern store; load-fail keeps going in memory
+        // rather than clobbering a recoverable file. Never read back into
+        // correction — measurement only.
+        let guess_accuracy_path = guess_accuracy_path();
+        let mut guess_ledger = match guess_accuracy_path.as_deref() {
+            Some(path) if path.exists() => match GuessLedger::load_from(path) {
+                Ok(ledger) => {
+                    tracing::info!(
+                        "GUESS_LEDGER_LOADED patterns={} tries={} hits={} path={:?}",
+                        ledger.len(),
+                        ledger.overall().tries,
+                        ledger.overall().hits,
+                        path
+                    );
+                    ledger
+                }
+                Err(e) => {
+                    tracing::warn!("guess-accuracy ledger load failed ({e}); starting fresh");
+                    GuessLedger::new()
+                }
+            },
+            _ => GuessLedger::new(),
+        };
+        let mut last_guess_ledger_save_ms: u64 = 0;
         // M3 correction Step 1 — the manual correction allow-list + master
         // gate. The engine task is its sole writer; loaded once here, mutated
         // in-memory on EngineControl + Escape-undo, flushed atomically. A
@@ -2390,6 +2578,7 @@ pub fn spawn<R: Runtime>(
                                 &mut proposer,
                                 &mut motor_map,
                                 &mut word_patterns,
+                                &mut guess_ledger,
                                 &mut funnel,
                                 &mut tally,
                             );
@@ -2836,6 +3025,7 @@ pub fn spawn<R: Runtime>(
                                                     &mut proposer,
                                                     &mut motor_map,
                                                     &mut word_patterns,
+                                                    &mut guess_ledger,
                                                     &mut funnel,
                                                     &mut tally,
                                                 );
@@ -3148,6 +3338,7 @@ pub fn spawn<R: Runtime>(
                         &mut proposer,
                         &mut motor_map,
                         &mut word_patterns,
+                        &mut guess_ledger,
                         &mut funnel,
                         &mut tally,
                     );
@@ -3176,6 +3367,15 @@ pub fn spawn<R: Runtime>(
                         funnel.word_pattern_saves += 1;
                     }
 
+                    // Phase 1 guesser accuracy scoreboard: same cadence, its own
+                    // file. Observe-only — measurement, no injection.
+                    flush_guess_ledger(
+                        &mut guess_ledger,
+                        guess_accuracy_path.as_deref(),
+                        now_ms(),
+                        &mut last_guess_ledger_save_ms,
+                    );
+
                     // Progress Statistics: persist today's tally on the same
                     // cadence and roll it at the calendar-day boundary. Watchdog
                     // runs every 1s, so even an idle day rolls over promptly.
@@ -3194,6 +3394,8 @@ pub fn spawn<R: Runtime>(
                         funnel.dump();
                         // Read-only kill-switch observability (no injection).
                         dump_classifications(&word_patterns);
+                        // Observe-only guesser accuracy readout (no injection).
+                        dump_guess_accuracy(&guess_ledger);
                     }
 
                     // C5c motor stability: periodic read-model emit so a
@@ -3359,6 +3561,19 @@ pub fn spawn<R: Runtime>(
                     path
                 ),
                 Err(e) => tracing::warn!("word-pattern store shutdown save failed: {e}"),
+            }
+        }
+        // Guesser accuracy scoreboard (M3 Phase 1): same graceful-shutdown flush.
+        if let Some(path) = guess_accuracy_path.as_deref() {
+            match guess_ledger.save_to(path) {
+                Ok(()) => tracing::info!(
+                    "GUESS_LEDGER_SAVED (shutdown) patterns={} tries={} hits={} path={:?}",
+                    guess_ledger.len(),
+                    guess_ledger.overall().tries,
+                    guess_ledger.overall().hits,
+                    path
+                ),
+                Err(e) => tracing::warn!("guess-accuracy ledger shutdown save failed: {e}"),
             }
         }
         // Progress Statistics: flush today's tally too, so a clean quit commits

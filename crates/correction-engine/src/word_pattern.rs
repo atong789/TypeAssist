@@ -491,7 +491,12 @@ impl WordPatternStore {
 
 /// Lowercase + keep only observable characters (printable ASCII). Matches the
 /// motor map's normalization so `Teh→The` and `teh→the` fold into one pattern.
-fn normalize_word(s: &str) -> String {
+///
+/// `pub` so the observe-only guesser scoreboard ([`crate::guess_ledger`]) keys
+/// its per-pattern accuracy by the *same* normalized form this store uses —
+/// otherwise `Teh` and `teh` would split into two scoreboard rows but one
+/// pattern row. Read-only helper; does not touch store state or semantics.
+pub fn normalize_word(s: &str) -> String {
     s.chars()
         .filter_map(|c| {
             let c = c.to_ascii_lowercase();
@@ -500,8 +505,11 @@ fn normalize_word(s: &str) -> String {
         .collect()
 }
 
-/// Levenshtein distance (unit costs) between two normalized words.
-fn edit_distance(a: &str, b: &str) -> usize {
+/// Levenshtein distance (unit costs) between two normalized words. `pub` so the
+/// observe-only guesser scoreboard ([`crate::guess_ledger`]) can tag whether a
+/// scored `typed → target` pair falls within the typo-fix guard, using the same
+/// metric this store's capture guard uses.
+pub fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let n = a.len();

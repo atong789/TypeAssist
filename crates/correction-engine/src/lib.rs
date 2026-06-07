@@ -17,6 +17,8 @@ use volatility_map::VolatilityMap;
 pub mod anchor;
 pub mod candidates;
 pub mod decision;
+pub mod guess_ledger;
+pub mod guesser;
 pub mod keyboard;
 pub mod kill_switch;
 pub mod lexicon;
@@ -32,11 +34,16 @@ pub mod slip_class;
 pub mod tokenizer;
 pub mod word_pattern;
 pub use anchor::{AnchorState, AnchorTracker, AnchorsSnapshot, SpanAnchor, VoidReason};
-pub use candidates::{ranked_known_candidates, KnownCandidate, CANDIDATES_VERSION};
+pub use candidates::{edit1, ranked_known_candidates, KnownCandidate, CANDIDATES_VERSION};
 pub use decision::{
     decide, mode_min_confidence, DecisionOutcome, LeaveAloneReason, ACTIVE_TIER, DECISION_VERSION,
     SEPARATION_MARGIN,
 };
+pub use guess_ledger::{
+    GuessLedger, OverallTally, PatternAccuracy, TauBucket, GUESS_LEDGER_VERSION,
+    GUESS_PERSIST_EVERY,
+};
+pub use guesser::{build_model, guess, ErrorModel, Guess, TAU_BUCKETS};
 pub use kill_switch::{
     classify, classify_pattern, PatternFacts, PatternReadiness, SilentReason, Tier2Reason,
     COMMON_TARGET_MIN_FREQUENCY, KILL_SWITCH_VERSION, STALE_AFTER_MS,
@@ -73,9 +80,9 @@ pub use score::{
 pub use slip_class::{classify_slip, transposition_keys, SlipClass, SLIP_CLASS_VERSION};
 pub use tokenizer::{Token, TokenKind, Tokenizer, TOKENIZER_VERSION};
 pub use word_pattern::{
-    PatternObserveReport, PatternSnapshot, PatternStat, WordPatternStore, MAX_PATTERN_EDIT_DISTANCE,
-    MAX_PATTERN_LENGTH_DIFF, PATTERN_PERSIST_EVERY, TIER1_MIN_OBSERVATIONS, UNDO_BRAKE_STRIKES,
-    WORD_PATTERN_VERSION,
+    edit_distance, normalize_word, PatternObserveReport, PatternSnapshot, PatternStat,
+    WordPatternStore, MAX_PATTERN_EDIT_DISTANCE, MAX_PATTERN_LENGTH_DIFF, PATTERN_PERSIST_EVERY,
+    TIER1_MIN_OBSERVATIONS, UNDO_BRAKE_STRIKES, WORD_PATTERN_VERSION,
 };
 
 /// **Engine MODE.** Names how aggressive the user wants the engine to be.
