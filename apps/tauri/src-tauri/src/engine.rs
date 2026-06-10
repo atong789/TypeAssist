@@ -38,12 +38,12 @@ use std::path::{Path, PathBuf};
 use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
 use correction_engine::{
     classify_slip, decide, has_motor_evidence, measure_token_motor, normalize_word,
-    ranked_known_candidates, score_candidates, should_log, AnchorTracker, Confidence,
-    ConfidenceTier, DecisionLedger, DecisionOutcome, GuessLedger, Lexicon, LexiconProposer,
-    MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver, PatternReadiness,
-    ScoredCandidate, SlipClass, StabilityReport, Token, TokenKind, Tokenizer, WordPatternStore,
-    ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION, MAX_PATTERN_EDIT_DISTANCE,
-    MAX_PATTERN_LENGTH_DIFF, SCORE_VERSION,
+    ranked_known_candidates, score_candidates, should_log, target_is_recordable, AnchorTracker,
+    Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome, GuessLedger,
+    Lexicon, LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver,
+    PatternReadiness, ScoredCandidate, SlipClass, StabilityReport, Token, TokenKind, Tokenizer,
+    WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
+    MAX_PATTERN_EDIT_DISTANCE, MAX_PATTERN_LENGTH_DIFF, SCORE_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime};
@@ -664,6 +664,22 @@ fn allow_list_path() -> Option<PathBuf> {
 /// modest during continuous typing. See [`flush_motor_map`].
 const MOTOR_FLUSH_INTERVAL_MS: u64 = 2_000;
 
+/// Idle gap after which the watchdog drops the live line buffer (+ caret +
+/// anchors) and starts the next keystroke on a clean line.
+///
+/// The line buffer is a dead-reckoned mirror of the focused field, updated
+/// only from keystrokes. An unobserved caret/content change — a mouse-click
+/// reposition, Up/Down in a multi-line field, an app/field switch — can
+/// desync it and leave a stale tail to the RIGHT of the caret, which turns
+/// every later keystroke into a mid-line replay (the source of the
+/// "edndd"-tail artifact cascade). We can't read the field to resync, but a
+/// real pause is a safe moment to discard the stale buffer. Set well above
+/// the resolver's Kept/Abandoned idle thresholds so pending verdicts resolve
+/// first; the buffer is transient, so nothing persisted is lost (Principle
+/// #8). This is the conservative half of the desync fix — the durable
+/// focus-change/echo-robustness signals are the tracked Fix-B follow-up.
+const LINE_IDLE_RESET_MS: u64 = 30_000;
+
 /// Watchdog ticks between periodic `EVT_MOTOR_STABILITY` emits. The report
 /// changes slowly, so 30 s keeps a passive consumer (debug panel) current
 /// without spam; Practice pulls fresh on demand via the control command.
@@ -1215,6 +1231,17 @@ fn tick_resolver<R: Runtime>(
                         // skipped so the rewrite-filter drop is auditable.
                         match corrected.as_deref() {
                             Some(c) => {
+                                // Guard 1 (soft): only record a pair whose
+                                // intended `target` is a real word — is_known
+                                // (bundled dict OR the user's learned set) OR
+                                // letter-trigram plausible. Rejects the
+                                // "edndd"-tail re-tokenization artifacts (each
+                                // carries a dictionary-absent trigram) without
+                                // blocking genuine vocabulary. Gates BOTH the
+                                // scoreboard and the word-pattern store below so
+                                // the two populations stay consistent.
+                                let target_recordable =
+                                    target_is_recordable(&normalize_word(c), Lexicon::shared());
                                 // --- Guesser accuracy scoreboard (M3 Phase 1,
                                 // observe-only) — PREDICT, then learn. Ask the
                                 // guesser for its top guess of `typed` using the
@@ -1228,7 +1255,18 @@ fn tick_resolver<R: Runtime>(
                                 {
                                     let typed_n = normalize_word(&rec.original_text);
                                     let target_n = normalize_word(c);
-                                    if !typed_n.is_empty() && !target_n.is_empty() {
+                                    // Skip no-ops (typed == target after
+                                    // normalization) so a pair that isn't a real
+                                    // slip never enters the scoreboard — the same
+                                    // guard the word-pattern store applies, so the
+                                    // two stay consistent. (A no-op forces the
+                                    // guesser to pick a *different* word, which it
+                                    // then "misses", dragging the hit-rate down.)
+                                    if !typed_n.is_empty()
+                                        && !target_n.is_empty()
+                                        && typed_n != target_n
+                                        && target_recordable
+                                    {
                                         let snaps = word_patterns.snapshots();
                                         let model = correction_engine::guesser::build_model(
                                             snaps.iter().map(|s| {
@@ -1283,9 +1321,10 @@ fn tick_resolver<R: Runtime>(
                                 if let Some(class) = classify_slip(&rec.original_text, c) {
                                     tally.add_slip(class);
                                 }
-                                if word_patterns
-                                    .observe_correction(outcome, &rec.original_text, c, now)
-                                    .recorded
+                                if target_recordable
+                                    && word_patterns
+                                        .observe_correction(outcome, &rec.original_text, c, now)
+                                        .recorded
                                 {
                                     funnel.word_patterns_observed += 1;
                                     // Read-only (kill-switch OFF): log what this
@@ -2279,6 +2318,9 @@ pub fn spawn<R: Runtime>(
         let mut last_heartbeat_at: Option<Instant> = None;
         let mut current_capture_health: CaptureHealth = CaptureHealth::Unknown;
         let mut respawn_attempts: Vec<Instant> = Vec::new();
+        // Last time a keystroke (Key/Backspace) arrived — drives the idle
+        // line-buffer reset (desync recovery). See [`LINE_IDLE_RESET_MS`].
+        let mut last_text_input_at: Instant = Instant::now();
 
         // **Capture-health watchdog** — ticks every 1s, reads
         // `last_heartbeat_at` to derive freshness, and drives
@@ -2390,6 +2432,10 @@ pub fn spawn<R: Runtime>(
                         InputEvent::Key { .. } | InputEvent::Backspace { .. }
                     ) {
                         funnel.keystrokes_received += 1;
+                        // Mark activity for the idle line-buffer reset: any
+                        // keystroke means the user is present, so the buffer
+                        // is not stale yet.
+                        last_text_input_at = Instant::now();
                     }
 
                     if input_paused
@@ -3342,6 +3388,37 @@ pub fn spawn<R: Runtime>(
                         &mut funnel,
                         &mut tally,
                     );
+
+                    // Idle line-buffer reset (desync recovery). tick_resolver
+                    // above already fired any due Kept/Abandoned verdicts on
+                    // this line, so clearing now drops only a stale, fully-
+                    // resolved buffer. The next keystroke starts a clean line —
+                    // breaking any desync that left a residual tail to the
+                    // right of the caret (the "edndd" cascade). Mirrors the
+                    // newline reset; the buffer is transient (Principle #7).
+                    if !line_buf.is_empty()
+                        && Instant::now()
+                            .duration_since(last_text_input_at)
+                            .as_millis() as u64
+                            >= LINE_IDLE_RESET_MS
+                    {
+                        tracing::info!(
+                            "IDLE-LINE-RESET cleared {} chars after >= {}ms idle",
+                            line_buf.len(),
+                            LINE_IDLE_RESET_MS
+                        );
+                        tokenizer.reset_line();
+                        line_buf.clear();
+                        line_dwells.clear();
+                        caret = 0;
+                        anchors.clear();
+                        let _ = app_handle.emit(EVT_LINE_RESET, ());
+                        let snap = anchors.snapshot();
+                        let _ = app_handle.emit(
+                            EVT_ANCHOR_SNAPSHOT,
+                            anchor_emit_payload(&snap, &line_buf),
+                        );
+                    }
 
                     // Component 5c: maintain the live motor-map file on a
                     // time cadence (not only every 100 obs / on shutdown,

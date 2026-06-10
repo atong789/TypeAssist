@@ -32,6 +32,7 @@ pub mod resolver;
 pub mod score;
 pub mod slip_class;
 pub mod tokenizer;
+pub mod trigram;
 pub mod word_pattern;
 pub use anchor::{AnchorState, AnchorTracker, AnchorsSnapshot, SpanAnchor, VoidReason};
 pub use candidates::{edit1, ranked_known_candidates, KnownCandidate, CANDIDATES_VERSION};
@@ -79,6 +80,7 @@ pub use score::{
 };
 pub use slip_class::{classify_slip, transposition_keys, SlipClass, SLIP_CLASS_VERSION};
 pub use tokenizer::{Token, TokenKind, Tokenizer, TOKENIZER_VERSION};
+pub use trigram::{target_is_recordable, TrigramModel};
 pub use word_pattern::{
     edit_distance, normalize_word, PatternObserveReport, PatternSnapshot, PatternStat,
     WordPatternStore, MAX_PATTERN_EDIT_DISTANCE, MAX_PATTERN_LENGTH_DIFF, PATTERN_PERSIST_EVERY,
