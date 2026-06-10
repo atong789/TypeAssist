@@ -111,7 +111,7 @@ pub const MAX_PATTERN_LENGTH_DIFF: usize = 1;
 const PRUNE_EPSILON: f32 = 1.0e-4;
 
 /// What a single [`WordPatternStore::observe_correction`] recorded, so the
-/// host can log it and (later) reconcile a capture counter (Principle #8). A
+/// host can log it and (later) reconcile a capture counter (Principle #7). A
 /// skipped correction (rewrite / no-op / empty) returns `recorded: false`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PatternObserveReport {

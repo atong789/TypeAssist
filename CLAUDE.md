@@ -2,7 +2,7 @@
 
 Native macOS app that helps users with motor difficulty type more accurately by learning each user's personal motor patterns and correcting typos via a spatial volatility map (not a generic dictionary).
 
-## Nothing leaves the device (Principle #9 — non-negotiable)
+## Nothing leaves the device (Principle #8 — non-negotiable)
 
 All user data — keystrokes, motor map, snapshots, slip patterns, fatigue signals, mode preferences — stays on the user's local machine. No cloud sync, no analytics, no telemetry, no crash reports, no shared learning across users. **The application has no network calls related to user data, ever.** This is structural, not optional: do not add an HTTP client, analytics, or remote logging.
 
@@ -10,7 +10,7 @@ All user data — keystrokes, motor map, snapshots, slip patterns, fatigue signa
 
 **Ephemeral contextual checks are not data collection.** The precise rule is: *nothing leaves the device, and no user activity is stored or logged.* Reading a transient piece of context that exists **only in memory, for a single decision, and is never persisted** is acceptable — it is not collection. The motivating case (M3): reading the **currently focused app's bundle ID** to pick that app's correction mode (Mail → Eager, Notes → Cautious, …). The bundle ID is used for one decision and discarded — never written to disk, never logged, never associated with keystrokes or content. The line is **persistence/logging**, not *observation*: an in-memory read for an immediate choice is fine; recording *which app you were in* (a timeline of your activity) is the surveillance this principle forbids.
 
-## Capture integrity is observable, not assumed (Principle #8 — non-negotiable)
+## Capture integrity is observable, not assumed (Principle #7 — non-negotiable)
 
 Every stage of the pipeline (**L1 ingest → engine accept → sealing → 5a verdict → 5c observe → persistence**) exposes a cumulative counter reconciled against the previous stage, so the conversion ratio between adjacent stages is auditable in real time. **Silent drops are unacceptable.** For a recovery-tracking app, a stroke survivor whose week of typing produces 1% of the expected data hasn't been *underserved* — the product has **lied to them about their recovery**. That is the worst failure mode the system has, worse than a wrong correction. This is foundational, not a feature.
 
@@ -20,14 +20,14 @@ Concretely: the engine maintains a `Funnel` (`apps/tauri/src-tauri/src/engine.rs
 
 ## Every meaningful state is preserved (Principle #6 — non-negotiable)
 
-A recovery record is only as trustworthy as the history it keeps. **Losing a day's state is the same failure class as a silent capture drop** (Principle #8) — the product would be unable to honestly show the user where their hands were. So every meaningful moment is checkpointed by design, not by luck:
+A recovery record is only as trustworthy as the history it keeps. **Losing a day's state is the same failure class as a silent capture drop** (Principle #7) — the product would be unable to honestly show the user where their hands were. So every meaningful moment is checkpointed by design, not by luck:
 
 - The engine writes a dated snapshot to `~/.typeassist/snapshots/YYYY-MM-DD.json` **once per day, on the first event of a new calendar day**, and **on engine startup before any writes to the live motor map**.
 - **Snapshots are never overwritten or deleted by the engine — they accumulate.** A dated filename plus a write-only-if-absent guard make each day's first-captured state permanent; the live `~/.typeassist/motor_map.json` always holds the latest.
 - This **replaces the previous weekly cadence**, which had already lost a day (no `2026-05-31` snapshot was ever written) — exactly the design flaw this fixes. Never work around a lost state; fix the cadence so it can't be lost.
 - The accumulated snapshots are the durable history the Progress view and the (future) therapist export read back; the Practice trend reads them at daily granularity. Implemented in `engine.rs` (the startup snapshot beside the motor-map load; the watchdog writes the new day's file when the calendar date rolls over).
 
-## TypeAssist grows with you, not over you (Principle #10 — non-negotiable)
+## TypeAssist grows with you, not over you (Principle #9 — non-negotiable)
 
 Unlike system autocorrect or generic typing assistants, TypeAssist does **not** arrive pre-trained. It learns the specific patterns of the specific person using it. Early on, it observes more than it acts. Over time, as it builds confidence about your slips and your recovery, it begins to help. The trade-off is honest: **less help on day one, more correct help on day ninety.** The user is not a passive subject of the algorithm — they are a participant in their own recovery.
 
@@ -56,15 +56,21 @@ Persistence: `crates/storage/` (SQLite via sqlx).
 - **L1 ↔ L2**: line-delimited JSON over stdio. Wire types in `crates/behavioural-model/src/events.rs`. Schema doc: `docs/contracts/input-events.md`.
 - **L2 → L3 → L4**: serde structs in `crates/volatility-map/src/schema.rs`. Versioned. JSON Schema is emitted to `crates/volatility-map/schema/volatility-map.v1.json` by `just schema`.
 
-## Product principles (tiebreakers when in doubt)
+## Principles (canonical, gap-free 1–9 — the single source of truth)
+
+This is the **one** numbered list; cite these numbers everywhere (code comments, docs, reviews). **1–5** are product tiebreakers (when in doubt, these decide); **6–9** are non-negotiables, each with its own detailed section *above* — the line here is the summary, the section is the contract. There is no Principle #7-gap and no separate principles doc: `docs/architecture.md` points here.
 
 1. **Dignity over diagnosis** — never describe the user by their condition.
 2. **Capability not compensation** — "TypeAssist learned a pattern", not "TypeAssist fixed your mistake".
 3. **The good day and the bad day both belong** — the app adapts, the user doesn't.
 4. **Quiet by default** — no notifications, no streaks, no guilt mechanics.
 5. **No sliders, anywhere.** Discrete card selectors only. Mouse path forgiving, keyboard path one-handed-friendly.
+6. **Every meaningful state is preserved** *(non-negotiable)* — dated snapshots accumulate and are never overwritten; losing a day's state is the same failure class as a silent capture drop. *(See "Every meaningful state is preserved" above.)*
+7. **Capture integrity is observable, not assumed** *(non-negotiable)* — every pipeline stage exposes a counter reconciled against the previous; silent drops are unacceptable. *(See "Capture integrity is observable, not assumed" above.)*
+8. **Nothing leaves the device** *(non-negotiable)* — all user data stays on the local machine; an absolute, structural bar — no network I/O for user data, ever. *(See "Nothing leaves the device" above.)*
+9. **TypeAssist grows with you, not over you** *(non-negotiable)* — not pre-trained; it learns the specific user; the kill-switch is per-user; it must never feel like a "worse autocorrect". *(See "TypeAssist grows with you, not over you" above.)*
 
-These override implementation convenience. If a feature seems to want a slider, find another shape.
+1–5 override implementation convenience — if a feature seems to want a slider, find another shape. 6–9 are not subject to tradeoff at all.
 
 ## Recovery physiology
 
@@ -90,7 +96,7 @@ TypeAssist's users have motor difficulties (stroke survivors, arthritis). Large,
 - **Fit the launch window — nothing important below the fold.** Every screen must lay out so all of its read-only content sits within the launch window without scrolling. Read-only content is *not* keyboard-reachable, so anything below the fold can only be reached with a mouse — which a keyboard-first app must not require. Pair a tight, compact layout with a Tauri default + `minHeight` that holds the densest screen, and cap any expandable list to what fits — or let it scroll *within* a fixed-size region (as the menu-bar Progress panel's Impact ledger does). Window dimensions live in `apps/tauri/src-tauri/tauri.conf.json`.
 - **WCAG AA contrast.** Body and secondary ("quiet") text must clear **4.5:1** against the background in *both* light and dark mode (3:1 for large text and non-text UI). Use the `--text-secondary` token, not translucent gray — gray mixed with `transparent` fails contrast unpredictably over varied backgrounds.
 - **Semantic elements.** Use real `<button>`/`<a>` with appropriate ARIA (e.g. `aria-current="page"` on the active nav item), never click-handler `<div>`s, so screen readers announce roles correctly.
-- **No sliders, anywhere.** Discrete card selectors only (see Product principles). Enforced by CSS in `apps/tauri/src/app.css`.
+- **No sliders, anywhere.** Discrete card selectors only (Principle #5). Enforced by CSS in `apps/tauri/src/app.css`.
 
 Shared accessible tokens live in `apps/tauri/src/app.css` (`--text-secondary`, `--hairline`, `--focus-ring`) plus a global `:focus` ring. Reuse them on every new screen so these rules hold automatically.
 
@@ -102,7 +108,7 @@ TypeAssist surfaces insight across three surfaces — **Today**, **Progress**, *
 - **Ambient** — normal all-day typing everywhere on the Mac, captured passively. The core product.
 - **Deliberate practice** — opt-in structured sessions (Practice mode, Warm-up).
 
-**Content-blind, always.** The app never sees *what* was typed — only motor/timing shape (key, dwell, drift, episode rhythm). Insight speaks to **episode shape and patterns, never content**. Never **store or log** which app was focused — a timeline of app usage is surveillance and is forbidden in insight/history. (This is distinct from the ephemeral focused-app read M3 uses to choose a correction mode — see Principle #9: an in-memory read for a single decision that is never persisted is allowed; *recording* a usage timeline is not.)
+**Content-blind, always.** The app never sees *what* was typed — only motor/timing shape (key, dwell, drift, episode rhythm). Insight speaks to **episode shape and patterns, never content**. Never **store or log** which app was focused — a timeline of app usage is surveillance and is forbidden in insight/history. (This is distinct from the ephemeral focused-app read M3 uses to choose a correction mode — see Principle #8: an in-memory read for a single decision that is never persisted is allowed; *recording* a usage timeline is not.)
 
 ### Today — the daily mirror (observational, read-only)
 
@@ -219,7 +225,7 @@ The first feature that **modifies live typing**. Built conservatively: the defau
 - **Echo-skip is load-bearing.** The L1 tap re-captures our own injected keystrokes (`.cgSessionEventTap` sees posted events). An `eventSourceUserData` tag did **not** survive the post→tap round-trip in practice, so echo is dropped **engine-side by exact count** (`pending_echo` = `delete_count` + replacement chars) — skipped before the funnel, the pipeline, and the undo check. Never re-introduce learning/correcting from injected events. *(Follow-up: the count-based skip can drift if echo events are dropped/merged — add a robustness check.)*
 - **One-key undo + teach-stop:** within `UNDO_WINDOW_MS` after a fix, a **bare Escape** reverts it (reverse injection) **and removes the pattern from the allow-list** (won't recur until re-enabled). Any other key is an implicit accept (disarm). Escape reaches the engine because the L1 tap special-cases **keycode 53 → U+001B** (its unicode string is otherwise empty). Escape is observed, not suppressed (it still reaches the app).
 - **Surfaces:** menu-bar **"Enable corrections"** check (instant global off) + **Corrections…** panel (`AllowlistPanel.svelte`, discrete on/off toggles over learned patterns, no sliders) + a universal **cue** HUD (`Cue.svelte`, shown by Rust without focus; not anchored to the word, since per-word geometry is native-Cocoa-only). The Progress→Impact tab stays read-only.
-- **Observability (Principle #8):** every fix/undo logs `CORRECTION_APPLIED` / `CORRECTION_UNDONE` and increments the funnel's `c_corrections {applied, undone}`.
+- **Observability (Principle #7):** every fix/undo logs `CORRECTION_APPLIED` / `CORRECTION_UNDONE` and increments the funnel's `c_corrections {applied, undone}`.
 - **macOS autocorrect coexistence (open):** the OS corrects common dictionary typos (e.g. `teh→the`) on the same stream — indistinguishable to the user from ours and it races our seal. For now, observe/report (deferring-to-autocorrect is a later step). Our gate stops *our* corrections instantly; only the OS lingers.
 
 ## Ghost-key signals (L2)

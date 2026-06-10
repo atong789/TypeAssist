@@ -6,7 +6,7 @@
 //! a known word typed cleanly is exactly the `Kept` signal we want. Routing
 //! the motor map through the decision ledger starved it — a fluent typist
 //! produced almost no observations (the "sealed → verdict" cliff the capture
-//! funnel exposed; CLAUDE.md Principle #8).
+//! funnel exposed; CLAUDE.md Principle #7).
 //!
 //! So the motor map gets its own **lean** ledger: one record per sealed,
 //! motor-evidenced Word/Acronym (known *and* unknown), carrying only what the

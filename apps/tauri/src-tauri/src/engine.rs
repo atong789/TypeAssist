@@ -174,7 +174,7 @@ pub const EVT_CAPTURE_HEALTH: &str = "engine://capture-health";
 pub const EVT_CORRECTION_STATE: &str = "corrections://state";
 /// **M3 correction Step 1.** A live correction was just injected — fired once
 /// per applied fix so the HUD cue can show `typed → target` briefly. Payload is
-/// [`CorrectionAppliedEvent`]. (Principle #8: every correction is observable.)
+/// [`CorrectionAppliedEvent`]. (Principle #7: every correction is observable.)
 pub const EVT_CORRECTION_APPLIED: &str = "corrections://applied";
 
 /// Engine-derived view of the sidecar's capture state. Transitions
@@ -501,7 +501,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// **Capture-integrity funnel** (CLAUDE.md Principle #8 — capture integrity
+/// **Capture-integrity funnel** (CLAUDE.md Principle #7 — capture integrity
 /// is observable, not assumed). Cumulative per-session counters at each
 /// pipeline boundary so the conversion ratio between adjacent stages is
 /// auditable: `received → accepted → sealed → verdict → observe → save`.
@@ -520,7 +520,7 @@ struct Funnel {
     /// Admitted to the C5c **motor ledger** — every fresh, motor-evidenced
     /// sealed word (known included). The stage between sealing and the
     /// motor verdict; the gate is just motor evidence (no lexicon Known-skip),
-    /// so `admitted ≈ sealed` minus paste / zero-dwell. (Principle #8: the
+    /// so `admitted ≈ sealed` minus paste / zero-dwell. (Principle #7: the
     /// new boundary is observable.)
     records_admitted: u64,
     /// 5a verdicts emitted (from the MOTOR ledger), by outcome (revisable: a
@@ -538,13 +538,13 @@ struct Funnel {
     /// 5d word-pattern store: of the `CorrectedToOther` verdicts the store
     /// sees, how many were recorded as a `typed→target` pattern vs skipped
     /// (semantic rewrite / no-op / no recoverable post-edit text). The two
-    /// reconcile against `v_corr_oth` (Principle #8: this stage drops data —
+    /// reconcile against `v_corr_oth` (Principle #7: this stage drops data —
     /// the rewrite filter — so the drop is counted, not silent).
     word_patterns_observed: u64,
     word_pattern_skipped: u64,
     /// Successful `word_patterns.json` flushes.
     word_pattern_saves: u64,
-    /// M3 correction Step 1 (Principle #8: a live correction is an action on
+    /// M3 correction Step 1 (Principle #7: a live correction is an action on
     /// the user's text — it must never be silent). `applied` counts injections
     /// fired from the manual allow-list; `undone` counts Escape teach-stops
     /// that reverted one. A healthy run reconciles `undone ≤ applied`.
@@ -593,7 +593,7 @@ impl Funnel {
     }
 
     /// Zero every counter and restamp the run start — closes a measurement
-    /// run and opens a fresh one (Principle #8: counters reconciled **per
+    /// run and opens a fresh one (Principle #7: counters reconciled **per
     /// run**, never conflated across runs). Logs a `FUNNEL_RESET` marker so
     /// run boundaries are visible when reconstructing from the log. Called
     /// by the explicit dump chord (after the dump) and the reset chord.
@@ -1141,7 +1141,7 @@ struct MotorKeystrokeEvent {
 ///     motor-evidenced word (known included), candidate-agnostic. Each
 ///     `Kept` / `CorrectedToOther` is folded into `motor_map` (the funnel's
 ///     verdict + observation counters live here, since this is the capture
-///     pipeline Principle #8 reconciles). A `MotorRecord` never carries a
+///     pipeline Principle #7 reconciles). A `MotorRecord` never carries a
 ///     candidate, so every correction reads as a `CorrectedToOther` slip.
 ///
 /// Each uses its own resolver instance (independent stability caches). Both
@@ -1193,7 +1193,7 @@ fn tick_resolver<R: Runtime>(
     for (record_id, outcome) in mchanges {
         tracing::info!("RESOLVE_OUTCOME rid={} -> {:?}", record_id, outcome);
         if motor_ledger.resolve_outcome(record_id, outcome) {
-            // Funnel (Principle #8): a verdict was assigned in the capture
+            // Funnel (Principle #7): a verdict was assigned in the capture
             // pipeline. Counts transitions, so revisions can tally > once.
             // Same-day stats (Statistics tab): a resolved word is one typed
             // word. Both Kept (clean) and CorrectedToOther (slipped) count
@@ -1727,7 +1727,7 @@ fn emit_sealed_token<R: Runtime>(
             return;
         };
 
-        // Funnel (Principle #8): a fresh Word/Acronym seal. Counted here —
+        // Funnel (Principle #7): a fresh Word/Acronym seal. Counted here —
         // the single fresh-seal chokepoint — so replays don't inflate it.
         funnel.tokens_sealed += 1;
 
@@ -2250,7 +2250,7 @@ pub fn spawn<R: Runtime>(
         // periodic flush (see `flush_motor_map`); 0 means "never this
         // session" so the first dirty watchdog tick flushes promptly.
         let mut last_motor_save_ms: u64 = 0;
-        // Capture-integrity funnel (Principle #8). Per-session boundary
+        // Capture-integrity funnel (Principle #7). Per-session boundary
         // counters; dumped on the Cmd+Shift+F chord and every 60s.
         let mut funnel = Funnel::new(now_ms());
         // M3 correction Step 1: the last fix, retained so a single Escape
@@ -2684,7 +2684,7 @@ pub fn spawn<R: Runtime>(
                                 Some(c) if is_non_text_key(c)
                             );
 
-                            // Diagnostic chords (Principle #8) — consumed here,
+                            // Diagnostic chords (Principle #7) — consumed here,
                             // never reach the tokenizer / line buffer:
                             //   Cmd+Shift+F → dump the funnel, then auto-reset
                             //                 (closes this run, opens a fresh one).
@@ -3463,7 +3463,7 @@ pub fn spawn<R: Runtime>(
                         &mut last_progress_save_ms,
                     );
 
-                    // Capture-integrity funnel (Principle #8): auto-dump
+                    // Capture-integrity funnel (Principle #7): auto-dump
                     // every 60s (watchdog ticks every 1s) so the funnel is
                     // reconstructable from logs after the fact, in addition
                     // to the on-demand Cmd+Shift+F chord.

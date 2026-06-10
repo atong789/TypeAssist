@@ -116,7 +116,7 @@ pub const MAX_SLIP_EDIT_DISTANCE: usize = 2;
 pub const MAX_SLIP_LENGTH_DIFF: usize = 1;
 
 /// What a single [`MotorMap::observe_outcome`] recorded, so the host can
-/// reconcile the capture funnel (CLAUDE.md Principle #8 — capture integrity
+/// reconcile the capture funnel (CLAUDE.md Principle #7 — capture integrity
 /// is observable). Char-level: one `Kept` word of N chars reports
 /// `correct = N`; a `CorrectedToOther` reports matched chars as `correct`
 /// and substitutions as `slips`.
@@ -309,7 +309,7 @@ impl MotorMap {
     ///
     /// Returns an [`ObserveReport`] of how many char-level observations were
     /// recorded (`correct` = matched/kept chars, `slips` = substitutions) so
-    /// the host can reconcile the capture funnel (Principle #8). A skipped or
+    /// the host can reconcile the capture funnel (Principle #7). A skipped or
     /// no-op outcome returns [`ObserveReport::default`] (zeros).
     pub fn observe_outcome(
         &mut self,

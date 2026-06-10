@@ -1,6 +1,6 @@
 # Funnel calibration passages (M2.5)
 
-Canonical fixed passages for the **capture-integrity calibration run** (Principle #8 — the
+Canonical fixed passages for the **capture-integrity calibration run** (Principle #7 — the
 funnel must show healthy adjacent-stage ratios before any M4 / kill-switch work). Unlike the
 earlier Gate 1A/1B runs — which were **free composition**, so they could never be re-typed
 identically — these are versioned, fixed texts so every future run is reproducible against the

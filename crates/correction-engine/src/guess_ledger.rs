@@ -27,7 +27,7 @@
 //! (`~/.typeassist/guess_accuracy.json`), path supplied by the host so L4 stays
 //! portable. Same atomic-write + persist-counter cadence as the word-pattern
 //! store. Keys are raw normalized words, on-device only — consistent with
-//! `word_patterns.json` (Principle #9: nothing leaves the device).
+//! `word_patterns.json` (Principle #8: nothing leaves the device).
 
 use std::collections::HashMap;
 use std::fs;
