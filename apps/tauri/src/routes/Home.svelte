@@ -4,7 +4,7 @@
      app states (Day one / Building back / Fluent), driven by the `appState`
      store. Copy is verbatim from the locked front-end design. -->
 <script lang="ts">
-  import { userName, appState, APP_STATES, type AppState } from "../lib/previewSettings";
+  import { userName, appState, type AppState } from "../lib/previewSettings";
 
   // Time-of-day greeting (the design shows "Good afternoon, …").
   const hour = new Date().getHours();
@@ -36,20 +36,6 @@
   };
   $: copy = COPY[$appState];
 </script>
-
-<!-- TEMPORARY dev-only preview switcher: flip the app state by hand to review
-     each. Remove once automatic detection from engine data is wired. -->
-<div class="preview" role="group" aria-label="Preview app state (developer)">
-  <span class="preview-label">Preview</span>
-  {#each APP_STATES as s}
-    <button
-      class="preview-btn"
-      class:on={$appState === s.value}
-      aria-pressed={$appState === s.value}
-      on:click={() => appState.set(s.value)}>{s.label}</button
-    >
-  {/each}
-</div>
 
 <section class="home">
   <h1 class="greeting">{greeting}</h1>
@@ -159,46 +145,5 @@
     border-radius: 50%;
     background: #28c840;
     flex-shrink: 0;
-  }
-
-  /* ---- temporary preview switcher (dev only) ---- */
-  .preview {
-    display: flex;
-    align-items: center;
-    gap: 0.3rem;
-    margin: 0 0 1.5rem;
-    padding: 0.3rem 0.4rem;
-    border: 1px dashed var(--hairline);
-    border-radius: 9px;
-    width: fit-content;
-  }
-  .preview-label {
-    font-size: 0.72rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-secondary);
-    padding: 0 0.4rem;
-  }
-  .preview-btn {
-    font: inherit;
-    font-size: 0.8rem;
-    padding: 0.3rem 0.6rem;
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--text-secondary);
-    cursor: pointer;
-  }
-  .preview-btn:hover {
-    background: color-mix(in srgb, canvastext 6%, canvas);
-  }
-  .preview-btn.on {
-    background: color-mix(in srgb, var(--focus-ring) 16%, canvas);
-    color: canvastext;
-    font-weight: 600;
-  }
-  .preview-btn:focus {
-    outline: 3px solid var(--focus-ring);
-    outline-offset: 2px;
   }
 </style>

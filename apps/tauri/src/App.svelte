@@ -3,6 +3,8 @@
   import { listen } from "@tauri-apps/api/event";
   import DebugPanel from "./routes/DebugPanel.svelte";
   import Home from "./routes/Home.svelte";
+  import Today from "./routes/Today.svelte";
+  import PreviewSwitcher from "./lib/PreviewSwitcher.svelte";
 
   // Builder's debug view — hidden behind Cmd+Shift+D. Not a user feature.
   let debugOpen = false;
@@ -76,6 +78,17 @@
     }
     event.preventDefault();
     tabEls[next]?.focus();
+  }
+
+  // A screen asked to switch to another tab (e.g. Today's "…in Progress" link →
+  // Progress, a real tab now). Sets the route and lands focus on the
+  // destination tab, the same as picking it in the sidebar.
+  function handleNavigate(event: CustomEvent<string>) {
+    const target = event.detail as Route;
+    if (tabs.some((t) => t.route === target) || target in utilityTitles) {
+      route = target;
+      focusSelectedTab();
+    }
   }
 
   // Blur whatever the webview currently has focused (→ document.body). Used on
@@ -201,7 +214,7 @@
 <svelte:window on:keydown={onWindowKeydown} />
 
 <main bind:this={rootEl}>
-  <nav aria-label="Primary">
+  <nav class="sidebar" aria-label="Primary">
     <div class="tabs" role="tablist" aria-orientation="vertical">
       {#each tabs as item, i}
         <button
@@ -220,9 +233,26 @@
         </button>
       {/each}
     </div>
+  </nav>
 
-    <div class="nav-spacer"></div>
+  <div class="panel" id="screen-panel" role="tabpanel" aria-labelledby={`tab-${route}`}>
+    <!-- TEMPORARY: dev preview-state switcher, shared across every state-aware
+         screen. Remove with automatic state detection. -->
+    <PreviewSwitcher />
+    {#if route === "home"}
+      <Home />
+    {:else if route === "today"}
+      <Today on:navigate={handleNavigate} />
+    {:else}
+      <header class="screen-header"><h1>{activeLabel}</h1></header>
+      <p class="placeholder">Shell only — this screen’s content is coming next.</p>
+    {/if}
+  </div>
 
+  <!-- Utility group — Feedback invite + About / Privacy links. Visually pinned
+       to the BOTTOM of the sidebar (grid area), but placed AFTER the panel in
+       SOURCE order so Tab reaches the active screen's content before it. -->
+  <nav class="utility" aria-label="Secondary">
     <!-- Feedback — a soft accent invitation, not a tab. -->
     <button
       class="navcta"
@@ -247,15 +277,6 @@
       >
     </div>
   </nav>
-
-  <div class="panel" id="screen-panel" role="tabpanel" aria-labelledby={`tab-${route}`}>
-    {#if route === "home"}
-      <Home />
-    {:else}
-      <header class="screen-header"><h1>{activeLabel}</h1></header>
-      <p class="placeholder">Shell only — this screen’s content is coming next.</p>
-    {/if}
-  </div>
 </main>
 
 {#if debugOpen}
@@ -266,24 +287,33 @@
   main {
     display: grid;
     grid-template-columns: 206px 1fr;
+    grid-template-rows: 1fr auto;
+    grid-template-areas:
+      "sidebar panel"
+      "utility panel";
     height: 100vh;
   }
-  nav {
+  /* The sidebar holds ONLY the primary tablist now; the utility group is a
+     separate grid area below it. That lets the utility group come later in
+     source order (so Tab reaches screen content first) while staying visually
+     pinned to the sidebar bottom. Both carry the right border so the two read as
+     one continuous sidebar. */
+  .sidebar {
+    grid-area: sidebar;
+    padding: 1rem 0.85rem 0.5rem;
+    border-right: 1px solid var(--hairline);
+  }
+  .utility {
+    grid-area: utility;
     display: flex;
     flex-direction: column;
-    padding: 1rem 0.85rem;
+    padding: 0.5rem 0.85rem 1rem;
     border-right: 1px solid var(--hairline);
   }
   .tabs {
     display: flex;
     flex-direction: column;
     gap: 0.25rem;
-  }
-  /* Grows to push the utility group (Feedback invite + footer links) to the
-     bottom of the sidebar. */
-  .nav-spacer {
-    flex: 1;
-    min-height: 1rem;
   }
 
   /* ---- Primary tabs ---------------------------------------------------- */
@@ -385,6 +415,7 @@
 
   /* ---- Panel ----------------------------------------------------------- */
   .panel {
+    grid-area: panel;
     overflow-y: auto;
     overflow-x: clip;
     min-width: 0;

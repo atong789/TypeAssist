@@ -115,9 +115,9 @@ TypeAssist surfaces insight across three surfaces — **Today**, **Progress**, *
 - A short, gentle **narrative readback** of the day. A friend giving a readback, never a clinician.
 - **"What I noticed"**: a few specific, recognizable patterns (e.g. "right thumb on the spacebar"). **Descriptive, never prescriptive** — never "you should practice."
 - **No clock-time / time-of-day timeline.** (Retired: time-of-day bands are context-free — a user can't connect "hesitant at 2pm" to anything. The meaningful variable is the **typing episode/effort** — cold starts, sustained-effort fatigue, recovery — not the clock.)
-- **Read-only.** Today has **no interactive elements** — it observes. (Progress is reached from the **menu-bar panel** via the tray, not a link from Today.) Today is a sidebar destination, so **no back-arrow**.
+- **Observational, never a key-by-key grader.** Today reflects the day in plain language and **never grades you key-by-key** — per-key detail lives only in **Progress**, which is *pulled* (reached from the menu-bar panel via the tray, not linked from Today). Today's **one** call to action is the **warm-up card** (the gentle *Start warm-up*; see *Today carries the warm-up* below); apart from that it observes — no scores, no per-key grading. Today is a sidebar destination, so **no back-arrow**.
 - **Honest empty states**: a morning with no data says "the day's just beginning" — never predictions or yesterday's baggage.
-- **Today observes; Home invites.** Any call to action (e.g. a warm-up suggestion on a stiff cold-start morning) lives on **Home's warm-up card**, never on Today.
+- **Today carries the warm-up; Home carries the Corrections invite.** The warm-up card (a gentle, optional **Start warm-up**, weighted to weak keys) lives on **Today**, in every app state. The *passive* "turn on Corrections" invite lives on **Home** (Fluent only). Both are **offered, never insisted on** — no nagging, no guilt. *(This supersedes the earlier "warm-up lives on Home, never on Today": the front-end design places the warm-up on Today.)*
 
 ### Progress — the menu-bar dashboard (Statistics + Impact)
 
