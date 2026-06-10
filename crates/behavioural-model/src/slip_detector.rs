@@ -235,12 +235,10 @@ impl SlipDetector {
             return;
         }
         let new_state = match std::mem::take(&mut self.state) {
-            DetectionState::Idle => {
-                DetectionState::Typed(vec![TypedKey {
-                    key: key.into(),
-                    timestamp_ms: ts,
-                }])
-            }
+            DetectionState::Idle => DetectionState::Typed(vec![TypedKey {
+                key: key.into(),
+                timestamp_ms: ts,
+            }]),
             DetectionState::Typed(typed) => self.advance_typed(typed, key, ts),
             DetectionState::Erasing {
                 typed,
@@ -405,17 +403,14 @@ impl SlipDetector {
 
         // In-memory log (per-pair tally).
         let key = (aimed_for.to_string(), hit_instead.to_string());
-        let entry = self
-            .by_pair
-            .entry(key)
-            .or_insert_with(|| SlipRecord {
-                aimed_for: aimed_for.to_string(),
-                hit_instead: hit_instead.to_string(),
-                hand,
-                finger,
-                count: 0,
-                last_seen_ms: 0,
-            });
+        let entry = self.by_pair.entry(key).or_insert_with(|| SlipRecord {
+            aimed_for: aimed_for.to_string(),
+            hit_instead: hit_instead.to_string(),
+            hand,
+            finger,
+            count: 0,
+            last_seen_ms: 0,
+        });
         entry.count += 1;
         entry.last_seen_ms = ts;
         self.total_slips += 1;

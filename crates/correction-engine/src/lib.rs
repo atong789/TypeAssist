@@ -46,8 +46,10 @@ pub use guess_ledger::{
 };
 pub use guesser::{build_model, guess, ErrorModel, Guess, TAU_BUCKETS};
 pub use kill_switch::{
-    classify, classify_pattern, PatternFacts, PatternReadiness, SilentReason, Tier2Reason,
-    COMMON_TARGET_MIN_FREQUENCY, KILL_SWITCH_VERSION, STALE_AFTER_MS,
+    classify, classify_auto_fire, classify_auto_fire_for, classify_pattern, AutoFireClass,
+    AutoFireFacts, NotActionableReason, PatternFacts, PatternReadiness, SilentReason, Tier2Reason,
+    COMMON_DEFER_FREQUENCY, COMMON_TARGET_MIN_FREQUENCY, KILL_SWITCH_VERSION,
+    MACOS_DECODABLE_MAX_DISTANCE, STALE_AFTER_MS,
 };
 pub use lexicon::{Lexicon, LEXICON_VERSION};
 pub use lexicon_proposal::{

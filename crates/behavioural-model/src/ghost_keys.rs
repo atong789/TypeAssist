@@ -463,11 +463,8 @@ mod tests {
         assert_eq!(snap.total_ghost_events, 3);
 
         // Per-finger rollup includes only mapped keys, in anatomical order.
-        let order: Vec<(Hand, Finger)> = snap
-            .per_finger
-            .iter()
-            .map(|r| (r.hand, r.finger))
-            .collect();
+        let order: Vec<(Hand, Finger)> =
+            snap.per_finger.iter().map(|r| (r.hand, r.finger)).collect();
         assert_eq!(
             order,
             vec![(Hand::Left, Finger::Pinky), (Hand::Right, Finger::Index)]

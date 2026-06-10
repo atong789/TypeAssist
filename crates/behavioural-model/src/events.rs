@@ -32,7 +32,10 @@ pub enum InputEvent {
     /// the OS disabled the tap (e.g. by timeout) and the adapter
     /// hasn't yet re-armed it. The engine's watchdog uses this plus
     /// the heartbeat timestamp to drive the `capture-health` state.
-    Heartbeat { timestamp_ms: u64, tap_enabled: bool },
+    Heartbeat {
+        timestamp_ms: u64,
+        tap_enabled: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,7 +56,10 @@ pub enum OutboundCommand {
     /// focused field, then type `replacement`. `replacement` includes the
     /// trailing word-boundary character (e.g. the space) so the adapter stays
     /// dumb — it does no word logic of its own.
-    InjectCorrection { delete_count: u32, replacement: String },
+    InjectCorrection {
+        delete_count: u32,
+        replacement: String,
+    },
     /// Shut down the adapter.
     Shutdown,
     /// **Soft capture restart.** Ask the adapter to tear down its
@@ -66,6 +72,15 @@ pub enum OutboundCommand {
     /// stays `tap_enabled: false` and the engine escalates to a
     /// hard restart (respawn the adapter process).
     RestartTap,
+    /// **Arm the Tab shield** (M3 SUGGEST flow). While armed, the adapter
+    /// CONSUMES the Tab key at the tap — the focused app never receives it — and
+    /// reports the press back so the engine can accept the live suggestion.
+    /// Sent when a suggestion bubble goes up; the engine disarms on
+    /// accept/dismiss/timeout. Outside the armed window Tab passes through
+    /// normally.
+    ArmTabShield,
+    /// **Disarm the Tab shield** — Tab passes through to the app again.
+    DisarmTabShield,
 }
 
 #[cfg(test)]

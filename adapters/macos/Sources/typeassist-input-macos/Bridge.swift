@@ -41,6 +41,10 @@ enum OutboundCommand {
     /// same proven command path as `injectCorrection`, so it exercises AX
     /// through the sidecar's working Accessibility grant.
     case axProbe
+    /// M3 SUGGEST flow: while armed, the tap consumes the Tab key (the focused
+    /// app never sees it) so accepting a suggestion never moves browser focus.
+    case armTabShield
+    case disarmTabShield
 }
 
 /// Line-delimited JSON over stdout (events) and stdin (commands).
@@ -132,6 +136,10 @@ final class Bridge {
             return .restartTap
         case "ax_probe":
             return .axProbe
+        case "arm_tab_shield":
+            return .armTabShield
+        case "disarm_tab_shield":
+            return .disarmTabShield
         default:
             return nil
         }

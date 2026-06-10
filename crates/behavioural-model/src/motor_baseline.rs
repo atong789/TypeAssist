@@ -479,7 +479,9 @@ impl MotorBaseline {
     /// isn't poisoned by a 5-second think. The first observe in a
     /// fresh baseline has no IKI sample; only dwell is recorded.
     pub fn observe_key(&mut self, key: &str, timestamp_ms: u64, dwell_ms: u32) {
-        let Some((hand, finger)) = finger_for(key) else { return; };
+        let Some((hand, finger)) = finger_for(key) else {
+            return;
+        };
         let leaf_id = match leaf_key(key) {
             Some(id) => id,
             None => return,
@@ -813,9 +815,7 @@ impl MotorBaseline {
                     } else {
                         None
                     },
-                    iki_mean_ms: iki_cell
-                        .filter(|c| c.n_eff > 0.0)
-                        .map(|c| c.mean),
+                    iki_mean_ms: iki_cell.filter(|c| c.n_eff > 0.0).map(|c| c.mean),
                 }
             })
             .collect();
@@ -1031,7 +1031,9 @@ mod tests {
         // should be computable (population prior bootstraps the
         // estimate) but the certainty should be near zero.
         let mb = fresh();
-        let a = mb.dwell_anomaly("a", 100).expect("single-char key has a finger");
+        let a = mb
+            .dwell_anomaly("a", 100)
+            .expect("single-char key has a finger");
         // mean_used should equal the population prior (no user data
         // anywhere).
         assert!(approx(a.mean_used, POP_DWELL_MEAN_MS, 1e-9));
@@ -1209,7 +1211,11 @@ mod tests {
         // A 50ms IKI is z ≈ -1.875 vs the 200±80 prior → anomaly ~0.83.
         let mb = fresh();
         let fast = mb.iki_anomaly("a", 50).unwrap();
-        assert!(fast.anomaly > 0.5, "fast IKI should be anomalous; got {}", fast.anomaly);
+        assert!(
+            fast.anomaly > 0.5,
+            "fast IKI should be anomalous; got {}",
+            fast.anomaly
+        );
         assert!(fast.z < 0.0, "fast IKI z should be negative");
 
         // 1000ms IKI is way out: z = 10 → anomaly ≈ 1.
@@ -1286,21 +1292,39 @@ mod tests {
         // Probe AT the next slot — IKI from last train timestamp is
         // 100ms (normal).
         let normal = mb.keystroke_anomaly("a", ts, 100).unwrap();
-        assert!(normal.combined < 0.1, "all-normal combined should be ≈0; got {}", normal.combined);
+        assert!(
+            normal.combined < 0.1,
+            "all-normal combined should be ≈0; got {}",
+            normal.combined
+        );
         assert!(normal.iki.is_some());
 
         // Now probe with a 50ms IKI (fast roll) — IKI fires.
         let fast = mb.keystroke_anomaly("a", ts + 50, 100).unwrap();
         let fast_iki_anom = fast.iki.unwrap().anomaly;
-        assert!(approx(fast.combined, fast_iki_anom.max(fast.dwell.anomaly), 1e-12));
-        assert!(fast_iki_anom > 0.1, "50ms IKI should fire; got {}", fast_iki_anom);
+        assert!(approx(
+            fast.combined,
+            fast_iki_anom.max(fast.dwell.anomaly),
+            1e-12
+        ));
+        assert!(
+            fast_iki_anom > 0.1,
+            "50ms IKI should fire; got {}",
+            fast_iki_anom
+        );
 
         // Probe with a 400ms dwell (slow press) — dwell fires.
         let slow = mb.keystroke_anomaly("a", ts + 100, 400).unwrap();
-        assert!(slow.dwell.anomaly > 0.5, "400ms dwell should fire; got {}", slow.dwell.anomaly);
+        assert!(
+            slow.dwell.anomaly > 0.5,
+            "400ms dwell should fire; got {}",
+            slow.dwell.anomaly
+        );
         assert!(approx(
             slow.combined,
-            slow.dwell.anomaly.max(slow.iki.map(|i| i.anomaly).unwrap_or(0.0)),
+            slow.dwell
+                .anomaly
+                .max(slow.iki.map(|i| i.anomaly).unwrap_or(0.0)),
             1e-12
         ));
     }
@@ -1313,7 +1337,10 @@ mod tests {
         // → certainty = dwell.certainty alone, no min).
         let mb = fresh();
         let first = mb.keystroke_anomaly("a", 1000, 100).unwrap();
-        assert!(first.iki.is_none(), "no prior keystroke → no IKI on first probe");
+        assert!(
+            first.iki.is_none(),
+            "no prior keystroke → no IKI on first probe"
+        );
         // certainty == dwell.certainty, not min'd against anything.
         assert!(approx(first.certainty, first.dwell.certainty, 1e-12));
     }
@@ -1371,8 +1398,16 @@ mod tests {
         let large = mb.coactivation(115, 95).unwrap();
         assert!(large.overlap_ms > small.overlap_ms);
         assert!(large.anomaly > small.anomaly);
-        assert!(large.anomaly > 0.9, "80ms overlap should saturate; got {}", large.anomaly);
-        assert!(small.anomaly < 0.2, "5ms overlap should be small; got {}", small.anomaly);
+        assert!(
+            large.anomaly > 0.9,
+            "80ms overlap should saturate; got {}",
+            large.anomaly
+        );
+        assert!(
+            small.anomaly < 0.2,
+            "5ms overlap should be small; got {}",
+            small.anomaly
+        );
     }
 
     #[test]
@@ -1414,13 +1449,9 @@ mod tests {
             mb.observe_key("a", last_ts, 80);
         }
         // No-overlap probe: well after last_ts.
-        let no_overlap = mb
-            .keystroke_anomaly("a", last_ts + 200, 80)
-            .unwrap();
+        let no_overlap = mb.keystroke_anomaly("a", last_ts + 200, 80).unwrap();
         // Overlap probe: down = last_ts - 30 → up = last_ts - 30 + 80.
-        let with_overlap = mb
-            .keystroke_anomaly("a", (last_ts - 30) + 80, 80)
-            .unwrap();
+        let with_overlap = mb.keystroke_anomaly("a", (last_ts - 30) + 80, 80).unwrap();
         assert!(no_overlap.coactivation.is_none());
         assert!(with_overlap.coactivation.is_some());
         assert!(
@@ -1438,7 +1469,10 @@ mod tests {
         // Pause length: gap exceeds MAX_TYPING_INTERVAL_MS.
         let next_ts = MAX_TYPING_INTERVAL_MS + 2;
         let probe = mb.keystroke_anomaly("a", next_ts, 100).unwrap();
-        assert!(probe.iki.is_none(), "between-pause keystroke must not have IKI");
+        assert!(
+            probe.iki.is_none(),
+            "between-pause keystroke must not have IKI"
+        );
         // And actually observing this keystroke does NOT update the
         // IKI cells. (The dwell did update — separate code path.)
         let iki_finger_before = mb.iki_fingers.get(&(Hand::Left, Finger::Pinky)).copied();

@@ -233,6 +233,187 @@ pub fn classify(
     classify_pattern(&facts)
 }
 
+// ============================================================================
+// M3 correction Step 2 — common-vs-personal auto-fire classifier.
+// ============================================================================
+//
+// A SEPARATE decision from [`classify_pattern`] above. That one is the parked
+// automatic-readiness model (silent Tier-1 vs flag Tier-2), where a *common*
+// target is a REQUIREMENT to act. Step 2 asks a different question:
+//
+//   Should TypeAssist OWN this correction, or DEFER it to macOS autocorrect?
+//
+// The product's differentiated value is the user's PERSONAL long tail — slips
+// macOS does not fix. macOS handles standard typos of common dictionary words;
+// it misses (a) typos of rarer words it lacks, and (b) severe jumbles it can't
+// decode (even toward a common word — the "autocorrect on but misses" case).
+//
+// Crucially we are BLIND to macOS autocorrect: our tap never sees its
+// substitutions (it rewrites via the text-input layer, not posted CGEvents), so
+// we cannot detect or coordinate with it at runtime. Acting on a typo macOS
+// also fixes therefore risks an unobservable collision. So "defer on common" is
+// a SAFETY stance, decided purely by inference (lexicon frequency + jumble
+// severity), never by watching macOS.
+//
+// Observe-only / dry-run: nothing here injects. The manual allow-list (Step 1)
+// remains the user's override for anything classified Defer.
+
+/// **EASILY-FLIPPED CONSTANT (provisional).** Target lexicon frequency at/above
+/// which we assume macOS autocorrect reliably handles standard typos of the
+/// word, so TypeAssist defers rather than risk an (unobservable) collision.
+/// Below it, the target is rare enough that macOS likely lacks it → the user's
+/// personal value → act. Starts equal to [`COMMON_TARGET_MIN_FREQUENCY`]; tune
+/// by watching the Step-2 dry-run against real typing.
+pub const COMMON_DEFER_FREQUENCY: u64 = COMMON_TARGET_MIN_FREQUENCY;
+
+/// **EASILY-FLIPPED CONSTANT (provisional).** Largest edit distance macOS
+/// autocorrect can plausibly *decode* as a typo of a known word. At/below this,
+/// a common-word typo is "standard" → macOS handles it → defer. ABOVE this, the
+/// jumble is severe enough that macOS can't map it back — so TypeAssist acts
+/// even toward a common target (the "autocorrect on but misses" case). 2 mirrors
+/// the original capture guard, so the dist≤2 common-word typos macOS already
+/// fixes are exactly the ones we defer, while the dist-3+ jumbles the widened
+/// capture now learns become ours. Tune from the dry-run.
+pub const MACOS_DECODABLE_MAX_DISTANCE: usize = 2;
+
+/// Step-2 decision: should TypeAssist own this correction or defer it to macOS?
+/// Observe-only — a classification, never an injection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AutoFireClass {
+    /// The user's personal slip, where macOS autocorrect is unlikely to help:
+    /// the target is rarer than [`COMMON_DEFER_FREQUENCY`] (macOS likely lacks
+    /// it) OR the jumble exceeds [`MACOS_DECODABLE_MAX_DISTANCE`] (macOS can't
+    /// decode it). All the act-worthiness gates have already passed.
+    Personal,
+    /// A common dictionary word with a small, standard typo — macOS autocorrect
+    /// already handles it, so we defer to avoid an unobservable collision. The
+    /// manual allow-list can still override.
+    DeferToAutocorrect,
+    /// Not act-worthy yet, with a reason (a gate failed). Reuses the same gate
+    /// vocabulary as [`PatternReadiness`].
+    NotActionable { reason: NotActionableReason },
+}
+
+/// Why an auto-fire candidate isn't act-worthy. Ordered the same way the
+/// classifier checks them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotActionableReason {
+    /// No such pattern has ever been observed.
+    Unseen,
+    /// Target isn't a real word — never a valid correction destination.
+    TargetNotAWord,
+    /// Decayed weight below [`TIER1_MIN_OBSERVATIONS`] — not confident yet.
+    InsufficientObservations,
+    /// Last observed longer ago than [`STALE_AFTER_MS`].
+    Stale,
+    /// **The safety rule.** The typed word is itself a real word — never auto-
+    /// rewrite it (the manual allow-list could, with the user's explicit opt-in).
+    TypedIsRealWord,
+    /// Undone [`UNDO_BRAKE_STRIKES`] times in a row — held off until it rebuilds.
+    BrakeTripped,
+}
+
+/// Pre-computed facts for the auto-fire decision — injected so the policy is a
+/// pure function (mirrors [`PatternFacts`]). Adds the jumble-severity inputs
+/// the common-vs-personal split needs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoFireFacts {
+    /// Decayed occurrence weight of the pattern.
+    pub weight: f32,
+    /// Time since last observed (ms), for the recency gate.
+    pub age_ms: u64,
+    /// Consecutive user-undos (the brake).
+    pub consecutive_undos: u32,
+    /// Is the typed word itself a real word? (Safety gate.)
+    pub typed_is_known: bool,
+    /// Is the target a real word at all?
+    pub target_is_known: bool,
+    /// The target's lexicon frequency (commonness — the defer signal).
+    pub target_frequency: u64,
+    /// Edit distance `typed → target` (jumble severity — the "macOS can't
+    /// decode it" signal that overrides defer for a common target).
+    pub edit_distance: usize,
+}
+
+/// Classify one auto-fire candidate from pre-computed facts. **Pure** — no
+/// lexicon, no store, no I/O.
+///
+/// Order: the act-worthiness gates first (→ [`AutoFireClass::NotActionable`]),
+/// then the common-vs-personal split.
+pub fn classify_auto_fire(f: &AutoFireFacts) -> AutoFireClass {
+    use AutoFireClass::NotActionable;
+    // --- Act-worthiness gates (same vocabulary as the Tier model). ---
+    if f.weight <= 0.0 {
+        return NotActionable {
+            reason: NotActionableReason::Unseen,
+        };
+    }
+    if !f.target_is_known {
+        return NotActionable {
+            reason: NotActionableReason::TargetNotAWord,
+        };
+    }
+    if f.weight < TIER1_MIN_OBSERVATIONS {
+        return NotActionable {
+            reason: NotActionableReason::InsufficientObservations,
+        };
+    }
+    if f.age_ms as f64 > f64::from(STALE_AFTER_MS) {
+        return NotActionable {
+            reason: NotActionableReason::Stale,
+        };
+    }
+    // Safety: never auto-rewrite a real word (the allow-list can, opt-in).
+    if f.typed_is_known {
+        return NotActionable {
+            reason: NotActionableReason::TypedIsRealWord,
+        };
+    }
+    if f.consecutive_undos >= UNDO_BRAKE_STRIKES {
+        return NotActionable {
+            reason: NotActionableReason::BrakeTripped,
+        };
+    }
+
+    // --- Act-worthy. Defer to macOS only for a common word with a standard
+    //     (decodable) typo; otherwise it's the user's personal value. ---
+    let target_common = f.target_frequency >= COMMON_DEFER_FREQUENCY;
+    let severe_jumble = f.edit_distance > MACOS_DECODABLE_MAX_DISTANCE;
+    if target_common && !severe_jumble {
+        AutoFireClass::DeferToAutocorrect
+    } else {
+        AutoFireClass::Personal
+    }
+}
+
+/// Convenience wrapper: assemble [`AutoFireFacts`] for `typed → target` from a
+/// [`WordPatternStore`] + [`Lexicon`] (and the edit distance between them), then
+/// [`classify_auto_fire`].
+pub fn classify_auto_fire_for(
+    typed: &str,
+    target: &str,
+    store: &WordPatternStore,
+    lexicon: &Lexicon,
+) -> AutoFireClass {
+    let Some(snap) = store.snapshot(typed, target) else {
+        return AutoFireClass::NotActionable {
+            reason: NotActionableReason::Unseen,
+        };
+    };
+    let facts = AutoFireFacts {
+        weight: snap.weight,
+        age_ms: store.last_now().saturating_sub(snap.last_update),
+        consecutive_undos: snap.consecutive_undos,
+        typed_is_known: lexicon.is_known(typed),
+        target_is_known: lexicon.is_known(target),
+        target_frequency: lexicon.frequency(target),
+        edit_distance: crate::word_pattern::edit_distance(typed, target),
+    };
+    classify_auto_fire(&facts)
+}
+
 // Sanity at compile time.
 const _: () = assert!(KILL_SWITCH_VERSION >= 1);
 
@@ -480,6 +661,135 @@ mod tests {
             PatternReadiness::Silent {
                 reason: SilentReason::InsufficientObservations
             }
+        );
+    }
+
+    // ---- Step 2: common-vs-personal auto-fire classifier ----------------
+
+    // Act-worthy facts: a non-word typo of a COMMON word, small (decodable)
+    // distance — the canonical "macOS handles it" / defer case. Tests mutate
+    // one field at a time.
+    fn defer_facts() -> AutoFireFacts {
+        AutoFireFacts {
+            weight: TIER1_MIN_OBSERVATIONS,
+            age_ms: 0,
+            consecutive_undos: 0,
+            typed_is_known: false,
+            target_is_known: true,
+            target_frequency: COMMON_DEFER_FREQUENCY,
+            edit_distance: 2,
+        }
+    }
+
+    #[test]
+    fn common_word_small_typo_defers_to_autocorrect() {
+        assert_eq!(
+            classify_auto_fire(&defer_facts()),
+            AutoFireClass::DeferToAutocorrect
+        );
+    }
+
+    #[test]
+    fn rare_target_is_personal() {
+        // Below the defer frequency → macOS likely lacks it → we act.
+        let f = AutoFireFacts {
+            target_frequency: COMMON_DEFER_FREQUENCY - 1,
+            ..defer_facts()
+        };
+        assert_eq!(classify_auto_fire(&f), AutoFireClass::Personal);
+    }
+
+    #[test]
+    fn severe_jumble_of_common_word_is_personal() {
+        // The "autocorrect on but misses" case: target is common, but the
+        // jumble is too severe for macOS to decode → ours.
+        let f = AutoFireFacts {
+            edit_distance: MACOS_DECODABLE_MAX_DISTANCE + 1,
+            ..defer_facts()
+        };
+        assert_eq!(classify_auto_fire(&f), AutoFireClass::Personal);
+    }
+
+    #[test]
+    fn typed_real_word_is_not_actionable_even_if_personal_shaped() {
+        // Safety: never auto-rewrite a real word, regardless of the split.
+        let f = AutoFireFacts {
+            typed_is_known: true,
+            target_frequency: COMMON_DEFER_FREQUENCY - 1,
+            ..defer_facts()
+        };
+        assert_eq!(
+            classify_auto_fire(&f),
+            AutoFireClass::NotActionable {
+                reason: NotActionableReason::TypedIsRealWord
+            }
+        );
+    }
+
+    #[test]
+    fn auto_fire_gates_mirror_the_tier_model() {
+        // Unseen.
+        assert_eq!(
+            classify_auto_fire(&AutoFireFacts {
+                weight: 0.0,
+                ..defer_facts()
+            }),
+            AutoFireClass::NotActionable {
+                reason: NotActionableReason::Unseen
+            }
+        );
+        // Target not a word.
+        assert_eq!(
+            classify_auto_fire(&AutoFireFacts {
+                target_is_known: false,
+                ..defer_facts()
+            }),
+            AutoFireClass::NotActionable {
+                reason: NotActionableReason::TargetNotAWord
+            }
+        );
+        // Insufficient observations.
+        assert_eq!(
+            classify_auto_fire(&AutoFireFacts {
+                weight: TIER1_MIN_OBSERVATIONS - 0.1,
+                ..defer_facts()
+            }),
+            AutoFireClass::NotActionable {
+                reason: NotActionableReason::InsufficientObservations
+            }
+        );
+        // Stale.
+        assert_eq!(
+            classify_auto_fire(&AutoFireFacts {
+                age_ms: STALE_AFTER_MS as u64 + 1,
+                ..defer_facts()
+            }),
+            AutoFireClass::NotActionable {
+                reason: NotActionableReason::Stale
+            }
+        );
+        // Brake tripped.
+        assert_eq!(
+            classify_auto_fire(&AutoFireFacts {
+                consecutive_undos: UNDO_BRAKE_STRIKES,
+                ..defer_facts()
+            }),
+            AutoFireClass::NotActionable {
+                reason: NotActionableReason::BrakeTripped
+            }
+        );
+    }
+
+    #[test]
+    fn end_to_end_teh_to_the_defers_to_autocorrect() {
+        // teh→the: common target, distance 2 → macOS's job, we defer. (Step 1's
+        // manual allow-list is the override that let Alice test it.)
+        let lex = Lexicon::shared();
+        let mut store = WordPatternStore::new();
+        observe_n(&mut store, "teh", "the", 12, 1_000_000);
+        assert_eq!(
+            classify_auto_fire_for("teh", "the", &store, lex),
+            AutoFireClass::DeferToAutocorrect
         );
     }
 }

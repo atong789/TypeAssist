@@ -245,8 +245,8 @@ mod tests {
         // pause-time bug that pulled the score (and steadier_hand) the
         // wrong way.
         let mut agg = AsymmetryTracker::default();
-        agg.observe(&key("a", 0, 80));    // L
-        agg.observe(&key("j", 100, 80));  // R, interval 100
+        agg.observe(&key("a", 0, 80)); // L
+        agg.observe(&key("j", 100, 80)); // R, interval 100
         agg.observe(&key("s", 1_000, 80)); // L, interval 900 (a long-but-kept interval)
         agg.observe(&key("k", 1_100, 80)); // R, interval 100
         let snap = agg.snapshot();
@@ -263,10 +263,10 @@ mod tests {
         // happens to favour left. Mirrors the real-world bug: pause-time
         // pollutes interval; dwell is the trustworthy motor signal.
         let mut agg = AsymmetryTracker::default();
-        agg.observe(&key("a", 0, 120));    // L dwell 120
-        agg.observe(&key("j", 100, 60));   // R dwell 60, interval 100
-        agg.observe(&key("s", 200, 110));  // L dwell 110, interval 100
-        agg.observe(&key("k", 300, 70));   // R dwell 70, interval 100
+        agg.observe(&key("a", 0, 120)); // L dwell 120
+        agg.observe(&key("j", 100, 60)); // R dwell 60, interval 100
+        agg.observe(&key("s", 200, 110)); // L dwell 110, interval 100
+        agg.observe(&key("k", 300, 70)); // R dwell 70, interval 100
         let snap = agg.snapshot();
         assert_eq!(snap.steadier_hand, Some(Hand::Right));
     }
@@ -274,11 +274,11 @@ mod tests {
     #[test]
     fn pause_length_gaps_are_excluded_from_intervals() {
         let mut agg = AsymmetryTracker::default();
-        agg.observe(&key("a", 100, 70));     // L
-        // 5 second pause — should NOT contribute to right's avg interval.
-        agg.observe(&key("j", 5_100, 70));   // R, gap = 5000ms → dropped
-        // Fast follow-up: this 200ms gap IS counted for left.
-        agg.observe(&key("s", 5_300, 70));   // L, gap = 200ms → kept
+        agg.observe(&key("a", 100, 70)); // L
+                                         // 5 second pause — should NOT contribute to right's avg interval.
+        agg.observe(&key("j", 5_100, 70)); // R, gap = 5000ms → dropped
+                                           // Fast follow-up: this 200ms gap IS counted for left.
+        agg.observe(&key("s", 5_300, 70)); // L, gap = 200ms → kept
         let snap = agg.snapshot();
         // Right has 1 keystroke but 0 interval samples because the only gap
         // landing on R (5000ms) was a pause.

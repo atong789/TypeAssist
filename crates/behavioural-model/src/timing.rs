@@ -248,11 +248,8 @@ mod tests {
             agg.observe(&key(k, 100 * (i as u64 + 1), 70));
         }
         let snap = agg.snapshot();
-        let order: Vec<(Hand, Finger)> = snap
-            .per_finger
-            .iter()
-            .map(|r| (r.hand, r.finger))
-            .collect();
+        let order: Vec<(Hand, Finger)> =
+            snap.per_finger.iter().map(|r| (r.hand, r.finger)).collect();
         // Left-pinky → left-thumb → right-thumb → right-pinky.
         // (No left-thumb key in this set, so it just isn't present.)
         assert_eq!(

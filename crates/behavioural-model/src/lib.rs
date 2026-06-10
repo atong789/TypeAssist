@@ -167,8 +167,7 @@ mod tests {
             .per_finger
             .iter()
             .find(|r| {
-                r.hand == volatility_map::Hand::Left
-                    && r.finger == volatility_map::Finger::Pinky
+                r.hand == volatility_map::Hand::Left && r.finger == volatility_map::Finger::Pinky
             })
             .expect("left pinky row must exist");
         assert!(lpinky.n_eff > 0.0, "n_eff = {}", lpinky.n_eff);

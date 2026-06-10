@@ -39,7 +39,7 @@ use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
 use correction_engine::{
     classify_slip, decide, has_motor_evidence, measure_token_motor, normalize_word,
     ranked_known_candidates, score_candidates, should_log, target_is_recordable, AnchorTracker,
-    Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome, GuessLedger,
+    AutoFireClass, Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome, GuessLedger,
     Lexicon, LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver,
     PatternReadiness, ScoredCandidate, SlipClass, StabilityReport, Token, TokenKind, Tokenizer,
     WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
@@ -176,6 +176,14 @@ pub const EVT_CORRECTION_STATE: &str = "corrections://state";
 /// per applied fix so the HUD cue can show `typed → target` briefly. Payload is
 /// [`CorrectionAppliedEvent`]. (Principle #7: every correction is observable.)
 pub const EVT_CORRECTION_APPLIED: &str = "corrections://applied";
+/// **M3 SUGGEST flow.** A suggestion is being OFFERED for the just-typed word —
+/// the bubble shows `typed → target · Tab to accept`; the user's text is
+/// unchanged until they accept. Payload is [`SuggestEvent`].
+pub const EVT_CORRECTION_SUGGEST: &str = "corrections://suggest";
+/// **M3 SUGGEST flow.** The live suggestion was dismissed (user kept typing, or
+/// the window timed out) — the bubble hides; the pattern is NOT disabled. No
+/// payload.
+pub const EVT_CORRECTION_DISMISS: &str = "corrections://dismiss";
 
 /// Engine-derived view of the sidecar's capture state. Transitions
 /// are observation-only this phase — driven by the Heartbeat
@@ -421,39 +429,44 @@ struct KeystrokePayload {
     ingest_latency_ms: f64,
 }
 
-/// Payload for [`EVT_CORRECTION_APPLIED`] — what the HUD cue shows. Carries the
-/// before/after words and whether this event is a fix or its undo, so one cue
-/// component renders both (`teh → the` on apply, `the → teh` reverting on undo).
+/// Payload for [`EVT_CORRECTION_APPLIED`] — what the HUD cue shows when a fix
+/// actually lands (the user accepted a suggestion with Tab).
 #[derive(Serialize, Clone)]
 struct CorrectionAppliedEvent {
     typed: String,
     target: String,
-    /// `false` for an injected fix, `true` for an Escape teach-stop revert.
-    undo: bool,
 }
 
-/// The just-fired correction, retained so a single Escape can revert it within
-/// [`UNDO_WINDOW_MS`]. `typed`/`target` are normalized (allow-list form);
-/// `boundary` is the terminator char that sealed the word (re-typed verbatim on
-/// both inject and revert). `fired_at_ms` arms the window.
+/// Payload for [`EVT_CORRECTION_SUGGEST`] — the offered word, shown in the
+/// bubble as `typed → target · Tab to accept`. The user's text is unchanged
+/// until they accept.
+#[derive(Serialize, Clone)]
+struct SuggestEvent {
+    typed: String,
+    target: String,
+}
+
+/// The live suggestion currently being offered, retained so a Tab within
+/// [`SUGGEST_WINDOW_MS`] accepts it. `typed`/`target` are normalized (allow-list
+/// form); `boundary` is the terminator char that sealed the word (re-typed
+/// verbatim when the fix is applied). `fired_at_ms` arms the window.
 #[derive(Debug, Clone)]
-struct LastCorrection {
+struct LiveSuggestion {
     typed: String,
     target: String,
     boundary: char,
     fired_at_ms: u64,
 }
 
-/// How long after a correction an Escape still reverts it. Sized for slow /
-/// stroke-survivor reaction time — generous, but the window also closes the
-/// moment the user types any other character (an implicit accept), so a long
-/// timeout doesn't keep Escape hijacked. **Tunable.**
-const UNDO_WINDOW_MS: u64 = 6_000;
+/// How long a suggestion stays live (Tab accepts; any other key dismisses).
+/// Sized for slow / stroke-survivor reaction time. After it, the Tab shield is
+/// disarmed and Tab passes through normally. **Tunable.**
+const SUGGEST_WINDOW_MS: u64 = 6_000;
 
-/// Escape's codepoint (U+001B). The engine sees it as a `Key` event (the L1 tap
-/// streams every keystroke); within an armed undo window it reverts the last
-/// correction instead of being a caret-only no-op.
-const KEY_ESCAPE: char = '\u{001B}';
+/// Tab's codepoint (U+0009). The L1 tap consumes Tab from the app while a
+/// suggestion is armed but still streams it here, so a live suggestion accepts
+/// on this key.
+const KEY_TAB: char = '\u{0009}';
 
 /// Per-Word-token decision (Component 3c-2). Observe-only — `would-correct`
 /// is a *proposal*, not an injection. `outcome` is the full
@@ -1562,10 +1575,9 @@ fn persist_and_emit_allow_list<R: Runtime>(
 
 /// Write an `InjectCorrection` to the sidecar's stdin: delete the last
 /// `delete_count` characters back from the caret, then type `replacement`
-/// (which already carries the trailing boundary char). The sidecar tags the
-/// synthesized CGEvents (`eventSourceUserData`) so the tap drops their echo —
-/// the engine never sees its own injection, so it can't re-learn or re-correct
-/// it. Returns whether the command was written (a dead stdin returns false).
+/// (which already carries the trailing boundary char). The injection's echo is
+/// dropped engine-side by exact count (`pending_echo`). Returns whether the
+/// command was written (a dead stdin returns false).
 fn send_inject_correction(
     child: &mut tauri_plugin_shell::process::CommandChild,
     delete_count: u32,
@@ -1588,6 +1600,22 @@ fn send_inject_correction(
         Err(e) => {
             tracing::warn!("InjectCorrection write to sidecar failed: {e}");
             false
+        }
+    }
+}
+
+/// Arm or disarm the sidecar's Tab shield (M3 SUGGEST flow). While armed the tap
+/// consumes Tab so accepting a suggestion never moves the focused app's focus.
+fn send_tab_shield(child: &mut tauri_plugin_shell::process::CommandChild, armed: bool) {
+    let cmd = if armed {
+        OutboundCommand::ArmTabShield
+    } else {
+        OutboundCommand::DisarmTabShield
+    };
+    if let Ok(mut line) = serde_json::to_string(&cmd) {
+        line.push('\n');
+        if let Err(e) = child.write(line.as_bytes()) {
+            tracing::warn!("tab-shield ({armed}) write to sidecar failed: {e}");
         }
     }
 }
@@ -1633,6 +1661,47 @@ fn dump_classifications(store: &WordPatternStore) {
         tier2,
         silent,
         actionable
+    );
+}
+
+/// M3 correction Step 2 — observe-only review of the common-vs-personal
+/// auto-fire split across all accumulated patterns. Lets Alice judge the
+/// classifier's verdicts on real data BEFORE any dry-run firing (step 3) or
+/// live firing. No injection. Lists the `Personal` (would-act) patterns with
+/// their target frequency + edit distance so the provisional thresholds
+/// (`COMMON_DEFER_FREQUENCY`, `MACOS_DECODABLE_MAX_DISTANCE`) can be tuned from
+/// what actually lands on each side. No-op on an empty store.
+fn dump_auto_fire_classifications(store: &WordPatternStore) {
+    if store.is_empty() {
+        return;
+    }
+    let lexicon = Lexicon::shared();
+    let (mut personal, mut defer, mut not_actionable) = (0u32, 0u32, 0u32);
+    let mut would_act: Vec<String> = Vec::new();
+    for snap in store.snapshots() {
+        match correction_engine::classify_auto_fire_for(&snap.typed, &snap.target, store, lexicon) {
+            AutoFireClass::Personal => {
+                personal += 1;
+                would_act.push(format!(
+                    "{}→{} freq={} dist={} w={:.1}",
+                    snap.typed,
+                    snap.target,
+                    lexicon.frequency(&snap.target),
+                    correction_engine::edit_distance(&snap.typed, &snap.target),
+                    snap.weight
+                ));
+            }
+            AutoFireClass::DeferToAutocorrect => defer += 1,
+            AutoFireClass::NotActionable { .. } => not_actionable += 1,
+        }
+    }
+    tracing::info!(
+        "AUTO_FIRE_DUMP patterns={} personal={} defer={} not_actionable={} would_act={:?}",
+        store.len(),
+        personal,
+        defer,
+        not_actionable,
+        would_act
     );
 }
 
@@ -2253,11 +2322,11 @@ pub fn spawn<R: Runtime>(
         // Capture-integrity funnel (Principle #7). Per-session boundary
         // counters; dumped on the Cmd+Shift+F chord and every 60s.
         let mut funnel = Funnel::new(now_ms());
-        // M3 correction Step 1: the last fix, retained so a single Escape
-        // within `UNDO_WINDOW_MS` reverts it (and teach-stops the pattern).
-        // Disarmed on revert, on any other keystroke (implicit accept), and on
-        // window timeout (watchdog).
-        let mut last_correction: Option<LastCorrection> = None;
+        // M3 SUGGEST flow: the live offered suggestion, retained so a Tab within
+        // `SUGGEST_WINDOW_MS` accepts it. Cleared on accept, on any other
+        // keystroke (dismiss — the pattern is NOT disabled), and on window
+        // timeout (watchdog).
+        let mut suggestion: Option<LiveSuggestion> = None;
         // Count of injected events (backspaces + replacement chars) we still
         // expect to see echoed back through the L1 tap. The tap re-captures our
         // own injection (`.cgSessionEventTap` sees posted events), so each
@@ -2693,6 +2762,7 @@ pub fn spawn<R: Runtime>(
                                 if matches!(single_char, Some('f') | Some('F')) {
                                     funnel.dump();
                                     dump_classifications(&word_patterns);
+                                    dump_auto_fire_classifications(&word_patterns);
                                     funnel.reset(now_ms());
                                     continue;
                                 }
@@ -2702,27 +2772,27 @@ pub fn spawn<R: Runtime>(
                                 }
                             }
 
-                            // M3 correction Step 1 — Escape-windowed undo +
-                            // teach-stop. While a correction is armed, the FIRST
-                            // real user keystroke decides its fate (the tap
-                            // suppresses our own injection echo, so the next key
-                            // we see is genuinely the user's): a bare Escape
-                            // within the window reverts the fix and removes the
-                            // pattern from the allow-list so it won't recur;
-                            // anything else is an implicit accept and just
-                            // disarms. `take()` disarms in every branch.
-                            if let Some(lc) = last_correction.take() {
+                            // M3 SUGGEST flow — accept-or-dismiss the live offer.
+                            // The L1 tap consumes Tab from the app while armed but
+                            // still streams it here, so the FIRST key after the
+                            // offer decides: a bare Tab within the window ACCEPTS
+                            // (apply the fix by injection); any other key DISMISSES
+                            // (leave the text as typed; the pattern is NOT disabled
+                            // — it triggers again next time). Either way disarm the
+                            // Tab shield. `take()` clears the live suggestion.
+                            if let Some(sg) = suggestion.take() {
                                 let expired =
-                                    now_ms().saturating_sub(lc.fired_at_ms) > UNDO_WINDOW_MS;
-                                let is_escape = matches!(single_char, Some(KEY_ESCAPE))
+                                    now_ms().saturating_sub(sg.fired_at_ms) > SUGGEST_WINDOW_MS;
+                                let is_tab = matches!(single_char, Some(KEY_TAB))
                                     && !modifiers.command
                                     && !modifiers.control;
-                                if !expired && is_escape {
-                                    // Revert: delete the target + boundary we
-                                    // injected, retype the original word +
-                                    // boundary.
-                                    let delete_count = (lc.target.chars().count() + 1) as u32;
-                                    let replacement = format!("{}{}", lc.typed, lc.boundary);
+                                send_tab_shield(&mut sidecar_child, false);
+                                if !expired && is_tab {
+                                    // ACCEPT: the app still shows the typed word +
+                                    // boundary (we never injected). Delete it and
+                                    // type the target + the same boundary.
+                                    let delete_count = (sg.typed.chars().count() + 1) as u32;
+                                    let replacement = format!("{}{}", sg.target, sg.boundary);
                                     let echo_len =
                                         delete_count + replacement.chars().count() as u32;
                                     if send_inject_correction(
@@ -2730,40 +2800,25 @@ pub fn spawn<R: Runtime>(
                                         delete_count,
                                         replacement,
                                     ) {
-                                        // Skip the revert's own echo too.
                                         pending_echo += echo_len;
-                                        funnel.corrections_undone += 1;
+                                        funnel.corrections_applied += 1;
                                         tracing::info!(
-                                            "CORRECTION_UNDONE typed={:?} target={:?}",
-                                            lc.typed,
-                                            lc.target
+                                            "CORRECTION_APPLIED typed={:?} target={:?} delete={}",
+                                            sg.typed,
+                                            sg.target,
+                                            delete_count
                                         );
-                                        // Cue shows the revert direction.
                                         let _ = app_handle.emit(
                                             EVT_CORRECTION_APPLIED,
                                             CorrectionAppliedEvent {
-                                                typed: lc.target.clone(),
-                                                target: lc.typed.clone(),
-                                                undo: true,
+                                                typed: sg.typed.clone(),
+                                                target: sg.target.clone(),
                                             },
                                         );
                                     }
-                                    // Teach-stop: a wrong fix is a one-key fix
-                                    // that won't recur. Remove + persist + echo
-                                    // so the panel/tray reflect the removal.
-                                    if allow_list.disable(&lc.typed) {
-                                        tracing::info!(
-                                            "ALLOW_LIST_TEACH_STOP removed typed={:?}",
-                                            lc.typed
-                                        );
-                                        persist_and_emit_allow_list(
-                                            &app_handle,
-                                            &allow_list,
-                                            allow_list_path.as_deref(),
-                                        );
-                                    }
-                                    // The revert's echo is suppressed too; reset
-                                    // the line to mirror the restored text.
+                                    // Echo is skipped; reset the line to mirror the
+                                    // corrected text (same as the old auto-fix
+                                    // reset). The consumed Tab produces no text.
                                     tokenizer.reset_line();
                                     line_buf.clear();
                                     line_dwells.clear();
@@ -2777,9 +2832,11 @@ pub fn spawn<R: Runtime>(
                                     );
                                     continue;
                                 }
-                                // Not an undo — implicit accept. `lc` is dropped
-                                // (disarmed); fall through to process this key
-                                // normally.
+                                // DISMISS — kept typing (or the window expired).
+                                // Hide the bubble; the pattern STAYS enabled. Fall
+                                // through to process this key normally.
+                                tracing::info!("CORRECTION_DISMISS typed={:?}", sg.typed);
+                                let _ = app_handle.emit(EVT_CORRECTION_DISMISS, ());
                             }
 
                             if is_non_text {
@@ -2906,12 +2963,6 @@ pub fn spawn<R: Runtime>(
                                             anchors.apply_insert(caret, c);
                                             caret = new_caret;
 
-                                            // M3 Step 1: set when a correction
-                                            // fired and reset the line, so the
-                                            // trailing resolver tick is skipped
-                                            // (mirrors the newline-reset path,
-                                            // which also doesn't tick after).
-                                            let mut corrected = false;
                                             if was_end_of_line {
                                                 if let Some(tok) = tokenizer.observe_char(c) {
                                                     // M3 correction Step 1: a word
@@ -2943,78 +2994,35 @@ pub fn spawn<R: Runtime>(
                                                         &mut proposer,
                                                         &mut funnel,
                                                     );
-                                                    if let Some((typed, target, word_len)) = fire {
-                                                        // Delete the word + the
-                                                        // boundary char we just
-                                                        // typed, then retype the
-                                                        // target + the same
-                                                        // boundary. Caret is at the
-                                                        // end of the line here
-                                                        // (was_end_of_line), so a
-                                                        // plain backspace-count
-                                                        // delete is correct.
-                                                        let delete_count = (word_len + 1) as u32;
-                                                        let replacement = format!("{target}{c}");
-                                                        let echo_len = delete_count
-                                                            + replacement.chars().count() as u32;
-                                                        if send_inject_correction(
-                                                            &mut sidecar_child,
-                                                            delete_count,
-                                                            replacement,
-                                                        ) {
-                                                            // Skip this fix's echo
-                                                            // (backspaces + retyped
-                                                            // chars) when it streams
-                                                            // back through the tap.
-                                                            pending_echo += echo_len;
-                                                            funnel.corrections_applied += 1;
-                                                            tracing::info!(
-                                                                "CORRECTION_APPLIED typed={:?} target={:?} delete={}",
-                                                                typed,
-                                                                target,
-                                                                delete_count
-                                                            );
-                                                            let _ = app_handle.emit(
-                                                                EVT_CORRECTION_APPLIED,
-                                                                CorrectionAppliedEvent {
-                                                                    typed: typed.clone(),
-                                                                    target: target.clone(),
-                                                                    undo: false,
-                                                                },
-                                                            );
-                                                            last_correction = Some(LastCorrection {
-                                                                typed,
-                                                                target,
-                                                                boundary: c,
-                                                                fired_at_ms: now_ms(),
-                                                            });
-                                                            // The tap suppresses the
-                                                            // injection's echo, so
-                                                            // the engine won't see
-                                                            // the text change — reset
-                                                            // the line to mirror the
-                                                            // corrected state (same
-                                                            // precedent as the
-                                                            // newline reset). This
-                                                            // also drops the
-                                                            // just-sealed typed word's
-                                                            // Pending record (it
-                                                            // idle-abandons), so the
-                                                            // engine never learns from
-                                                            // its own fix.
-                                                            tokenizer.reset_line();
-                                                            line_buf.clear();
-                                                            line_dwells.clear();
-                                                            caret = 0;
-                                                            anchors.clear();
-                                                            let _ = app_handle.emit(EVT_LINE_RESET, ());
-                                                            let snap = anchors.snapshot();
-                                                            let _ = app_handle.emit(
-                                                                EVT_ANCHOR_SNAPSHOT,
-                                                                anchor_emit_payload(&snap, &line_buf),
-                                                            );
-                                                            corrected = true;
-                                                        }
+                                                    if let Some((typed, target, _word_len)) = fire {
+                                                        // M3 SUGGEST: do NOT auto-
+                                                        // correct. OFFER the fix and
+                                                        // arm the Tab shield; the
+                                                        // user's text stays exactly
+                                                        // as typed (no injection, no
+                                                        // line reset) until they
+                                                        // press Tab to accept. Normal
+                                                        // seal processing continues
+                                                        // (corrected stays false).
+                                                        tracing::info!(
+                                                            "CORRECTION_SUGGEST typed={:?} target={:?}",
+                                                            typed,
+                                                            target
+                                                        );
+                                                        let _ = app_handle.emit(
+                                                            EVT_CORRECTION_SUGGEST,
+                                                            SuggestEvent {
+                                                                typed: typed.clone(),
+                                                                target: target.clone(),
+                                                            },
+                                                        );
+                                                        send_tab_shield(&mut sidecar_child, true);
+                                                        suggestion = Some(LiveSuggestion {
+                                                            typed,
+                                                            target,
+                                                            boundary: c,
+                                                            fired_at_ms: now_ms(),
+                                                        });
                                                     }
                                                 }
                                             } else {
@@ -3055,32 +3063,29 @@ pub fn spawn<R: Runtime>(
                                             // and the revisit case (a
                                             // mid-line edit may have
                                             // flipped a previously-resolved
-                                            // record). Skipped when a
-                                            // correction just reset the line
-                                            // (it emitted its own snapshot).
-                                            if !corrected {
-                                                tick_resolver(
-                                                    &app_handle,
-                                                    &mut resolver,
-                                                    &mut motor_resolver,
-                                                    &anchors,
-                                                    &line_buf,
-                                                    caret,
-                                                    &mut ledger,
-                                                    &mut motor_ledger,
-                                                    &mut proposer,
-                                                    &mut motor_map,
-                                                    &mut word_patterns,
-                                                    &mut guess_ledger,
-                                                    &mut funnel,
-                                                    &mut tally,
-                                                );
-                                                let snap = anchors.snapshot();
-                                                let _ = app_handle.emit(
-                                                    EVT_ANCHOR_SNAPSHOT,
-                                                    anchor_emit_payload(&snap, &line_buf),
-                                                );
-                                            }
+                                            // record). (SUGGEST never resets
+                                            // the line, so this always runs.)
+                                            tick_resolver(
+                                                &app_handle,
+                                                &mut resolver,
+                                                &mut motor_resolver,
+                                                &anchors,
+                                                &line_buf,
+                                                caret,
+                                                &mut ledger,
+                                                &mut motor_ledger,
+                                                &mut proposer,
+                                                &mut motor_map,
+                                                &mut word_patterns,
+                                                &mut guess_ledger,
+                                                &mut funnel,
+                                                &mut tally,
+                                            );
+                                            let snap = anchors.snapshot();
+                                            let _ = app_handle.emit(
+                                                EVT_ANCHOR_SNAPSHOT,
+                                                anchor_emit_payload(&snap, &line_buf),
+                                            );
                                         }
                                     }
                                     _ => {
@@ -3313,10 +3318,12 @@ pub fn spawn<R: Runtime>(
                             // M3 Step 1 master gate — the instant global on/off.
                             // Persist + echo so the tray check and panel switch
                             // converge on the engine's authoritative state. Turn
-                            // OFF disarms any pending undo (no fix to revert).
+                            // OFF dismisses any live suggestion + disarms the Tab
+                            // shield (nothing to accept).
                             if allow_list.set_enabled(enabled) {
-                                if !enabled {
-                                    last_correction = None;
+                                if !enabled && suggestion.take().is_some() {
+                                    send_tab_shield(&mut sidecar_child, false);
+                                    let _ = app_handle.emit(EVT_CORRECTION_DISMISS, ());
                                 }
                                 tracing::info!("CORRECTION_GATE enabled={enabled}");
                                 persist_and_emit_allow_list(
@@ -3365,6 +3372,17 @@ pub fn spawn<R: Runtime>(
                     // reloads converge to truth without waiting for a
                     // transition.
                     watchdog_ticks = watchdog_ticks.wrapping_add(1);
+
+                    // M3 SUGGEST: time out a live offer the user neither accepted
+                    // nor typed past (e.g. they paused). Dismiss + disarm the Tab
+                    // shield so Tab passes through normally again.
+                    if let Some(sg) = suggestion.as_ref() {
+                        if now_ms().saturating_sub(sg.fired_at_ms) > SUGGEST_WINDOW_MS {
+                            suggestion = None;
+                            send_tab_shield(&mut sidecar_child, false);
+                            let _ = app_handle.emit(EVT_CORRECTION_DISMISS, ());
+                        }
+                    }
 
                     // C5a verdict state machine: Kept / Abandoned fire on
                     // elapsed idle, so the resolver must tick even when no
@@ -3471,6 +3489,7 @@ pub fn spawn<R: Runtime>(
                         funnel.dump();
                         // Read-only kill-switch observability (no injection).
                         dump_classifications(&word_patterns);
+                        dump_auto_fire_classifications(&word_patterns);
                         // Observe-only guesser accuracy readout (no injection).
                         dump_guess_accuracy(&guess_ledger);
                     }

@@ -133,16 +133,11 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
     let menu = Menu::with_items(
         app,
         &[
-            &open_main,
-            &practice,
-            &progress,
-            &sep_a,
+            &open_main, &practice, &progress, &sep_a,
             // &corr_toggle,  // hidden for now — see note above
             // &corrections,  // hidden for now — see note above
             // &sep_b,
-            &settings,
-            &sep_c,
-            &quit,
+            &settings, &sep_c, &quit,
         ],
     )?;
 
@@ -597,13 +592,26 @@ pub fn run() {
                     });
             }
 
-            // M3 correction Step 1 — the visible cue. On every applied
-            // correction (and its undo) briefly show the small HUD near the
-            // top-right of the screen, then hide it. Rust owns show / position /
+            // M3 SUGGEST — the visible cue/bubble. Rust owns show / position /
             // hide so the cue needs no positioner JS dependency and is shown
             // WITHOUT focus (the window is also `focus: false`), so it never
             // steals the caret from the app the user is typing in. The cue
-            // webview renders the `typed → target` text from the same event.
+            // webview renders the text from each event.
+            //
+            //   suggest  → show the offer bubble and KEEP it up (until accept /
+            //              dismiss / timeout drives one of the events below).
+            //   applied  → the user accepted; flash briefly, then hide.
+            //   dismiss  → the user kept typing / it timed out; hide now.
+            {
+                let handle = app.handle().clone();
+                app.handle()
+                    .listen(engine::EVT_CORRECTION_SUGGEST, move |_| {
+                        if let Some(w) = handle.get_webview_window("cue") {
+                            let _ = w.move_window(Position::TopRight);
+                            let _ = w.show();
+                        }
+                    });
+            }
             {
                 let handle = app.handle().clone();
                 app.handle()
@@ -613,9 +621,18 @@ pub fn run() {
                             let _ = w.show();
                             let w_hide = w.clone();
                             tauri::async_runtime::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
                                 let _ = w_hide.hide();
                             });
+                        }
+                    });
+            }
+            {
+                let handle = app.handle().clone();
+                app.handle()
+                    .listen(engine::EVT_CORRECTION_DISMISS, move |_| {
+                        if let Some(w) = handle.get_webview_window("cue") {
+                            let _ = w.hide();
                         }
                     });
             }

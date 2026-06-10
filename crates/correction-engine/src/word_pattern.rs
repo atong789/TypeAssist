@@ -506,9 +506,8 @@ pub fn normalize_word(s: &str) -> String {
 }
 
 /// Levenshtein distance (unit costs) between two normalized words. `pub` so the
-/// observe-only guesser scoreboard ([`crate::guess_ledger`]) can tag whether a
-/// scored `typed → target` pair falls within the typo-fix guard, using the same
-/// metric this store's capture guard uses.
+/// kill-switch's auto-fire classifier reads jumble severity from the same metric
+/// the capture guard uses, and the host can surface it in the observe-only dump.
 pub fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
