@@ -15,10 +15,10 @@
       {
         "label": "main",
         "title": "TypeAssist",
-        "width": 960,
-        "height": 800,
-        "minHeight": 720,
-        "resizable": true,
+        "width": 780,
+        "height": 620,
+        "resizable": false,
+        "center": true,
         "visible": false
       },
       {

@@ -1,46 +1,62 @@
 <script lang="ts">
-  import Home from "./routes/Home.svelte";
-  import Settings from "./routes/Settings.svelte";
-  import WarmUp from "./routes/WarmUp.svelte";
-  import Today from "./routes/Today.svelte";
-  import DebugPanel from "./routes/DebugPanel.svelte";
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
+  import DebugPanel from "./routes/DebugPanel.svelte";
+  import Home from "./routes/Home.svelte";
 
   // Builder's debug view — hidden behind Cmd+Shift+D. Not a user feature.
   let debugOpen = false;
 
-  // Practice is no longer a sidebar destination — it lives in its own menu-bar
-  // panel window (opened from the tray), not the main app's routes.
-  type Route = "home" | "today" | "warmup" | "settings";
+  // ---- Shell navigation -------------------------------------------------
+  // Front-end rebuild, shell only. The locked design: FOUR primary tabs, then a
+  // three-tier utility group at the bottom — Feedback as a soft accent
+  // invitation ("Tell me what you think"), then About + Privacy & Terms of
+  // Service as tiny muted links. Each opens a PLACEHOLDER panel for now; real
+  // screen content is built one at a time next.
+  type Route =
+    | "home"
+    | "today"
+    | "progress"
+    | "settings"
+    | "feedback"
+    | "about"
+    | "privacy";
 
-  const items: { route: Route; label: string }[] = [
-    { route: "home", label: "Home" },
-    { route: "today", label: "Today" },
-    // The in-app "Warm-up" screen is hidden for now: "Warm-up" is being used
-    // for the menu-bar panel (the renamed Practice), so we surface only that one
-    // to avoid two things called "Warm-up". The route, import, and render branch
-    // below are kept intact — restore this entry to bring the in-app screen back.
-    // { route: "warmup", label: "Warm-up" },
-    { route: "settings", label: "Settings" },
+  // Only these four are tabs (a WAI-ARIA roving tablist). Icons are Tabler,
+  // bundled locally (see main.ts) — never a CDN.
+  const tabs: { route: Route; label: string; icon: string }[] = [
+    { route: "home", label: "Home", icon: "ti-home" },
+    { route: "today", label: "Today", icon: "ti-sun" },
+    { route: "progress", label: "Progress", icon: "ti-chart-bar" },
+    { route: "settings", label: "Settings", icon: "ti-settings" },
   ];
+
+  // The utility destinations are NOT tabs — Feedback is the accent invite,
+  // About / Privacy are muted footer links. Titles for the placeholder panels.
+  const utilityTitles: Record<string, string> = {
+    feedback: "Feedback",
+    about: "About",
+    privacy: "Privacy & Terms of Service",
+  };
 
   let route: Route = "home";
   let tabEls: HTMLButtonElement[] = [];
 
-  // Sidebar is a WAI-ARIA vertical tablist with roving tabindex:
+  $: activeLabel =
+    tabs.find((t) => t.route === route)?.label ?? utilityTitles[route] ?? "";
+
+  // Sidebar tablist with roving tabindex (the four primary tabs only):
   //  - one tab stop (the selected tab); Tab enters here, Tab again exits to the
-  //    panel's interactive content, Shift+Tab reverses.
-  //  - Up/Down (wrapping) and Home/End move focus between tabs.
-  //  - MANUAL activation: arrows only move focus; Enter/Space (or click) selects.
-  //    Chosen over auto-activation so a stray arrow press never changes screens
-  //    — fewer accidental navigations for motor-impaired users.
-  function selectIndex(i: number) {
-    route = items[i].route;
+  //    Feedback invite → footer links → panel content; Shift+Tab reverses.
+  //  - Up/Down (wrapping) and Home/End move focus between the four tabs.
+  //  - MANUAL activation: arrows only move focus; Enter/Space (or click) selects
+  //    — so a stray arrow never changes screens (fewer accidental navigations).
+  function selectTab(i: number) {
+    route = tabs[i].route;
   }
 
   function onTabKeydown(event: KeyboardEvent, index: number) {
-    const count = items.length;
+    const count = tabs.length;
     let next: number;
     switch (event.key) {
       case "ArrowDown":
@@ -56,35 +72,84 @@
         next = count - 1;
         break;
       default:
-        // Enter/Space activate the focused tab natively; Tab exits the list.
-        return;
+        return; // Enter/Space activate natively; Tab exits the list.
     }
     event.preventDefault();
     tabEls[next]?.focus();
   }
 
-  // Route changes requested by a child view (e.g. Home's "Start" → Warm-up).
-  function handleNavigate(event: CustomEvent<string>) {
-    route = event.detail as Route;
+  // Blur whatever the webview currently has focused (→ document.body). Used on
+  // hide so the last-focused element doesn't keep its :focus for WebKit to
+  // restore on the next open. The ring is a plain :focus outline (no class), so
+  // blur() removes it; with focus cleared while hidden, the show repaint is
+  // clean.
+  function clearFocus() {
+    const active = document.activeElement as HTMLElement | null;
+    if (active && active !== document.body) active.blur?.();
+  }
+
+  // Land keyboard focus on the currently-selected tab so Up/Down works
+  // immediately, with EXACTLY ONE focus ring. Applied twice:
+  //   - next animation frame (after the window is shown), and
+  //   - again ~120ms later as a safety net, because WebKit can restore the
+  //     previously-focused element a beat AFTER our rAF runs (that late restore
+  //     is what left a second ring). The re-apply only corrects a genuine
+  //     desync (active ≠ the selected tab), so it never yanks focus from a clean
+  //     state. The ring shows because the tab style is on :focus (not
+  //     :focus-visible). No-op for a non-tab route (the tray only routes to tabs).
+  function focusSelectedTab() {
+    const apply = (force: boolean) => {
+      const el = tabEls[tabs.findIndex((t) => t.route === route)];
+      if (!el) return;
+      const active = document.activeElement as HTMLElement | null;
+      if (!force && active === el) return; // already correct — don't disturb it
+      if (active && active !== el) active.blur?.();
+      el.focus({ preventScroll: true });
+    };
+    requestAnimationFrame(() => apply(true));
+    setTimeout(() => apply(false), 120);
   }
 
   // Menu-bar entry: the tray's "Open TypeAssist" / "Settings" items show this
-  // (otherwise hidden) window and ask it to land on a specific route. The
-  // webview stays loaded across hide/show, so this listener is registered once.
+  // (otherwise hidden) window and ask it to land on a route. The webview stays
+  // loaded across hide/show, so this listener is registered once; `app://route`
+  // fires on EVERY re-show, so re-focusing here covers each menu-bar open.
   onMount(() => {
-    const unlisten = listen<string>("app://route", (e) => {
+    const unlistenRoute = listen<string>("app://route", (e) => {
       const target = e.payload as Route;
-      route = target;
+      if (tabs.some((t) => t.route === target) || target in utilityTitles) {
+        route = target;
+      }
+      focusSelectedTab();
     });
+
+    // Deterministic hide signal from Rust (the main window only hides; emitted
+    // in its CloseRequested handler). visibilitychange does NOT fire on a native
+    // menu-bar hide, so this is the reliable trigger to clear focus while
+    // hidden — nothing stale then survives to be restored on the next open.
+    const unlistenHidden = listen("app://main-hidden", () => clearFocus());
+
+    // Belt-and-suspenders for platforms/cases where visibilitychange DOES fire
+    // (and a plain app-switch keeps the window visible, so it won't fire then —
+    // Cmd-Tabbing away never disturbs focus).
+    function onVisibilityChange() {
+      if (document.hidden) clearFocus();
+      else focusSelectedTab();
+    }
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    // First open (and any case where the window is already visible at mount).
+    focusSelectedTab();
     return () => {
-      unlisten.then((off) => off());
+      unlistenRoute.then((off) => off());
+      unlistenHidden.then((off) => off());
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   });
 
   // Focus trap: keep keyboard focus inside the app's controls. In a WebView,
   // Tab past the last focusable element hands focus to the host window — a
-  // ringless, non-DOM location — before it wraps. So we wrap it ourselves:
-  // Tab on the last control → first; Shift+Tab on the first → last.
+  // ringless, non-DOM location — before it wraps. So we wrap it ourselves.
   let rootEl: HTMLElement;
 
   function realTabbables(): HTMLElement[] {
@@ -99,8 +164,6 @@
   }
 
   function onWindowKeydown(event: KeyboardEvent) {
-    // Cmd+Shift+D toggles the builder's debug panel. Caught here so it works
-    // from any screen and doesn't depend on focus being inside the panel.
     if (event.metaKey && event.shiftKey && (event.key === "d" || event.key === "D")) {
       event.preventDefault();
       debugOpen = !debugOpen;
@@ -115,7 +178,6 @@
     if (!active || !rootEl.contains(active)) return;
 
     if (!event.shiftKey) {
-      // Forward: wrap to first if focus is at or past the last tabbable.
       const atOrPastLast =
         active === last ||
         (active.compareDocumentPosition(last) & Node.DOCUMENT_POSITION_PRECEDING) !== 0;
@@ -124,7 +186,6 @@
         first.focus();
       }
     } else {
-      // Backward: wrap to last if focus is at or before the first tabbable.
       const atOrBeforeFirst =
         active === first ||
         (active.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
@@ -134,16 +195,15 @@
       }
     }
   }
-
 </script>
 
-<!-- Focus trap: keeps keyboard focus within the app's interactive controls (see script). -->
+<!-- Focus trap: keeps keyboard focus within the app's interactive controls. -->
 <svelte:window on:keydown={onWindowKeydown} />
 
 <main bind:this={rootEl}>
   <nav aria-label="Primary">
     <div class="tabs" role="tablist" aria-orientation="vertical">
-      {#each items as item, i}
+      {#each tabs as item, i}
         <button
           role="tab"
           id={`tab-${item.route}`}
@@ -152,18 +212,48 @@
           tabindex={route === item.route ? 0 : -1}
           class:active={route === item.route}
           bind:this={tabEls[i]}
-          on:click={() => selectIndex(i)}
+          on:click={() => selectTab(i)}
           on:keydown={(e) => onTabKeydown(e, i)}
-        >{item.label}</button>
+        >
+          <i class={`ti ${item.icon}`} aria-hidden="true"></i>
+          <span>{item.label}</span>
+        </button>
       {/each}
+    </div>
+
+    <div class="nav-spacer"></div>
+
+    <!-- Feedback — a soft accent invitation, not a tab. -->
+    <button
+      class="navcta"
+      class:active={route === "feedback"}
+      on:click={() => (route = "feedback")}
+    >
+      <i class="ti ti-message-dots" aria-hidden="true"></i>
+      <span>Tell me what you think</span>
+    </button>
+
+    <!-- About / Privacy — tiny muted links. -->
+    <div class="navfoot">
+      <button
+        class="navfootlink"
+        class:active={route === "about"}
+        on:click={() => (route = "about")}>About</button
+      >
+      <button
+        class="navfootlink"
+        class:active={route === "privacy"}
+        on:click={() => (route = "privacy")}>Privacy &amp; Terms of Service</button
+      >
     </div>
   </nav>
 
   <div class="panel" id="screen-panel" role="tabpanel" aria-labelledby={`tab-${route}`}>
-    {#if route === "home"}<Home on:navigate={handleNavigate} />
-    {:else if route === "today"}<Today />
-    {:else if route === "warmup"}<WarmUp on:navigate={handleNavigate} />
-    {:else if route === "settings"}<Settings />
+    {#if route === "home"}
+      <Home />
+    {:else}
+      <header class="screen-header"><h1>{activeLabel}</h1></header>
+      <p class="placeholder">Shell only — this screen’s content is coming next.</p>
     {/if}
   </div>
 </main>
@@ -175,11 +265,13 @@
 <style>
   main {
     display: grid;
-    grid-template-columns: 220px 1fr;
+    grid-template-columns: 206px 1fr;
     height: 100vh;
   }
   nav {
-    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    padding: 1rem 0.85rem;
     border-right: 1px solid var(--hairline);
   }
   .tabs {
@@ -187,13 +279,22 @@
     flex-direction: column;
     gap: 0.25rem;
   }
-  nav button {
+  /* Grows to push the utility group (Feedback invite + footer links) to the
+     bottom of the sidebar. */
+  .nav-spacer {
+    flex: 1;
+    min-height: 1rem;
+  }
+
+  /* ---- Primary tabs ---------------------------------------------------- */
+  nav button[role="tab"] {
     /* Large, mouse-forgiving target: >= 44px tall, full sidebar width. */
     display: flex;
     align-items: center;
+    gap: 0.65rem;
     min-height: 44px;
     text-align: left;
-    padding: 0.5rem 0.85rem;
+    padding: 0.5rem 0.8rem;
     background: transparent;
     border: 1px solid transparent;
     border-radius: 8px;
@@ -201,51 +302,102 @@
     color: inherit;
     cursor: pointer;
   }
-  /* "Hover" — a faint NEUTRAL-GREY wash, nothing more. Clearly secondary:
-     "you could click this". Distinct in hue from the accent-tinted active
-     state, so a hovered item never looks selected. */
-  nav button:hover {
+  nav button[role="tab"] .ti {
+    font-size: 1.2rem;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+  nav button[role="tab"]:hover {
     background: color-mix(in srgb, canvastext 6%, canvas);
   }
-  /* "Current screen" — a persistent ACCENT-TINTED fill + bold label + a solid
-     accent bar down the left edge. Tinted (blue), not grey, so it can't be
-     mistaken for hover; filled, not an outline, so it can't be mistaken for the
-     keyboard-focus ring. State is conveyed by weight + bar + tint, not colour
-     alone. */
-  nav button.active {
+  /* Current screen: accent-tinted fill + bold label + left accent bar. Tinted
+     (not grey) so it can't read as hover; filled (not outline) so it can't read
+     as the focus ring. */
+  nav button[role="tab"].active {
     background: color-mix(in srgb, var(--focus-ring) 16%, canvas);
     font-weight: 600;
     box-shadow: inset 4px 0 0 0 var(--focus-ring);
   }
-  /* Hovering the current screen keeps the active look (this rule's source order
-     wins over :hover at equal specificity). */
-  nav button.active:hover {
+  nav button[role="tab"].active .ti {
+    color: var(--focus-ring);
+  }
+  nav button[role="tab"].active:hover {
     background: color-mix(in srgb, var(--focus-ring) 22%, canvas);
   }
-  /* "Keyboard focus" — a blue RING. Shape is clearly distinct from the filled
-     active state above. On :focus (not just :focus-visible) so it's always shown. */
+
+  /* ---- Feedback: soft accent invitation (not a tab) -------------------- */
+  .navcta {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    width: 100%;
+    min-height: 42px;
+    text-align: left;
+    padding: 0.55rem 0.8rem;
+    margin-bottom: 0.6rem;
+    font: inherit;
+    font-size: 0.92rem;
+    color: color-mix(in srgb, var(--focus-ring) 85%, canvastext);
+    background: color-mix(in srgb, var(--focus-ring) 10%, canvas);
+    border: 1px solid color-mix(in srgb, var(--focus-ring) 30%, canvas);
+    border-radius: 9px;
+    cursor: pointer;
+  }
+  .navcta .ti {
+    font-size: 1.1rem;
+    flex-shrink: 0;
+  }
+  .navcta:hover,
+  .navcta.active {
+    background: color-mix(in srgb, var(--focus-ring) 16%, canvas);
+  }
+
+  /* ---- About / Privacy: tiny muted links ------------------------------- */
+  .navfoot {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.15rem;
+  }
+  .navfootlink {
+    padding: 0.3rem 0.2rem;
+    background: transparent;
+    border: none;
+    border-radius: 5px;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    text-align: left;
+    cursor: pointer;
+  }
+  .navfootlink:hover,
+  .navfootlink.active {
+    color: canvastext;
+    text-decoration: underline;
+  }
+
+  /* Shared focus ring for every sidebar control (on :focus, not only
+     :focus-visible, so programmatic focus shows it too). */
   nav button:focus {
     outline: 3px solid var(--focus-ring);
     outline-offset: 2px;
   }
+
+  /* ---- Panel ----------------------------------------------------------- */
   .panel {
-    /* Vertical scroll only when content can't fit. `overflow-x: clip` stops the
-       spurious HORIZONTAL scroll container WebKit would otherwise create (CSS
-       computes overflow-x to `auto` when overflow-y is `auto` and overflow-x is
-       `visible`). That container is keyboard-focusable but never matches
-       :focus-visible — i.e. a ringless tab stop. Clip removes it entirely. */
     overflow-y: auto;
     overflow-x: clip;
     min-width: 0;
     padding: 1.5rem 2rem;
   }
-  /* If the panel ever IS a scroll stop (tall content + short window), it must
-     show a ring like every other focusable element. :focus (not just
-     :focus-visible) because WebKit focuses scroll regions without the latter.
-     Inset offset so the ring isn't clipped by the panel's own overflow. */
   .panel:focus,
   .panel:focus-visible {
     outline: 3px solid var(--focus-ring);
     outline-offset: -3px;
+  }
+  .placeholder {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
   }
 </style>

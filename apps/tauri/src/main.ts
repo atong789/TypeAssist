@@ -1,4 +1,8 @@
 import "./app.css";
+// Tabler icon font — bundled locally from node_modules (NOT a CDN), so the
+// app makes no network request for it (Principle #8). Vite bundles the woff2
+// from the package at build time.
+import "@tabler/icons-webfont/dist/tabler-icons.min.css";
 import App from "./App.svelte";
 import PracticePanel from "./routes/PracticePanel.svelte";
 import ProgressPanel from "./routes/ProgressPanel.svelte";

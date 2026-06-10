@@ -181,6 +181,51 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
     Ok(corr_toggle)
 }
 
+// ---- Main-window position memory --------------------------------------------
+// The main window is fixed-size and non-resizable; it HIDES (not closes) on
+// Cmd+W, so its position is already kept within a running session. These two
+// helpers persist that position across full app restarts. Window chrome only —
+// writes a tiny `{x,y}` file to the app config dir, never user/recovery data,
+// never ~/.typeassist.
+
+fn main_position_path<R: Runtime>(app: &AppHandle<R>) -> Option<std::path::PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|d| d.join("main-window-position.json"))
+}
+
+fn save_main_position<R: Runtime>(app: &AppHandle<R>, x: i32, y: i32) {
+    if let Some(path) = main_position_path(app) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, format!("{{\"x\":{x},\"y\":{y}}}"));
+    }
+}
+
+/// Restore the saved main-window position (if any). No-op on first run, so the
+/// window falls back to the config's `center: true`.
+fn restore_main_position<R: Runtime>(app: &AppHandle<R>) {
+    let Some(path) = main_position_path(app) else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return;
+    };
+    if let (Some(x), Some(y)) = (
+        v.get("x").and_then(serde_json::Value::as_i64),
+        v.get("y").and_then(serde_json::Value::as_i64),
+    ) {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
+        }
+    }
+}
+
 /// Show + focus the main window and route it. The main window starts hidden
 /// (menu-bar-only); the route is delivered via `app://route`, which `App.svelte`
 /// listens for. The webview stays loaded across hide/show, so its listener
@@ -561,6 +606,17 @@ pub fn run() {
             WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
+                // The main window only HIDES, never closes — so its webview's
+                // last-focused element keeps its :focus, and WebKit restores it
+                // on the next open (visibilitychange does NOT fire on a native
+                // menu-bar hide, so the JS-side blur never runs). Signal the
+                // webview explicitly so it can clear keyboard focus while
+                // hidden; otherwise the stale element shows a second focus ring
+                // on reopen. Emitted while the webview is still alive (hidden ≠
+                // destroyed), so the listener runs before the next show.
+                if window.label() == "main" {
+                    let _ = window.app_handle().emit("app://main-hidden", ());
+                }
             }
             // The Practice and Progress panels are dropdowns: clicking away
             // (losing focus) dismisses them. Practice keeps focus while typing,
@@ -572,6 +628,10 @@ pub fn run() {
             {
                 let _ = window.hide();
             }
+            // Remember where the user puts the main window, across restarts.
+            WindowEvent::Moved(pos) if window.label() == "main" => {
+                save_main_position(window.app_handle(), pos.x, pos.y);
+            }
             _ => {}
         })
         .setup(|app| {
@@ -579,6 +639,9 @@ pub fn run() {
             // before any window would otherwise activate the app in the Dock.
             #[cfg(target_os = "macos")]
             let _ = app.set_activation_policy(ActivationPolicy::Accessory);
+
+            // Put the (hidden) main window back where the user last left it.
+            restore_main_position(app.handle());
 
             let corr_toggle = build_tray(app.handle())?;
 

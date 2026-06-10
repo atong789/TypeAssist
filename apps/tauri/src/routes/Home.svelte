@@ -1,176 +1,204 @@
-<!-- Home view — a quiet landing. Greets the user, reflects today at a glance,
-     and offers (never insists on) a warm-up. Voice is warm and human; copy
-     says "helping", never "fixing". See CLAUDE.md product principles. -->
+<!-- Home — Jordan's greeting + a calm, state-aware read, with a passive invite to
+     turn on Corrections once Fluent. Home INVITES (the warm-up CTA lives on
+     Today); it carries no per-key detail (that's Progress). Renders all three
+     app states (Day one / Building back / Fluent), driven by the `appState`
+     store. Copy is verbatim from the locked front-end design. -->
 <script lang="ts">
-  import { createEventDispatcher } from "svelte";
+  import { userName, appState, APP_STATES, type AppState } from "../lib/previewSettings";
 
-  const dispatch = createEventDispatcher<{ navigate: string }>();
+  // Time-of-day greeting (the design shows "Good afternoon, …").
+  const hour = new Date().getHours();
+  const partOfDay = hour < 12 ? "morning" : hour < 18 ? "afternoon" : "evening";
+  $: greeting = `Good ${partOfDay}, ${$userName}.`;
 
-  // HIDDEN FOR NOW (display-only): the "Home invites" warm-up card below opens
-  // the in-app Warm-up screen, which is hidden so only the menu-bar "Warm-up"
-  // (the renamed Practice) shows. Flip to `true` to bring the card back, or
-  // repoint its click at the menu-bar Warm-up panel later. Kept as a flag (not
-  // deleted markup) so its styles and the `dispatch` wiring stay intact.
-  const showWarmupCard = false;
-
-  // TODO: wire to the real user name later.
-  const name = "Soumyo";
-
-  function greeting(): string {
-    const hour = new Date().getHours();
-    if (hour < 12) return "Good morning";
-    if (hour < 18) return "Good afternoon";
-    return "Good evening";
-  }
-
-  // TODO: wire to real session data from the engine later.
-  const todayNote = "A light morning so far. Your rhythm is steady.";
+  type Copy = { sub: string; body: string; today: string; status: string; invite?: string };
+  const COPY: Record<AppState, Copy> = {
+    day1: {
+      sub: "I’m Jordan, and I’m quietly learning as you type — everywhere on your Mac.",
+      body: "We’ve only just met. Right now I’m watching how your hands move across the keys — nothing more. The more you type, the more I’ll understand.",
+      today: "Glad to meet you — let’s start typing.",
+      status: "Jordan is here, quietly learning.",
+    },
+    building: {
+      sub: "Jordan is quietly learning as you type, everywhere on your Mac.",
+      body: "I’m starting to see your pattern. A few keys trip you up more than others — the detail’s in Progress whenever you want it.",
+      today: "A steady start. Your rhythm is finding itself.",
+      status: "Jordan is active.",
+    },
+    fluent: {
+      sub: "Jordan is quietly learning as you type, everywhere on your Mac.",
+      body: "I’ve got a clear picture of your hands now — your trouble spots and your gains are both in Progress.",
+      invite:
+        "I can help as you type now, if you’d like — turn on Corrections. You’ll always be the one typing.",
+      today: "Smooth so far. You’re in a good groove.",
+      status: "Jordan is active.",
+    },
+  };
+  $: copy = COPY[$appState];
 </script>
 
-<div class="home">
-  <header>
-    <h1>{greeting()}, {name}.</h1>
-    <p class="subline">TypeAssist is quietly learning as you type, everywhere on your Mac.</p>
-  </header>
+<!-- TEMPORARY dev-only preview switcher: flip the app state by hand to review
+     each. Remove once automatic detection from engine data is wired. -->
+<div class="preview" role="group" aria-label="Preview app state (developer)">
+  <span class="preview-label">Preview</span>
+  {#each APP_STATES as s}
+    <button
+      class="preview-btn"
+      class:on={$appState === s.value}
+      aria-pressed={$appState === s.value}
+      on:click={() => appState.set(s.value)}>{s.label}</button
+    >
+  {/each}
+</div>
 
-  <div class="today">
-    <span class="today-label">Today</span>
-    <span class="today-note">{todayNote}</span>
-  </div>
+<section class="home">
+  <h1 class="greeting">{greeting}</h1>
+  <p class="sub">{copy.sub}</p>
 
-  <!-- The whole card is one large, mouse-forgiving button: click anywhere to
-       start. The "Start" pill is a visible affordance only — the card itself
-       is the control, so there is a single tab stop, activatable with
-       Enter and Space. Keeping it a <button> (with phrasing-content spans, no
-       nested button or heading) keeps the markup valid and accessible.
-       Gated off for now (see `showWarmupCard`). -->
-  {#if showWarmupCard}
-    <button class="warmup" on:click={() => dispatch("navigate", "warmup")}>
-      <span class="warmup-copy">
-        <span class="warmup-title">A quick warm-up?</span>
-        <span class="warmup-desc">30 seconds to help me tune to your hands today. Entirely optional.</span>
-      </span>
-      <span class="start" aria-hidden="true">Start</span>
-    </button>
+  <hr class="rule" />
+
+  <p class="body">{copy.body}</p>
+
+  {#if copy.invite}
+    <div class="invite">
+      <i class="ti ti-bulb" aria-hidden="true"></i>
+      <span>{copy.invite}</span>
+    </div>
   {/if}
 
-  <p class="status">
-    <span class="dot" aria-hidden="true"></span>
-    Jordan is here, quietly learning.
-  </p>
-</div>
+  <hr class="rule" />
+
+  <div class="todayrow">
+    <span class="today-label">Today</span>
+    <span class="today-line">{copy.today}</span>
+  </div>
+
+  <div class="status">
+    <span class="greendot" aria-hidden="true"></span>
+    <span>{copy.status}</span>
+  </div>
+</section>
 
 <style>
   .home {
-    display: flex;
-    flex-direction: column;
-    gap: 2.5rem;
-    max-width: 880px;
+    max-width: 38rem;
   }
-
-  header h1 {
-    margin: 0 0 0.6rem;
-    font-size: 2.5rem;
-    font-weight: 700;
+  .greeting {
+    margin: 0 0 0.5rem;
+    font-size: 1.7rem;
+    font-weight: 600;
     letter-spacing: -0.02em;
+    color: canvastext;
   }
-
-  .subline {
+  .sub {
     margin: 0;
-    font-size: 1.25rem;
+    font-size: 1rem;
+    line-height: 1.6;
     color: var(--text-secondary);
   }
+  .rule {
+    border: none;
+    border-top: 1px solid var(--hairline);
+    margin: 1.1rem 0;
+  }
+  .body {
+    margin: 0;
+    font-size: 1rem;
+    line-height: 1.6;
+    color: canvastext;
+  }
 
-  .today {
+  /* Passive Corrections invite (Fluent only) — accent-tinted, never a button.
+     "turn on Corrections" is copy; Corrections is turned on from the menu or
+     Settings. */
+  .invite {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    margin: 1rem 0 0;
+    padding: 0.75rem 0.9rem;
+    border-radius: 10px;
+    font-size: 0.95rem;
+    line-height: 1.5;
+    color: canvastext;
+    background: color-mix(in srgb, var(--focus-ring) 10%, canvas);
+    border: 1px solid color-mix(in srgb, var(--focus-ring) 28%, canvas);
+  }
+  .invite .ti {
+    font-size: 1.1rem;
+    color: var(--focus-ring);
+    flex-shrink: 0;
+    margin-top: 0.05rem;
+  }
+
+  .todayrow {
     display: flex;
     align-items: baseline;
-    gap: 1rem;
-    padding: 1.1rem 0;
-    border-top: 1px solid var(--hairline);
-    border-bottom: 1px solid var(--hairline);
+    gap: 0.85rem;
   }
-
   .today-label {
     font-weight: 600;
+    color: canvastext;
   }
-
-  .today-note {
+  .today-line {
     color: var(--text-secondary);
-  }
-
-  /* The entire card is the button. Reset native button styling and lay it out
-     like a card; large target spanning the content width. */
-  .warmup {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1.5rem;
-    width: 100%;
-    padding: 1.5rem 1.75rem;
-    font: inherit;
-    color: inherit;
-    text-align: left;
-    background: transparent;
-    border: 1px solid var(--hairline);
-    border-radius: 14px;
-    cursor: pointer;
-  }
-
-  .warmup:hover {
-    background: color-mix(in srgb, canvastext 6%, canvas);
-  }
-
-  .warmup:focus {
-    outline: 3px solid var(--focus-ring);
-    outline-offset: 3px;
-  }
-
-  .warmup-copy {
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-  }
-
-  .warmup-title {
-    font-size: 1.2rem;
-    font-weight: 600;
-  }
-
-  .warmup-desc {
-    line-height: 1.5;
-    color: var(--text-secondary);
-  }
-
-  /* Visible affordance only (aria-hidden); the card around it is the control. */
-  .start {
-    flex-shrink: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 44px;
-    padding: 0.6rem 1.5rem;
-    font-weight: 600;
-    border: 1px solid color-mix(in srgb, canvastext 28%, canvas);
-    border-radius: 10px;
-  }
-
-  .warmup:hover .start {
-    background: color-mix(in srgb, canvastext 10%, canvas);
   }
 
   .status {
     display: flex;
     align-items: center;
-    gap: 0.55rem;
-    margin: 0;
+    gap: 0.6rem;
+    margin-top: 1.6rem;
     font-size: 0.95rem;
     color: var(--text-secondary);
   }
-
-  .dot {
+  /* "Jordan is active" indicator. Green reads as live in both light and dark. */
+  .greendot {
     width: 9px;
     height: 9px;
     border-radius: 50%;
-    background: #34c759;
+    background: #28c840;
+    flex-shrink: 0;
+  }
+
+  /* ---- temporary preview switcher (dev only) ---- */
+  .preview {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    margin: 0 0 1.5rem;
+    padding: 0.3rem 0.4rem;
+    border: 1px dashed var(--hairline);
+    border-radius: 9px;
+    width: fit-content;
+  }
+  .preview-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+    padding: 0 0.4rem;
+  }
+  .preview-btn {
+    font: inherit;
+    font-size: 0.8rem;
+    padding: 0.3rem 0.6rem;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+  .preview-btn:hover {
+    background: color-mix(in srgb, canvastext 6%, canvas);
+  }
+  .preview-btn.on {
+    background: color-mix(in srgb, var(--focus-ring) 16%, canvas);
+    color: canvastext;
+    font-weight: 600;
+  }
+  .preview-btn:focus {
+    outline: 3px solid var(--focus-ring);
+    outline-offset: 2px;
   }
 </style>
