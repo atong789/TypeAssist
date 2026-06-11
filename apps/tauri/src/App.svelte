@@ -1,14 +1,38 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick, type ComponentType } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import DebugPanel from "./routes/DebugPanel.svelte";
   import Home from "./routes/Home.svelte";
   import Today from "./routes/Today.svelte";
   import Progress from "./routes/Progress.svelte";
   import Settings from "./routes/Settings.svelte";
-  import PreviewSwitcher from "./lib/PreviewSwitcher.svelte";
   import FeedbackDialog from "./lib/FeedbackDialog.svelte";
+  import Onboarding from "./routes/Onboarding.svelte";
   import { modalOpen } from "./lib/modal";
+  import { onboarded, appState } from "./lib/previewSettings";
+
+  // DEV-ONLY preview-state switcher. Loaded via a dynamic import GUARDED by
+  // import.meta.env.DEV so a production build folds the branch to `false`, drops
+  // the import, and never emits the component's JS *or* CSS chunk — it is
+  // excluded from a release entirely, not merely hidden.
+  let PreviewSwitcher: ComponentType | null = null;
+  if (import.meta.env.DEV) {
+    import("./lib/PreviewSwitcher.svelte").then((m) => (PreviewSwitcher = m.default));
+  }
+
+  // First-run onboarding gates the shell. On "Get started" (or a restore), it
+  // completes and drops the user onto Today in Day one — observe-only, NOT a
+  // warm-up — so the first day breathes.
+  async function completeOnboarding() {
+    appState.set("day1");
+    route = "today";
+    onboarded.set(true);
+    // Let the shell mount (tabEls + navRovingIndex update for "today"), then land
+    // the focus ring on the Today nav item via the same deterministic nav focus
+    // used on every tab switch.
+    await tick();
+    focusSelectedTab();
+  }
 
   // Feedback opens as a modal (not a sidebar route). Focus the CTA before opening
   // so the modal records it and returns focus to it on close (WebKit doesn't
@@ -240,7 +264,10 @@
 <!-- Focus trap: keeps keyboard focus within the app's interactive controls. -->
 <svelte:window on:keydown={onWindowKeydown} />
 
-<main bind:this={rootEl}>
+{#if !$onboarded}
+  <Onboarding on:done={completeOnboarding} />
+{:else}
+  <main bind:this={rootEl}>
   <nav class="sidebar" aria-label="Primary">
     <div class="tabs" role="tablist" aria-orientation="vertical">
       {#each tabs as item, i}
@@ -263,9 +290,12 @@
   </nav>
 
   <div class="panel" id="screen-panel" role="tabpanel" aria-labelledby={`tab-${route}`}>
-    <!-- TEMPORARY: dev preview-state switcher, shared across every state-aware
-         screen. Remove with automatic state detection. -->
-    <PreviewSwitcher />
+    <!-- TEMPORARY, DEV-ONLY: preview-state switcher (loaded only in dev — see the
+         guarded dynamic import above). Absent from release builds entirely.
+         Remove with automatic state detection. -->
+    {#if PreviewSwitcher}
+      <svelte:component this={PreviewSwitcher} />
+    {/if}
     {#if route === "home"}
       <Home />
     {:else if route === "today"}
@@ -304,7 +334,8 @@
       >
     </div>
   </nav>
-</main>
+  </main>
+{/if}
 
 {#if debugOpen}
   <DebugPanel />

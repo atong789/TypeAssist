@@ -309,6 +309,28 @@ fn open_corrections(app: AppHandle) {
     show_corrections(&app);
 }
 
+/// Tauri command: open System Settings ▸ Privacy & Security ▸ Accessibility so the
+/// user can grant the one permission TypeAssist needs (read keystrokes), used by
+/// the first-run onboarding. Pure UI convenience — it launches the OS settings
+/// pane and reads/writes no user data.
+#[tauri::command]
+fn open_accessibility_settings() {
+    let _ = std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        .spawn();
+}
+
+/// Tauri command: bring the main window back to the front. Used by onboarding
+/// step 2 after the Accessibility grant — System Settings is frontmost at that
+/// point, so we re-activate our own window (we never force-close System Settings).
+#[tauri::command]
+fn focus_main_window(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
 /// Tauri command: flip the global correction master gate. The panel's master
 /// switch posts this; the engine persists + echoes `corrections://state`, which
 /// the panel and the tray check both render from. (The tray check has its own
@@ -592,6 +614,8 @@ pub fn run() {
             open_practice,
             open_progress,
             open_corrections,
+            open_accessibility_settings,
+            focus_main_window,
             set_correction_enabled,
             set_pattern_enabled,
             request_allow_list,

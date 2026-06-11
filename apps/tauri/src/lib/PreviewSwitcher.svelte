@@ -4,7 +4,7 @@
      (rendered once in App.svelte), not in any one screen. Remove this component
      and its mount when automatic state detection from engine data is wired. -->
 <script lang="ts">
-  import { appState, APP_STATES } from "./previewSettings";
+  import { appState, APP_STATES, onboarded } from "./previewSettings";
 </script>
 
 <div class="preview" role="group" aria-label="Preview app state (developer)">
@@ -17,6 +17,8 @@
       on:click={() => appState.set(s.value)}>{s.label}</button
     >
   {/each}
+  <span class="preview-sep" aria-hidden="true"></span>
+  <button class="preview-btn" on:click={() => onboarded.set(false)}>Replay onboarding</button>
 </div>
 
 <style>
@@ -58,5 +60,11 @@
   .preview-btn:focus {
     outline: 3px solid var(--focus-ring);
     outline-offset: 2px;
+  }
+  .preview-sep {
+    width: 1px;
+    align-self: stretch;
+    margin: 0.1rem 0.3rem;
+    background: var(--hairline);
   }
 </style>

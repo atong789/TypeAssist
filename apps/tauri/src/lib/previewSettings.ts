@@ -41,3 +41,8 @@ function persisted<T>(key: string, fallback: T): Writable<T> {
 
 export const userName = persisted<string>("ta.userName", "Soumyo");
 export const appState = persisted<AppState>("ta.appState", "fluent");
+
+// First-run onboarding shows once, before the shell, until completed. Persisted so
+// it never reappears after the user finishes (or restores from a backup). The dev
+// Preview switcher exposes a "Replay onboarding" reset to review it again.
+export const onboarded = persisted<boolean>("ta.onboarded", false);

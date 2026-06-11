@@ -15,6 +15,8 @@
   import { appState } from "../lib/previewSettings";
   import { loadSpellingPref, saveSpellingPref, type SpellingPref } from "../lib/locale";
   import Modal from "../lib/Modal.svelte";
+  import RestoreDialog from "../lib/RestoreDialog.svelte";
+  import { backUp, deleteEverything } from "../lib/dataActions";
 
   // ---- Warm-up language — reuses the existing locale pref (Practice reads it).
   let lang: SpellingPref = "system";
@@ -55,37 +57,23 @@
     };
   });
 
-  // ---- Data actions (UI + dialogs built; file I/O stubbed) -------------------
+  // ---- Data actions (UI + dialogs built; file I/O stubbed in lib/dataActions) ---
   let restoreOpen = false;
   let deleteOpen = false;
   let lastBackup: string | null = null;
   let deleteCancelBtn: HTMLButtonElement | undefined;
 
-  function backupFilename(): string {
-    const d = new Date();
-    const p = (n: number) => String(n).padStart(2, "0");
-    return `TypeAssist-backup-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.tabackup`;
-  }
-
-  // Export ALL learned data to one dated file via the macOS save dialog.
-  // Async so callers can AWAIT the save before chaining the next step (e.g. the
-  // Restore picker) once the real I/O lands.
-  async function backUp() {
-    // TODO(data-layer): await tauri-plugin-dialog save() → write a bundle of the
-    // on-device store (motor_map.json, word_patterns.json, key scores, …) to the
-    // chosen path. No cloud — the save dialog already exposes iCloud / USB / folders.
-    lastBackup = backupFilename(); // stub: record the name (UI + delete guardrail use it)
-    console.info("[stub] back up →", lastBackup);
+  // The main "Back up" button + the delete-guardrail backup record the filename
+  // locally so the delete dialog can show "Backed up — …".
+  async function doBackup() {
+    lastBackup = await backUp();
   }
 
   // Explicitly focus the trigger BEFORE opening (WebKit doesn't focus buttons on
   // click) so the modal records it as prevFocus and returns focus here on close.
   function openRestore(e: MouseEvent) {
     (e.currentTarget as HTMLElement | null)?.focus();
-    // TODO(data-layer): warn only if the app actually HAS data; using the preview
-    // state as a stand-in for "has learned data" for now.
-    if ($appState === "day1") doRestore();
-    else restoreOpen = true;
+    restoreOpen = true;
   }
   function openDelete(e: MouseEvent) {
     (e.currentTarget as HTMLElement | null)?.focus();
@@ -94,27 +82,12 @@
   // "Back up now" inside the delete modal removes its own button (the guardrail
   // flips to "Backed up — …"), so move focus to a stable control in the dialog.
   async function backupNow() {
-    await backUp();
+    await doBackup();
     tick().then(() => deleteCancelBtn?.focus());
-  }
-  function doRestore() {
-    // TODO(data-layer): open dialog → pick a backup → REPLACE the current data
-    // with that snapshot (never merge — merging double-counts the statistics).
-    console.info("[stub] restore (replace, never merge)");
-    restoreOpen = false;
-  }
-  // "Back up current first" — wait for the save to finish, THEN flow straight into
-  // the restore file-picker (never stop after the backup).
-  async function backupThenRestore() {
-    await backUp();
-    doRestore();
   }
 
   function confirmDelete() {
-    // TODO(data-layer): erase ALL learned data on disk (motor map, word patterns,
-    // snapshots, key scores, allow-list patterns) so the app truly starts fresh.
-    console.info("[stub] delete everything");
-    appState.set("day1"); // return the app to Day one
+    deleteEverything(); // erases on-device data + returns the app to Day one
     deleteOpen = false;
   }
 </script>
@@ -189,7 +162,7 @@
   <p class="group-sub">
     A copy of what TypeAssist has learned about your hands — kept only on this Mac.
   </p>
-  <button class="btn-primary" on:click={backUp}>
+  <button class="btn-primary" on:click={doBackup}>
     <i class="ti ti-download" aria-hidden="true"></i> Back up
   </button>
   <p class="help">
@@ -202,21 +175,12 @@
   </div>
 </section>
 
-<!-- Restore — warning modal -->
+<!-- Restore — the shared guarded warning dialog (also used by Onboarding). -->
 {#if restoreOpen}
-  <Modal titleId="restore-title" on:cancel={() => (restoreOpen = false)}>
-    <h2 id="restore-title" class="dlg-title">Restore from a backup?</h2>
-    <p class="dlg-body">
-      Restoring replaces your current learning with the backup. Anything learned since the backup
-      will be lost.
-    </p>
-    <div class="dlg-actions">
-      <button class="btn-ghost" on:click={backupThenRestore}>Back up current first</button>
-      <div class="dlg-spacer"></div>
-      <button class="btn-ghost" on:click={doRestore}>Restore</button>
-      <button class="btn-primary" data-autofocus on:click={() => (restoreOpen = false)}>Cancel</button>
-    </div>
-  </Modal>
+  <RestoreDialog
+    on:close={() => (restoreOpen = false)}
+    on:restored={() => (restoreOpen = false)}
+  />
 {/if}
 
 <!-- Delete — confirm modal -->
@@ -393,7 +357,6 @@
 
   /* ---- buttons + links ---- */
   .btn-primary,
-  .btn-ghost,
   .btn-danger {
     display: inline-flex;
     align-items: center;
@@ -414,14 +377,6 @@
   .btn-primary:hover {
     background: color-mix(in srgb, var(--focus-ring) 88%, black);
   }
-  .btn-ghost {
-    background: transparent;
-    border: 1px solid color-mix(in srgb, canvastext 28%, canvas);
-    color: canvastext;
-  }
-  .btn-ghost:hover {
-    background: color-mix(in srgb, canvastext 6%, canvas);
-  }
   /* Destructive action — NEUTRAL muted outline (never red; the app avoids red/green
      for colour-blind safety). Destructiveness is carried by the amber alert icon,
      the copy, the confirm step, and Cancel being the highlighted blue default. */
@@ -435,7 +390,6 @@
     color: canvastext;
   }
   .btn-primary:focus,
-  .btn-ghost:focus,
   .btn-danger:focus {
     outline: 3px solid var(--focus-ring);
     outline-offset: 2px;
