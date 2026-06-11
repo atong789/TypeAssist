@@ -4,6 +4,7 @@
   import DebugPanel from "./routes/DebugPanel.svelte";
   import Home from "./routes/Home.svelte";
   import Today from "./routes/Today.svelte";
+  import Progress from "./routes/Progress.svelte";
   import PreviewSwitcher from "./lib/PreviewSwitcher.svelte";
 
   // Builder's debug view — hidden behind Cmd+Shift+D. Not a user feature.
@@ -43,6 +44,18 @@
 
   let route: Route = "home";
   let tabEls: HTMLButtonElement[] = [];
+
+  // The nav's roving anchor: the index of the tab that holds tabindex="0" (the
+  // single keyboard stop). It follows the selected tab, but when the active
+  // route is a utility one (Feedback / About / Privacy — none of which are tabs)
+  // it STAYS on the last selected tab, so the nav ALWAYS keeps exactly one tab
+  // stop and never drops out of the Tab order (which is what let focus get
+  // trapped in the utility group).
+  let navRovingIndex = 0;
+  $: {
+    const idx = tabs.findIndex((t) => t.route === route);
+    if (idx >= 0) navRovingIndex = idx;
+  }
 
   $: activeLabel =
     tabs.find((t) => t.route === route)?.label ?? utilityTitles[route] ?? "";
@@ -112,7 +125,7 @@
   //     :focus-visible). No-op for a non-tab route (the tray only routes to tabs).
   function focusSelectedTab() {
     const apply = (force: boolean) => {
-      const el = tabEls[tabs.findIndex((t) => t.route === route)];
+      const el = tabEls[navRovingIndex];
       if (!el) return;
       const active = document.activeElement as HTMLElement | null;
       if (!force && active === el) return; // already correct — don't disturb it
@@ -222,7 +235,7 @@
           id={`tab-${item.route}`}
           aria-controls="screen-panel"
           aria-selected={route === item.route}
-          tabindex={route === item.route ? 0 : -1}
+          tabindex={i === navRovingIndex ? 0 : -1}
           class:active={route === item.route}
           bind:this={tabEls[i]}
           on:click={() => selectTab(i)}
@@ -243,6 +256,8 @@
       <Home />
     {:else if route === "today"}
       <Today on:navigate={handleNavigate} />
+    {:else if route === "progress"}
+      <Progress />
     {:else}
       <header class="screen-header"><h1>{activeLabel}</h1></header>
       <p class="placeholder">Shell only — this screen’s content is coming next.</p>
