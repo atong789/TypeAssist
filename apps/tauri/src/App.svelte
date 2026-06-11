@@ -5,7 +5,19 @@
   import Home from "./routes/Home.svelte";
   import Today from "./routes/Today.svelte";
   import Progress from "./routes/Progress.svelte";
+  import Settings from "./routes/Settings.svelte";
   import PreviewSwitcher from "./lib/PreviewSwitcher.svelte";
+  import FeedbackDialog from "./lib/FeedbackDialog.svelte";
+  import { modalOpen } from "./lib/modal";
+
+  // Feedback opens as a modal (not a sidebar route). Focus the CTA before opening
+  // so the modal records it and returns focus to it on close (WebKit doesn't
+  // focus a button on click).
+  let feedbackOpen = false;
+  function openFeedback(e: MouseEvent) {
+    (e.currentTarget as HTMLElement | null)?.focus();
+    feedbackOpen = true;
+  }
 
   // Builder's debug view — hidden behind Cmd+Shift+D. Not a user feature.
   let debugOpen = false;
@@ -195,6 +207,8 @@
       debugOpen = !debugOpen;
       return;
     }
+    // A modal owns Tab while it's open — stand down so the two traps don't fight.
+    if ($modalOpen) return;
     if (event.key !== "Tab" || !rootEl) return;
     const tabbables = realTabbables();
     if (tabbables.length === 0) return;
@@ -258,6 +272,8 @@
       <Today on:navigate={handleNavigate} />
     {:else if route === "progress"}
       <Progress />
+    {:else if route === "settings"}
+      <Settings />
     {:else}
       <header class="screen-header"><h1>{activeLabel}</h1></header>
       <p class="placeholder">Shell only — this screen’s content is coming next.</p>
@@ -268,12 +284,8 @@
        to the BOTTOM of the sidebar (grid area), but placed AFTER the panel in
        SOURCE order so Tab reaches the active screen's content before it. -->
   <nav class="utility" aria-label="Secondary">
-    <!-- Feedback — a soft accent invitation, not a tab. -->
-    <button
-      class="navcta"
-      class:active={route === "feedback"}
-      on:click={() => (route = "feedback")}
-    >
+    <!-- Feedback — a soft accent invitation, not a tab; opens the modal. -->
+    <button class="navcta" on:click={openFeedback}>
       <i class="ti ti-message-dots" aria-hidden="true"></i>
       <span>Tell me what you think</span>
     </button>
@@ -296,6 +308,10 @@
 
 {#if debugOpen}
   <DebugPanel />
+{/if}
+
+{#if feedbackOpen}
+  <FeedbackDialog on:close={() => (feedbackOpen = false)} />
 {/if}
 
 <style>

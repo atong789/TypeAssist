@@ -60,7 +60,7 @@
   </div>
 
   <div class="status">
-    <span class="greendot" aria-hidden="true"></span>
+    <span class="statusdot" aria-hidden="true"></span>
     <span>{copy.status}</span>
   </div>
 </section>
@@ -138,12 +138,13 @@
     font-size: 0.95rem;
     color: var(--text-secondary);
   }
-  /* "Jordan is active" indicator. Green reads as live in both light and dark. */
-  .greendot {
+  /* "Jordan is active" indicator — the blue accent, not green (colour-blind-safe;
+     the app reserves no meaning for green). The text carries the status. */
+  .statusdot {
     width: 9px;
     height: 9px;
     border-radius: 50%;
-    background: #28c840;
+    background: var(--focus-ring);
     flex-shrink: 0;
   }
 </style>
