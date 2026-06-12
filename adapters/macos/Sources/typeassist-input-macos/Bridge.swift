@@ -26,6 +26,10 @@ enum InputEvent {
     /// user is currently typing. `tapEnabled` is our own view of the
     /// CGEvent tap state.
     case heartbeat(timestampMs: UInt64, tapEnabled: Bool)
+    /// The caret may have moved somewhere the engine can't dead-reckon — a
+    /// mouse/trackpad click (from the tap) or a focus/app change (from the
+    /// secure-field AX observer). Content-free: `reason` is only a log tag.
+    case caretMoved(reason: String)
 }
 
 enum OutboundCommand {
@@ -110,6 +114,8 @@ final class Bridge {
                 "timestamp_ms": ts,
                 "tap_enabled": tapEnabled,
             ]
+        case let .caretMoved(reason):
+            payload = ["type": "caret_moved", "reason": reason]
         }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
               let s = String(data: data, encoding: .utf8) else {

@@ -317,22 +317,22 @@ const CANDIDATES_TOP_N: usize = 3;
 // are mapped to caret moves.
 const KEY_C0_LEFT: char = '\u{001C}';
 const KEY_C0_RIGHT: char = '\u{001D}';
-// Up/Down kept here for documentation and tests — they're filtered out
-// (via `is_non_text_key`) but deliberately not mapped to caret moves in
-// the single-line model. Marked dead_code so the binary build doesn't
-// warn; the test module references them.
-#[allow(dead_code)]
+// Up/Down are filtered out of text (via `is_non_text_key`) and NOT mapped to
+// caret moves in the single-line model. Instead `is_vertical_nav` routes them
+// to a Fix-B line reset: they move the caret to another line the model can't
+// follow, so leaving the caret put (the old behaviour) silently desynced.
 const KEY_C0_UP: char = '\u{001E}';
-#[allow(dead_code)]
 const KEY_C0_DOWN: char = '\u{001F}';
 const KEY_NS_LEFT: char = '\u{F702}';
 const KEY_NS_RIGHT: char = '\u{F703}';
-#[allow(dead_code)]
 const KEY_NS_UP: char = '\u{F700}';
-#[allow(dead_code)]
 const KEY_NS_DOWN: char = '\u{F701}';
 const KEY_NS_HOME: char = '\u{F729}';
 const KEY_NS_END: char = '\u{F72B}';
+// PageUp / PageDown (AppKit NSPageUp/DownFunctionKey). Like Up/Down they jump
+// the caret off the tracked line → Fix-B reset, not a caret nudge.
+const KEY_NS_PAGEUP: char = '\u{F72C}';
+const KEY_NS_PAGEDOWN: char = '\u{F72D}';
 
 /// True if `c` is a non-text key signal — a control character or an
 /// AppKit private-use function-key code. These codepoints exist only to
@@ -389,6 +389,55 @@ fn nav_action(c: char, caret: usize, line_len: usize, command: bool) -> Option<u
         KEY_NS_END => Some(line_len),
         _ => None,
     }
+}
+
+/// True for the vertical / paging navigation keys (Up, Down, PageUp, PageDown).
+/// `nav_action` returns `None` for these — in the single-line model there's no
+/// caret position to move to — so the old behaviour left the caret put, which
+/// silently desynced the model from the real (now multi-line) cursor. Fix-B
+/// routes them to a full line reset instead. Plain Left/Right/Home/End are NOT
+/// here: they move the model caret correctly (and off the line end, which
+/// already disables firing), so they stay as-is.
+fn is_vertical_nav(c: char) -> bool {
+    matches!(
+        c,
+        KEY_C0_UP | KEY_C0_DOWN | KEY_NS_UP | KEY_NS_DOWN | KEY_NS_PAGEUP | KEY_NS_PAGEDOWN
+    )
+}
+
+/// **Fix-B — caret-move line reset.** The engine dead-reckons `line_buf` /
+/// `caret` / anchors from keystrokes alone, so any caret move it can't observe
+/// (mouse / trackpad click, Up / Down / PageUp / PageDown, focus or app switch)
+/// leaves that model stale. With live correction on, a stale model can fire
+/// backspaces at the wrong position (the `edndd` desync). Resetting to a clean
+/// line only costs a skipped correction on the *next* word — the safe
+/// direction — whereas NOT resetting is what deletes the wrong thing, so every
+/// unobservable caret move funnels through here.
+///
+/// Mirrors the newline reset (clears the line buffers + caret + anchors, resets
+/// the tokenizer line, emits `EVT_LINE_RESET` + the anchor snapshot) and also
+/// disarms any pending Escape-undo, whose revert would otherwise inject at the
+/// now-stale caret. `trigger` is a log tag only (`mouse` / `focus` / `updown`).
+fn reset_line_for_caret_move<R: Runtime>(
+    app: &AppHandle<R>,
+    tokenizer: &mut Tokenizer,
+    line_buf: &mut Vec<char>,
+    line_dwells: &mut Vec<u32>,
+    caret: &mut usize,
+    anchors: &mut AnchorTracker,
+    last_correction: &mut Option<LastCorrection>,
+    trigger: &str,
+) {
+    tracing::info!("LINE_RESET trigger={trigger}");
+    tokenizer.reset_line();
+    line_buf.clear();
+    line_dwells.clear();
+    *caret = 0;
+    anchors.clear();
+    *last_correction = None;
+    let _ = app.emit(EVT_LINE_RESET, ());
+    let snap = anchors.snapshot();
+    let _ = app.emit(EVT_ANCHOR_SNAPSHOT, anchor_emit_payload(&snap, line_buf));
 }
 
 /// THE single entry point that puts a character into `line_buf`. Anything
@@ -2551,6 +2600,25 @@ pub fn spawn<R: Runtime>(
                             );
                         }
                         InputEvent::Shutdown => break 'engine_loop,
+                        InputEvent::CaretMoved { reason } => {
+                            // Fix-B: the L1 adapter saw a gesture that can move
+                            // the caret somewhere we can't dead-reckon — a
+                            // mouse/trackpad click or a focus/app change. Reset
+                            // the line model so a live correction can't fire
+                            // against a stale buffer. Content-free event: nothing
+                            // to ingest, nothing to count in the funnel.
+                            let trigger = reason.as_deref().unwrap_or("caret");
+                            reset_line_for_caret_move(
+                                &app_handle,
+                                &mut tokenizer,
+                                &mut line_buf,
+                                &mut line_dwells,
+                                &mut caret,
+                                &mut anchors,
+                                &mut last_correction,
+                                trigger,
+                            );
+                        }
                         InputEvent::Backspace { .. } => {
                             // Funnel: a backspace passed the pause filter and
                             // enters the edit pipeline (not a modifier drop).
@@ -2790,23 +2858,45 @@ pub fn spawn<R: Runtime>(
                                 // edit, no token feed — and the buffer is
                                 // never written.
                                 let c = single_char.unwrap();
-                                tracing::info!(
-                                    "non-text key U+{:04X} — caret-only handling",
-                                    c as u32
-                                );
-                                // ONE coherent handler for all four nav
-                                // keys. Anything not mapped (Up/Down,
-                                // F1–F12, other PU codepoints) returns
-                                // `None` and we no-op. The Command flag
-                                // distinguishes Cmd+Left/Right (= Home/End
-                                // on macOS) from plain arrow navigation.
-                                if let Some(new_caret) =
-                                    nav_action(c, caret, line_buf.len(), modifiers.command)
-                                {
-                                    caret = new_caret;
+                                if is_vertical_nav(c) {
+                                    // Fix-B: Up/Down/PageUp/PageDown move the
+                                    // caret to another line/screen the single-
+                                    // line model can't follow. `nav_action`
+                                    // returns None for these (caret stays put =
+                                    // silent desync); reset the line instead.
+                                    tracing::info!(
+                                        "non-text key U+{:04X} — vertical nav, line reset",
+                                        c as u32
+                                    );
+                                    reset_line_for_caret_move(
+                                        &app_handle,
+                                        &mut tokenizer,
+                                        &mut line_buf,
+                                        &mut line_dwells,
+                                        &mut caret,
+                                        &mut anchors,
+                                        &mut last_correction,
+                                        "updown",
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "non-text key U+{:04X} — caret-only handling",
+                                        c as u32
+                                    );
+                                    // ONE coherent handler for the horizontal
+                                    // nav keys. Anything not mapped (F1–F12,
+                                    // other PU codepoints) returns `None` and
+                                    // we no-op. The Command flag distinguishes
+                                    // Cmd+Left/Right (= Home/End on macOS) from
+                                    // plain arrow navigation.
+                                    if let Some(new_caret) =
+                                        nav_action(c, caret, line_buf.len(), modifiers.command)
+                                    {
+                                        caret = new_caret;
+                                    }
+                                    // Anchor positions don't move on pure
+                                    // navigation, so no snapshot emit needed.
                                 }
-                                // Anchor positions don't move on pure
-                                // navigation, so no snapshot emit needed.
                             } else if modifiers.command || modifiers.control {
                                 // System shortcut (Cmd+X, Ctrl+X, Cmd+Shift+D,
                                 // etc.) — the key's character is the shortcut

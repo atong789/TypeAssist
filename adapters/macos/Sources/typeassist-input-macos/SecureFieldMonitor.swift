@@ -35,6 +35,14 @@ final class SecureFieldMonitor {
     /// Apple Silicon's weak memory model the tap could read a stale `false`
     /// forever (the bug this fixes). The lock both serialises access and
     /// publishes the write, so the tap sees the latest value.
+    /// Sink for the Fix-B `CaretMoved` event emitted on focus/app changes
+    /// (the secure gate and this share the one AX observer).
+    private let bridge: Bridge
+
+    init(bridge: Bridge) {
+        self.bridge = bridge
+    }
+
     private let lock = NSLock()
     private var _isSecureFieldFocused = false
 
@@ -90,6 +98,10 @@ final class SecureFieldMonitor {
     }
 
     @objc private func activeAppChanged(_ note: Notification) {
+        // Fix-B: switching apps puts the caret in a different field/app the
+        // engine can't dead-reckon — reset its line model. (Not emitted from
+        // the initial bind in `start()`, which doesn't route through here.)
+        bridge.emit(.caretMoved(reason: "focus"))
         rebindToFrontmostApp()
     }
 
@@ -113,10 +125,10 @@ final class SecureFieldMonitor {
 
     private func installObserver(for pid: pid_t) {
         var observer: AXObserver?
-        let callback: AXObserverCallback = { _, _, _, refcon in
+        let callback: AXObserverCallback = { _, _, notification, refcon in
             guard let refcon = refcon else { return }
             let me = Unmanaged<SecureFieldMonitor>.fromOpaque(refcon).takeUnretainedValue()
-            me.focusChanged()
+            me.axNotification(notification as String)
         }
         guard AXObserverCreate(pid, callback, &observer) == .success,
               let obs = observer else {
@@ -128,10 +140,11 @@ final class SecureFieldMonitor {
         }
         let appEl = AXUIElementCreateApplication(pid)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
-        // Focused-element changed is the primary trigger; selected-text changed
-        // is an extra re-assert for the reload case — clicking into / placing
-        // the caret in the rebuilt password field fires it even when the focus
-        // notification landed early. Both just trigger a re-evaluation.
+        // Focused-element changed serves both jobs (secure re-eval + the Fix-B
+        // focus caret-move). Selected-text changed is subscribed ONLY for the
+        // secure re-eval — the reload re-assert when clicking into a rebuilt
+        // password field — and never emits CaretMoved (it fires on normal
+        // typing, so it can't be a caret-move signal; see `axNotification`).
         for note in [
             kAXFocusedUIElementChangedNotification,
             kAXSelectedTextChangedNotification,
@@ -151,10 +164,23 @@ final class SecureFieldMonitor {
         appObserver = nil
     }
 
-    /// AX notification trigger (focus or selection changed): read now, then
-    /// re-poll briefly to catch a subrole that populates after the element is
-    /// rebuilt (page reload).
-    private func focusChanged() {
+    /// AX notification trigger: emit the Fix-B `CaretMoved` signal on a genuine
+    /// focus change, re-read the secure flag, then re-poll briefly to catch a
+    /// subrole that populates after the element is rebuilt (page reload).
+    ///
+    /// Only **focused-element changed** emits `CaretMoved` (focus moved to a
+    /// different element, so the caret is elsewhere — content-free). We do NOT
+    /// emit on **selected-text changed**: `kAXSelectedTextChangedNotification`
+    /// fires whenever the caret advances, which includes *normal typing*, so it
+    /// can't be told apart from a keystroke — treating it as a caret move wiped
+    /// the line after every key and starved correction (the reason the
+    /// selection trigger was reverted). The subscription stays, but only to
+    /// drive the secure re-eval below, which emits nothing to stdout. Clicks
+    /// (incl. trackpad) and Up/Down are covered by EventTap and the engine.
+    private func axNotification(_ name: String) {
+        if name == (kAXFocusedUIElementChangedNotification as String) {
+            bridge.emit(.caretMoved(reason: "focus"))
+        }
         reevaluateNow()
         scheduleConfirmation()
     }

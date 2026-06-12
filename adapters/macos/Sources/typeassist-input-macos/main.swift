@@ -19,7 +19,7 @@ guard Accessibility.isTrusted(prompt: promptForAccessibility) else {
 // Secure-field gate (Layer 2 cache): start tracking focus BEFORE the tap so
 // the "is the focused field secure?" flag is already correct when the first
 // keystroke arrives. Layer 1 (global secure input) needs no setup.
-let secureMonitor = SecureFieldMonitor()
+let secureMonitor = SecureFieldMonitor(bridge: bridge)
 secureMonitor.start()
 
 let tap = EventTap(bridge: bridge, secureMonitor: secureMonitor)

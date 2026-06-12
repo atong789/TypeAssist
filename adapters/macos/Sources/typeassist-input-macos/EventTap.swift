@@ -15,7 +15,14 @@ final class EventTap {
     }
 
     func start() -> Bool {
-        let mask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
+        // Key events for capture; mouse-DOWNs for Fix-B caret-move detection.
+        // A trackpad click IS a mouse-down, so left/right/other cover trackpad
+        // too. We only need the click happened, never where — no coordinates.
+        let mask = (1 << CGEventType.keyDown.rawValue)
+            | (1 << CGEventType.keyUp.rawValue)
+            | (1 << CGEventType.leftMouseDown.rawValue)
+            | (1 << CGEventType.rightMouseDown.rawValue)
+            | (1 << CGEventType.otherMouseDown.rawValue)
 
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
         guard let port = CGEvent.tapCreate(
@@ -108,6 +115,20 @@ final class EventTap {
                 )
             }
             return
+        }
+
+        // **Fix-B caret-move**: a mouse / trackpad click can reposition the
+        // caret with no keystroke the engine can dead-reckon. Emit a
+        // content-free CaretMoved so the engine resets its line model before a
+        // live correction could fire backspaces at the wrong spot. Emitted
+        // regardless of secure-field state (it carries no typed content), and
+        // BEFORE the keycode/secure-gate path (a click is not a key).
+        switch type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            bridge.emit(.caretMoved(reason: "mouse"))
+            return
+        default:
+            break
         }
 
         // NOTE: our own injection echo is dropped on the ENGINE side by an exact

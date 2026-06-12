@@ -33,6 +33,17 @@ pub enum InputEvent {
     /// hasn't yet re-armed it. The engine's watchdog uses this plus
     /// the heartbeat timestamp to drive the `capture-health` state.
     Heartbeat { timestamp_ms: u64, tap_enabled: bool },
+    /// **Caret may have moved somewhere the engine can't dead-reckon.**
+    /// Emitted by the L1 adapter on a mouse / trackpad click or a focus / app
+    /// change — gestures that reposition the caret with no key the engine can
+    /// follow. Content-free by construction (Principle #9): no coordinates, no
+    /// text, only an optional `reason` tag for logs (`"mouse"` / `"focus"`).
+    /// The engine treats it as an immediate line reset so a live correction
+    /// can't fire backspaces against a stale line model.
+    CaretMoved {
+        #[serde(default)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +131,23 @@ mod tests {
         };
         let json = serde_json::to_string(&down).unwrap();
         assert!(json.contains("\"tap_enabled\":false"));
+    }
+
+    #[test]
+    fn caret_moved_event_round_trips() {
+        // The L1 adapter emits this on a click / focus change. `reason` is a
+        // content-free log tag; it must survive the round-trip, and the
+        // variant must also parse when `reason` is absent.
+        let e = InputEvent::CaretMoved {
+            reason: Some("mouse".into()),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""type":"caret_moved""#));
+        let back: InputEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+
+        let bare: InputEvent = serde_json::from_str(r#"{"type":"caret_moved"}"#).unwrap();
+        assert_eq!(bare, InputEvent::CaretMoved { reason: None });
     }
 
     #[test]
