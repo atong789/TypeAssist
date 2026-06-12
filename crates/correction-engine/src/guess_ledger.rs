@@ -254,27 +254,31 @@ impl GuessLedger {
     }
 
     fn write_json(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
+        // Durable atomic write (temp → fsync → rename → fsync dir) so a crash
+        // can't leave a zero-length or torn accuracy ledger.
         let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
+        crate::persist::durable_write(path, json.as_bytes())
     }
 
     /// Load a ledger from `path`. A freshly loaded ledger starts "clean"
     /// (persist counter zero); the τ table is re-seeded if its shape predates a
-    /// [`TAU_BUCKETS`] change.
+    /// [`TAU_BUCKETS`] change. A **corrupt** file is quarantined aside (never
+    /// wiped) and the ledger comes up empty rather than erroring (Principle #6);
+    /// a missing file still propagates `NotFound` for the caller's
+    /// `path.exists()` guard.
     pub fn load_from(path: &Path) -> io::Result<Self> {
         let bytes = fs::read(path)?;
-        let mut ledger: GuessLedger = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-        ledger.obs_since_persist = 0;
-        ledger.overall.ensure_tau_shape();
-        Ok(ledger)
+        match serde_json::from_slice::<GuessLedger>(&bytes) {
+            Ok(mut ledger) => {
+                ledger.obs_since_persist = 0;
+                ledger.overall.ensure_tau_shape();
+                Ok(ledger)
+            }
+            Err(e) => {
+                crate::persist::quarantine_corrupt(path, e);
+                Ok(Self::new())
+            }
+        }
     }
 }
 

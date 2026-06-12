@@ -464,26 +464,29 @@ impl WordPatternStore {
     }
 
     fn write_json(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
+        // Durable atomic write (temp → fsync → rename → fsync dir) so a crash
+        // can't leave a zero-length or torn pattern store.
         let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
+        crate::persist::durable_write(path, json.as_bytes())
     }
 
     /// Load a store from `path`. A freshly loaded store starts "clean"
-    /// (persist counter zero). A future version bump can migrate here.
+    /// (persist counter zero). A **corrupt** file is quarantined aside (never
+    /// wiped) and the store comes up empty rather than erroring (Principle #6);
+    /// a missing file still propagates `NotFound` for the caller's
+    /// `path.exists()` guard.
     pub fn load_from(path: &Path) -> io::Result<Self> {
         let bytes = fs::read(path)?;
-        let mut store: WordPatternStore =
-            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-        store.obs_since_persist = 0;
-        Ok(store)
+        match serde_json::from_slice::<WordPatternStore>(&bytes) {
+            Ok(mut store) => {
+                store.obs_since_persist = 0;
+                Ok(store)
+            }
+            Err(e) => {
+                crate::persist::quarantine_corrupt(path, e);
+                Ok(Self::new())
+            }
+        }
     }
 }
 

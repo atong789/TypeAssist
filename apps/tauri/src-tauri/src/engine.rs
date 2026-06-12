@@ -893,9 +893,15 @@ impl DailyTally {
 /// (a missing file is the honest "no data yet" state, never an error).
 fn read_progress_days(path: &Path) -> Vec<DailyEntry> {
     match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice::<ProgressSnapshots>(&bytes)
-            .map(|s| s.days)
-            .unwrap_or_default(),
+        Ok(bytes) => match serde_json::from_slice::<ProgressSnapshots>(&bytes) {
+            Ok(s) => s.days,
+            Err(e) => {
+                // Corrupt file: move it aside (never wipe accumulated history)
+                // and start empty, rather than silently dropping it.
+                correction_engine::persist::quarantine_corrupt(path, e);
+                Vec::new()
+            }
+        },
         Err(_) => Vec::new(),
     }
 }
@@ -936,12 +942,9 @@ fn write_progress(path: &Path, tally: &DailyTally) -> std::io::Result<()> {
         days,
     };
     let json = serde_json::to_vec_pretty(&snap).map_err(std::io::Error::other)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, path)
+    // Durable atomic write (temp → fsync → rename → fsync dir) so a crash can't
+    // leave a zero-length or torn progress history.
+    correction_engine::persist::durable_write(path, &json)
 }
 
 /// Watchdog-driven progress persistence + day rollover. On a calendar-day

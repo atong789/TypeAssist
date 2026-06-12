@@ -136,30 +136,31 @@ impl AllowList {
     // --- Persistence (atomic, mirrors WordPatternStore) ---------------------
 
     /// Load from `path`. A missing file is **not** an error — it's the
-    /// shipped-dark default (gate off, no patterns). A corrupt file IS an
-    /// error so the caller can surface it rather than silently resetting the
-    /// user's curated list.
+    /// shipped-dark default (gate off, no patterns). A **corrupt** file is
+    /// quarantined aside to `<stem>.corrupt-<ts>.json` (never wiped — the
+    /// curated list is preserved for recovery) and the safe-dark default is
+    /// returned, rather than erroring; a warning is logged so the reset is
+    /// visible.
     pub fn load_from(path: &Path) -> io::Result<Self> {
         match fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(al) => Ok(al),
+                Err(e) => {
+                    correction_engine::persist::quarantine_corrupt(path, e);
+                    Ok(Self::default())
+                }
+            },
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e),
         }
     }
 
-    /// Serialize to `path` atomically (write-tmp + rename), so a reader never
-    /// sees a half-written file.
+    /// Serialize to `path` durably and atomically (temp → fsync → rename →
+    /// fsync dir), so a reader never sees a half-written file and a crash can't
+    /// leave a zero-length or torn allow-list.
     pub fn save_to(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
         let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
+        correction_engine::persist::durable_write(path, json.as_bytes())
     }
 }
 
@@ -273,5 +274,32 @@ mod tests {
         assert_eq!(loaded.target_for("teh"), Some("the"));
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn corrupt_file_is_quarantined_and_loads_default() {
+        // A corrupt allow-list must NOT error (which would block startup) and
+        // must NOT silently wipe the user's curated list: it's moved aside and
+        // the safe-dark default (gate off, no patterns) is returned.
+        let path = std::env::temp_dir().join(format!("ta_allow_corrupt_{}.json", std::process::id()));
+        fs::write(&path, b"}{ not valid allow-list json").unwrap();
+
+        let al = AllowList::load_from(&path).expect("corrupt load must not error");
+        assert!(!al.correction_enabled, "comes up shipped-dark");
+        assert!(al.patterns.is_empty());
+
+        assert!(!path.exists(), "corrupt file moved aside, not wiped");
+        let dir = path.parent().unwrap();
+        let quarantined: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with(&format!("ta_allow_corrupt_{}", std::process::id()))
+                    && n.contains(".corrupt-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantine file preserved");
+        let _ = fs::remove_file(quarantined[0].path());
     }
 }

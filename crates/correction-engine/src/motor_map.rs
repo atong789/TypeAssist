@@ -650,26 +650,29 @@ impl MotorMap {
     }
 
     fn write_json(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
+        // Durable atomic write (temp → fsync → rename → fsync dir) so a crash
+        // can't leave a zero-length or torn motor map.
         let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
+        crate::persist::durable_write(path, json.as_bytes())
     }
 
     /// Load a map from `path`. A freshly loaded map starts "clean" (persist
-    /// counter zero). Returns the deserialized map; a future version bump can
-    /// migrate here.
+    /// counter zero). A **corrupt** file is quarantined aside (never wiped) and
+    /// the map comes up empty rather than erroring engine startup (Principle
+    /// #6); a missing file still propagates `NotFound` for the caller's
+    /// `path.exists()` guard.
     pub fn load_from(path: &Path) -> io::Result<Self> {
         let bytes = fs::read(path)?;
-        let mut map: MotorMap = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-        map.obs_since_persist = 0;
-        Ok(map)
+        match serde_json::from_slice::<MotorMap>(&bytes) {
+            Ok(mut map) => {
+                map.obs_since_persist = 0;
+                Ok(map)
+            }
+            Err(e) => {
+                crate::persist::quarantine_corrupt(path, e);
+                Ok(Self::new())
+            }
+        }
     }
 }
 
@@ -1092,6 +1095,34 @@ mod tests {
             loaded.query_probable_intent('s'),
             map.query_probable_intent('s')
         );
+    }
+
+    #[test]
+    fn corrupt_file_is_quarantined_and_loads_empty() {
+        // A garbage file must NOT error the load (which would block engine
+        // startup) and must NOT be silently wiped: it's moved aside and the
+        // map comes up empty.
+        let path = std::env::temp_dir()
+            .join(format!("ta_motor_corrupt_{}.json", std::process::id()));
+        fs::write(&path, b"{ this is not valid motor_map json").unwrap();
+
+        let map = MotorMap::load_from(&path).expect("corrupt load must not error");
+        assert!(map.is_empty(), "comes up empty after quarantine");
+
+        // The original is gone; a sibling `*.corrupt-*.json` preserves the bytes.
+        assert!(!path.exists(), "corrupt file was moved aside");
+        let dir = path.parent().unwrap();
+        let quarantined: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with(&format!("ta_motor_corrupt_{}", std::process::id()))
+                    && n.contains(".corrupt-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantine file");
+        let _ = fs::remove_file(quarantined[0].path());
     }
 
     #[test]

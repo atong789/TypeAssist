@@ -28,6 +28,7 @@ pub mod log;
 pub mod motor_ledger;
 pub mod motor_map;
 pub mod motor_signal;
+pub mod persist;
 pub mod resolver;
 pub mod score;
 pub mod slip_class;
