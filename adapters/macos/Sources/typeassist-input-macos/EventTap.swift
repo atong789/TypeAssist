@@ -9,6 +9,13 @@ final class EventTap {
     private var runLoopSource: CFRunLoopSource?
     private var keyDownTimestamps: [Int64: UInt64] = [:]
 
+    /// Verbose per-keystroke `GATE_READ` diagnostics, off unless
+    /// `TYPEASSIST_LOG_GATE=1`. Read once at init so the hot path is a bool
+    /// check, not an env lookup. The `SECURE_FIELD_DROP` / `SECURE_FIELD_FOCUS`
+    /// lines (low-volume, only on drops/transitions) always log.
+    private let logGateReads =
+        ProcessInfo.processInfo.environment["TYPEASSIST_LOG_GATE"] == "1"
+
     init(bridge: Bridge, secureMonitor: SecureFieldMonitor) {
         self.bridge = bridge
         self.secureMonitor = secureMonitor
@@ -155,12 +162,16 @@ final class EventTap {
         let secureInput = IsSecureEventInputEnabled()
         let secureField = secureMonitor.isSecureFieldFocused
 
-        // Per-key diagnostic: exactly the booleans the gate is about to act on,
-        // plus the reader thread id — keycode only, never the character. Lets
-        // the sandbox confirm the tap sees `secureField=true` while a password
-        // field is focused (and that the reader/writer threads line up).
-        FileHandle.standardError.write(Data(
-            "GATE_READ keycode=\(keycode) secureField=\(secureField) secureInput=\(secureInput) tid=\(threadID())\n".utf8))
+        // Per-key diagnostic (opt-in via TYPEASSIST_LOG_GATE=1): exactly the
+        // booleans the gate is about to act on, plus the reader thread id —
+        // keycode only, never the character. Off by default so normal runs
+        // aren't flooded with one line per keystroke; enable it to confirm the
+        // tap sees `secureField=true` in a password field (and reader/writer
+        // threads line up).
+        if logGateReads {
+            FileHandle.standardError.write(Data(
+                "GATE_READ keycode=\(keycode) secureField=\(secureField) secureInput=\(secureInput) tid=\(threadID())\n".utf8))
+        }
 
         if secureInput || secureField {
             let reason = secureInput ? "secureEventInput" : "axSecureField"
