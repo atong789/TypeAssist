@@ -244,7 +244,12 @@ macOS 13 (Ventura) or later. Windows and Android adapters are future work; the L
 
 ## Build & dev
 
-`just` is the entry point. From the repo root:
+> **⚠️ This Mac does NOT have `just` installed — never recommend, relay, or run any `just <recipe>` command here. Always give the plain shell equivalent instead.** The `justfile` recipes below are reference only; translate each to its underlying command. The ones used most:
+> - **Normal dev (real data):** `cd ~/Projects/typeassist/apps/tauri && npm run tauri dev`
+> - **Sandbox preview (throwaway data — never touches real `~/.typeassist`):** `cd ~/Projects/typeassist/apps/tauri && TYPEASSIST_DATA_DIR="$HOME/.typeassist-sandbox" npm run tauri dev`
+> - **Clean the sandbox:** `rm -rf ~/.typeassist-sandbox`
+
+`just` is the canonical entry point in the repo, but (per the note above) **do not invoke it on this machine** — use the shell equivalents. From the repo root:
 
 | Command | What it does |
 |---|---|
