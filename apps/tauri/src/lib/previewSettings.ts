@@ -1,8 +1,9 @@
 // Small persisted UI settings, backed by localStorage (per the main window).
 // These are intentionally lightweight stand-ins during the front-end rebuild:
 //
-//  - `userName`  — a saved setting; defaults to "Soumyo" until onboarding
-//    writes the real name. Move to a Rust-backed setting when onboarding lands.
+//  - `userName`  — a saved setting; defaults to blank (no hardcoded name)
+//    until onboarding writes the real one. TODO: move to a Rust-backed
+//    setting when onboarding lands.
 //  - `appState`  — the app-wide state (Day one / Building back / Fluent) that
 //    every screen reflects. For now it's a value you flip BY HAND (the Home
 //    preview switcher writes it, and it persists); automatic detection from
@@ -39,7 +40,7 @@ function persisted<T>(key: string, fallback: T): Writable<T> {
   return store;
 }
 
-export const userName = persisted<string>("ta.userName", "Soumyo");
+export const userName = persisted<string>("ta.userName", "");
 export const appState = persisted<AppState>("ta.appState", "fluent");
 
 // First-run onboarding shows once, before the shell, until completed. Persisted so
