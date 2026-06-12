@@ -1,14 +1,17 @@
+import Carbon
 import CoreGraphics
 import Foundation
 
 final class EventTap {
     private let bridge: Bridge
+    private let secureMonitor: SecureFieldMonitor
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var keyDownTimestamps: [Int64: UInt64] = [:]
 
-    init(bridge: Bridge) {
+    init(bridge: Bridge, secureMonitor: SecureFieldMonitor) {
         self.bridge = bridge
+        self.secureMonitor = secureMonitor
     }
 
     func start() -> Bool {
@@ -114,6 +117,37 @@ final class EventTap {
         // deterministically.
 
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
+
+        // **Secure-field gate** — refuse to forward ANY part of a keystroke
+        // (character, timing, modifiers, backspace) while a password / secure
+        // field is in play, so password content never leaves this capture
+        // process. Two independent signals, checked before the event is ever
+        // emitted on the wire:
+        //   Layer 1 — `IsSecureEventInputEnabled()`: cheap, global; true for
+        //     native secure fields, the login window, `sudo` in Terminal.
+        //   Layer 2 — `secureMonitor.isSecureFieldFocused`: an AX-focus-driven
+        //     cached flag (no per-key AX query) that also catches web /
+        //     Electron / custom password fields, which expose an
+        //     `AXSecureTextField` subrole but often DON'T trip Layer 1.
+        // The whole event is dropped; we never record its keyDown timestamp,
+        // so no dwell leaks either. Each signal is read ONCE here.
+        let secureInput = IsSecureEventInputEnabled()
+        let secureField = secureMonitor.isSecureFieldFocused
+
+        // Per-key diagnostic: exactly the booleans the gate is about to act on,
+        // plus the reader thread id — keycode only, never the character. Lets
+        // the sandbox confirm the tap sees `secureField=true` while a password
+        // field is focused (and that the reader/writer threads line up).
+        FileHandle.standardError.write(Data(
+            "GATE_READ keycode=\(keycode) secureField=\(secureField) secureInput=\(secureInput) tid=\(threadID())\n".utf8))
+
+        if secureInput || secureField {
+            let reason = secureInput ? "secureEventInput" : "axSecureField"
+            FileHandle.standardError.write(
+                Data("SECURE_FIELD_DROP keycode=\(keycode) reason=\(reason)\n".utf8))
+            return
+        }
+
         let timestampNs = event.timestamp
         let timestampMs = UInt64(timestampNs / 1_000_000)
 
