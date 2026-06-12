@@ -36,4 +36,3 @@ tracing-subscriber.workspace = true
 behavioural-model = { path = "../../../crates/behavioural-model" }
 volatility-map = { path = "../../../crates/volatility-map" }
 correction-engine = { path = "../../../crates/correction-engine" }
-storage = { path = "../../../crates/storage" }

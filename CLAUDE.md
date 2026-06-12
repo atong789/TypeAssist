@@ -49,7 +49,7 @@ L1 is OS-specific and swappable. L2–L5 are portable. L3 is the load-bearing co
 | 4 | Correction engine — lexicon-aware spatial fixes, three tiers, three space-error types, four outcome states | Rust | `crates/correction-engine/` |
 | 5 | UI — Tauri 2.x shell + Svelte/TS webview | Tauri + Svelte | `apps/tauri/` |
 
-Persistence: `crates/storage/` (SQLite via sqlx).
+Persistence: on-device JSON stores under `~/.typeassist/`, written with durable atomic writes + corrupt-file quarantine via `crates/correction-engine/src/persist.rs`. (An earlier unused SQLite scaffold, `crates/storage/`, has been removed.)
 
 ## Contracts
 
@@ -295,8 +295,7 @@ typeassist/
 ├── crates/
 │   ├── volatility-map/    # L3 — schema contract
 │   ├── behavioural-model/ # L2
-│   ├── correction-engine/ # L4 (stub)
-│   └── storage/           # SQLite persistence
+│   └── correction-engine/ # L4 — engine + `persist.rs` (durable JSON store I/O)
 ├── adapters/
 │   └── macos/             # L1 — Swift sidecar
 ├── apps/
