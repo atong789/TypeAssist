@@ -9,7 +9,7 @@ mod engine;
 use allow_list::AllowList;
 use engine::{EngineControl, EngineControlSender};
 use tauri::{
-    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, IconMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
     ActivationPolicy, AppHandle, Emitter, Listener, Manager, Runtime, WindowEvent,
 };
@@ -90,6 +90,45 @@ fn request_motor_stability(sender: tauri::State<EngineControlSender>) -> Result<
         .map_err(|e| format!("engine control channel closed: {e}"))
 }
 
+/// Status-line label text. The active state carries no glyph — the blue accent
+/// dot is the menu item's *icon* (a native `NSMenu` renders text in the menu's
+/// own colour, so a dot can only match the UI's blue as an image, not a text
+/// glyph). The inactive ("paused") wording is a placeholder, left as-is for now
+/// — it still carries a neutral dot inline since it has no coloured icon.
+fn status_text(active: bool) -> &'static str {
+    if active {
+        "Jordan is active"
+    } else {
+        "⚪ Jordan is paused"
+    }
+}
+
+/// A filled dot in the app's blue accent (`--focus-ring`, `#0a84ff` — the same
+/// blue the primary buttons use), built in memory as the status line's icon for
+/// the active state. Anti-aliased edge; rendered in colour (not a template).
+fn accent_dot() -> tauri::image::Image<'static> {
+    const N: u32 = 32;
+    const COLOR: (u8, u8, u8) = (0x0a, 0x84, 0xff); // --focus-ring, the UI blue
+    let c = N as f32 / 2.0;
+    let radius = c - 2.0;
+    let mut rgba = vec![0u8; (N * N * 4) as usize];
+    for y in 0..N {
+        for x in 0..N {
+            let dx = x as f32 + 0.5 - c;
+            let dy = y as f32 + 0.5 - c;
+            let d = (dx * dx + dy * dy).sqrt();
+            // 1px feather for a smooth edge.
+            let cov = (radius - d + 0.5).clamp(0.0, 1.0);
+            let i = ((y * N + x) * 4) as usize;
+            rgba[i] = COLOR.0;
+            rgba[i + 1] = COLOR.1;
+            rgba[i + 2] = COLOR.2;
+            rgba[i + 3] = (cov * 255.0) as u8;
+        }
+    }
+    tauri::image::Image::new_owned(rgba, N, N)
+}
+
 /// Menu-bar (Grammarly model): TypeAssist has no Dock icon and lives entirely
 /// behind the tray. The main app window and the Practice panel are *shown* from
 /// the tray, never the Dock. Build the tray icon + native menu in `setup`.
@@ -98,21 +137,35 @@ fn request_motor_stability(sender: tauri::State<EngineControlSender>) -> Result<
 /// fullscreen — unlike the Practice webview panel, which is a normal window
 /// (acceptable: "nobody practices typing during a fullscreen call").
 fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>> {
-    let open_main = MenuItem::with_id(app, "open_main", "Open TypeAssist", true, None::<&str>)?;
+    // The locked design-doc v23 §03 "while-learning" menu, top to bottom:
+    //   status · Warm-up · Progress · Open TypeAssist · Settings… · ─── · Quit
+    // Status is a non-interactive header (disabled, so it never highlights or
+    // fires); its text + dot are updated live by the capture-health listener
+    // below. The active dot is the app's blue accent, rendered as the item's
+    // icon (see `accent_dot`).
+    let status = IconMenuItem::with_id(
+        app,
+        "status",
+        status_text(true),
+        false,
+        Some(accent_dot()),
+        None::<&str>,
+    )?;
     let practice = MenuItem::with_id(app, "practice", "Warm-up", true, None::<&str>)?;
     let progress = MenuItem::with_id(app, "progress", "Progress", true, None::<&str>)?;
+    let open_main = MenuItem::with_id(app, "open_main", "Open TypeAssist", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
     // M3 correction Step 1 — the menu-bar master gate (instant, one-action
     // global on/off, the brief's "global off") + the curation panel opener. The
     // check's initial state is read off disk so it reflects the persisted gate;
     // it then tracks the engine's authoritative echo (see `setup`). Default is
     // OFF — the feature ships dark.
     //
-    // HIDDEN FOR NOW (display-only): correction isn't ready to suggest yet, so
-    // neither the "Enable corrections" toggle nor the "Corrections…" opener is
-    // added to the menu. The code is kept intact — `corr_toggle` is still built
-    // and returned so the engine-echo sync in `setup` keeps working — and both
-    // resurface (as a confidence-gated on/off switch) by re-adding the
-    // commented `&corr_toggle` / `&corrections` (+ a separator) to the menu.
+    // DEFERRED (reveal-when-ready layer): the Corrections group is NOT part of
+    // the while-learning menu. `corr_toggle` is still built and returned so the
+    // engine-echo sync in `setup` keeps working; it (and a "Corrections…"
+    // opener) resurface by adding them — with their own divider — to the menu
+    // when correction is ready to suggest.
     let corr_enabled = read_allow_list()
         .map(|al| al.correction_enabled)
         .unwrap_or(false);
@@ -124,24 +177,18 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
         corr_enabled,
         None::<&str>,
     )?;
-    // let corrections = MenuItem::with_id(app, "corrections", "Corrections…", true, None::<&str>)?;
-    let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
-    let sep_a = PredefinedMenuItem::separator(app)?;
-    // let sep_b = PredefinedMenuItem::separator(app)?; // divided the (now hidden) corrections section
-    let sep_c = PredefinedMenuItem::separator(app)?;
+    // One divider only (locked rule): Quit isolated at the bottom, past it.
+    let sep = PredefinedMenuItem::separator(app)?;
     let quit = PredefinedMenuItem::quit(app, Some("Quit TypeAssist"))?;
     let menu = Menu::with_items(
         app,
         &[
-            &open_main,
+            &status,
             &practice,
             &progress,
-            &sep_a,
-            // &corr_toggle,  // hidden for now — see note above
-            // &corrections,  // hidden for now — see note above
-            // &sep_b,
+            &open_main,
             &settings,
-            &sep_c,
+            &sep,
             &quit,
         ],
     )?;
@@ -178,6 +225,23 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
             tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
         })
         .build(app)?;
+
+    // Wire the status line to the engine's capture-health signal: blue accent
+    // dot + "active" while `Live`, neutral dot + "paused" otherwise. The item is
+    // updated in place on each transition (the dot follows the same signal the
+    // capture-health panel uses; payload is `{ "state": "live" | … }`).
+    {
+        let status_item = status.clone();
+        app.listen(engine::EVT_CAPTURE_HEALTH, move |event| {
+            let active = serde_json::from_str::<serde_json::Value>(event.payload())
+                .ok()
+                .and_then(|v| v.get("state").and_then(|s| s.as_str()).map(|s| s == "live"))
+                .unwrap_or(false);
+            let _ = status_item.set_text(status_text(active));
+            let _ = status_item.set_icon(if active { Some(accent_dot()) } else { None });
+        });
+    }
+
     Ok(corr_toggle)
 }
 
@@ -247,6 +311,12 @@ fn show_practice<R: Runtime>(app: &AppHandle<R>) {
         let _ = w.show();
         let _ = w.set_focus();
         let _ = app.emit("practice://open", ());
+        // C5e: a warm-up / Practice round is now on screen — its typed text is
+        // app-generated, so tell the engine to keep it out of the word-freq
+        // vocabulary tally (the motor map still observes). Cleared on blur-hide.
+        if let Some(sender) = app.try_state::<EngineControlSender>() {
+            let _ = sender.send(EngineControl::SetPromptedCaptureActive(true));
+        }
     }
 }
 
@@ -651,6 +721,15 @@ pub fn run() {
                     || window.label() == "allowlist" =>
             {
                 let _ = window.hide();
+                // C5e: the warm-up / Practice round is gone — resume feeding the
+                // word-freq vocabulary tally from ambient (real) typing.
+                if window.label() == "practice" {
+                    if let Some(sender) =
+                        window.app_handle().try_state::<EngineControlSender>()
+                    {
+                        let _ = sender.send(EngineControl::SetPromptedCaptureActive(false));
+                    }
+                }
             }
             // Remember where the user puts the main window, across restarts.
             WindowEvent::Moved(pos) if window.label() == "main" => {

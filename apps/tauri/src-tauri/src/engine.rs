@@ -276,6 +276,14 @@ pub enum EngineControl {
     /// keys the round leaned into. Read-only: reads on-disk history, changes
     /// nothing.
     RequestPracticeTrend { keys: Vec<char> },
+    /// **C5e word-freq gate.** Mark whether a warm-up / Practice round is on
+    /// screen. While active, the typed text is **app-generated** (prompted
+    /// sentences), so the [`WordFreq`] vocabulary tally must skip it or the
+    /// personal word-frequency picture is skewed by our own prompts. The
+    /// **motor map still observes** it — practising weak keys is exactly its
+    /// purpose; only the vocabulary count is suppressed. Posted `true` when the
+    /// Practice panel is shown, `false` when it hides (see `lib.rs`).
+    SetPromptedCaptureActive(bool),
     /// **M3 correction Step 1 — master gate.** Flip `correction_enabled` on the
     /// allow-list. The instant global on/off the tray toggle posts. The engine
     /// persists and echoes the new state on [`EVT_CORRECTION_STATE`].
@@ -1227,6 +1235,7 @@ fn tick_resolver<R: Runtime>(
     proposer: &mut LexiconProposer,
     motor_map: &mut MotorMap,
     word_freq: &mut WordFreq,
+    prompted_capture_active: bool,
     word_patterns: &mut WordPatternStore,
     guess_ledger: &mut GuessLedger,
     funnel: &mut Funnel,
@@ -1292,8 +1301,13 @@ fn tick_resolver<R: Runtime>(
                         // `observe_kept` itself enforces the is_known gate, so a
                         // name/password/junk token is never written to disk.
                         // Only Kept feeds this — corrected/abandoned words are a
-                        // slip, not vocabulary.
-                        word_freq.observe_kept(&rec.original_text, Lexicon::shared(), now);
+                        // slip, not vocabulary. SKIP while a warm-up / Practice
+                        // round is on screen: that text is our own prompts, not
+                        // the user's vocabulary (the motor map below still
+                        // observes it — practising weak keys is its purpose).
+                        if !prompted_capture_active {
+                            word_freq.observe_kept(&rec.original_text, Lexicon::shared(), now);
+                        }
                         motor_map.observe_outcome(outcome, &rec.original_text, None, now)
                     }
                     Outcome::CorrectedToOther => {
@@ -2273,6 +2287,11 @@ pub fn spawn<R: Runtime>(
             _ => WordFreq::new(),
         };
         let mut last_word_freq_save_ms: u64 = 0;
+        // C5e: while a warm-up / Practice round is on screen, typed text is
+        // app-generated, so the word-freq tally skips it (the motor map still
+        // observes — that's the point of practice). Flipped by
+        // `EngineControl::SetPromptedCaptureActive` from the panel's show/hide.
+        let mut prompted_capture_active = false;
         // C5d word-pattern store — learns typed→target word corrections,
         // observe-only (kill-switch OFF). Its own file beside the motor map;
         // load-fail keeps going in memory rather than clobbering a recoverable
@@ -2802,6 +2821,7 @@ pub fn spawn<R: Runtime>(
                                 &mut proposer,
                                 &mut motor_map,
                                 &mut word_freq,
+                                prompted_capture_active,
                                 &mut word_patterns,
                                 &mut guess_ledger,
                                 &mut funnel,
@@ -3272,6 +3292,7 @@ pub fn spawn<R: Runtime>(
                                                     &mut proposer,
                                                     &mut motor_map,
                                                     &mut word_freq,
+                                                    prompted_capture_active,
                                                     &mut word_patterns,
                                                     &mut guess_ledger,
                                                     &mut funnel,
@@ -3511,6 +3532,14 @@ pub fn spawn<R: Runtime>(
                             );
                             let _ = app_handle.emit(EVT_PRACTICE_TREND, trend);
                         }
+                        EngineControl::SetPromptedCaptureActive(active) => {
+                            // C5e: gate the word-freq tally while prompted
+                            // (warm-up / Practice) text is on screen. Motor-map
+                            // observation is untouched. Content-blind — a bare
+                            // on/off, no app id, no text.
+                            prompted_capture_active = active;
+                            tracing::info!("PROMPTED_CAPTURE active={active}");
+                        }
                         EngineControl::SetCorrectionEnabled(enabled) => {
                             // M3 Step 1 master gate — the instant global on/off.
                             // Persist + echo so the tray check and panel switch
@@ -3586,6 +3615,7 @@ pub fn spawn<R: Runtime>(
                         &mut proposer,
                         &mut motor_map,
                         &mut word_freq,
+                        prompted_capture_active,
                         &mut word_patterns,
                         &mut guess_ledger,
                         &mut funnel,

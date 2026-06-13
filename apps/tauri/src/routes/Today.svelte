@@ -7,6 +7,7 @@
      Copy is verbatim from the locked front-end design. -->
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
   import { appState } from "../lib/previewSettings";
 
   const dispatch = createEventDispatcher<{ navigate: string }>();
@@ -18,10 +19,11 @@
     day: "numeric",
   });
 
-  // PLACEHOLDER: the warm-up session flow isn't wired from Today yet — this task
-  // is the Today screen UI only. Leave the control rendered but inert.
+  // One warm-up, two doors: this opens the canonical round — the menu-bar
+  // Practice panel (PracticePanel.svelte) — the same flow the tray "Warm-up"
+  // item opens, via the `open_practice` command.
   function startWarmup() {
-    // TODO: open the warm-up flow.
+    invoke("open_practice");
   }
 </script>
 
