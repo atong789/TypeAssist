@@ -42,7 +42,7 @@ use correction_engine::{
     Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome, GuessLedger,
     Lexicon, LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver,
     PatternReadiness, ScoredCandidate, SlipClass, StabilityReport, Token, TokenKind, Tokenizer,
-    WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
+    WordFreq, WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
     MAX_PATTERN_EDIT_DISTANCE, MAX_PATTERN_LENGTH_DIFF, SCORE_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -698,6 +698,21 @@ fn snapshots_dir() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("snapshots"))
 }
 
+/// `~/.typeassist/word_freq.json` — the local vocabulary tally (C5e),
+/// observe-only, privacy-gated to `is_known` words. Its OWN file beside the
+/// motor map (counts only — no order, no context).
+fn word_freq_path() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("word_freq.json"))
+}
+
+/// `~/.typeassist/word_freq_snapshots` — the word-tally's daily dated archive.
+/// Deliberately its OWN directory, NOT under `snapshots/`: the Practice-trend
+/// reader loads every file in `snapshots/` as a `MotorMap`, so a differently-
+/// shaped file there would break it (same rule as `word_patterns_path`).
+fn word_freq_snapshots_dir() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("word_freq_snapshots"))
+}
+
 /// `~/.typeassist/allow_list.json` — the manual correction allow-list + master
 /// gate (M3 correction Step 1). The engine task is its sole writer; the UI
 /// reads it read-only. Its own file beside the learning stores — it is config,
@@ -1211,6 +1226,7 @@ fn tick_resolver<R: Runtime>(
     motor_ledger: &mut MotorLedger,
     proposer: &mut LexiconProposer,
     motor_map: &mut MotorMap,
+    word_freq: &mut WordFreq,
     word_patterns: &mut WordPatternStore,
     guess_ledger: &mut GuessLedger,
     funnel: &mut Funnel,
@@ -1270,6 +1286,14 @@ fn tick_resolver<R: Runtime>(
                 // only; the kill-switch stays off).
                 let report = match outcome {
                     Outcome::Kept => {
+                        // C5e local vocabulary tally (observe-only, privacy-
+                        // gated): a Kept word is clean, left-in vocabulary, so
+                        // tally it for the future personal-frequency scorer.
+                        // `observe_kept` itself enforces the is_known gate, so a
+                        // name/password/junk token is never written to disk.
+                        // Only Kept feeds this — corrected/abandoned words are a
+                        // slip, not vocabulary.
+                        word_freq.observe_kept(&rec.original_text, Lexicon::shared(), now);
                         motor_map.observe_outcome(outcome, &rec.original_text, None, now)
                     }
                     Outcome::CorrectedToOther => {
@@ -1497,6 +1521,42 @@ fn flush_word_patterns(
         }
         Err(e) => {
             tracing::warn!("word-pattern store flush save failed: {e}");
+            false
+        }
+    }
+}
+
+/// Flush the live word-frequency tally (C5e) on the same time cadence as
+/// [`flush_motor_map`] — its own file, its own last-save clock. Observe-only;
+/// no pruning (it does not decay). Returns whether a write succeeded.
+fn flush_word_freq(
+    word_freq: &mut WordFreq,
+    path: Option<&Path>,
+    now: u64,
+    last_save_ms: &mut u64,
+) -> bool {
+    if !word_freq.has_unsaved() {
+        return false;
+    }
+    if now.saturating_sub(*last_save_ms) < MOTOR_FLUSH_INTERVAL_MS {
+        return false;
+    }
+    let Some(path) = path else {
+        return false; // no HOME — in-memory only this session
+    };
+    match word_freq.save_to(path) {
+        Ok(()) => {
+            *last_save_ms = now;
+            tracing::info!(
+                "WORD_FREQ_SAVED (flush) words={} tokens={:.0} path={:?}",
+                word_freq.len(),
+                word_freq.total_count(),
+                path
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!("word-freq tally flush save failed: {e}");
             false
         }
     }
@@ -2185,6 +2245,34 @@ pub fn spawn<R: Runtime>(
             },
             _ => MotorMap::new(),
         };
+        // C5e local vocabulary tally — counts is_known words the user types
+        // correctly and leaves in place, for a FUTURE personal-frequency
+        // candidate-ranking experiment (observe-only; nothing reads it back
+        // into correction yet). Its own file beside the motor map; load-fail
+        // keeps going in memory rather than clobbering a recoverable file.
+        // Privacy-gated to is_known words, so the file can never hold a name,
+        // password, ID, or any out-of-dictionary string.
+        let word_freq_path = word_freq_path();
+        let word_freq_snapshots_dir = word_freq_snapshots_dir();
+        let mut word_freq = match word_freq_path.as_deref() {
+            Some(path) if path.exists() => match WordFreq::load_from(path) {
+                Ok(wf) => {
+                    tracing::info!(
+                        "WORD_FREQ_LOADED words={} tokens={:.0} path={:?}",
+                        wf.len(),
+                        wf.total_count(),
+                        path
+                    );
+                    wf
+                }
+                Err(e) => {
+                    tracing::warn!("word-freq tally load failed ({e}); starting fresh in memory");
+                    WordFreq::new()
+                }
+            },
+            _ => WordFreq::new(),
+        };
+        let mut last_word_freq_save_ms: u64 = 0;
         // C5d word-pattern store — learns typed→target word corrections,
         // observe-only (kill-switch OFF). Its own file beside the motor map;
         // load-fail keeps going in memory rather than clobbering a recoverable
@@ -2297,6 +2385,25 @@ pub fn spawn<R: Runtime>(
             // Mark today handled (whether we wrote or it already existed), so
             // the watchdog only acts when the calendar day rolls over.
             last_snapshot_date = Some(ymd_from_epoch_ms(now));
+        }
+        // C5e word-tally daily snapshot bookkeeping (Principle #6) — its own
+        // directory + date guard, mirroring the motor map. Startup snapshot
+        // preserves the as-loaded tally before the loop mutates it.
+        let mut last_word_freq_snapshot_date: Option<(i64, u32, u32)> = word_freq_snapshots_dir
+            .as_deref()
+            .and_then(most_recent_snapshot_ms)
+            .map(ymd_from_epoch_ms);
+        if let Some(dir) = word_freq_snapshots_dir.as_deref() {
+            let now = now_ms();
+            let today = dir.join(format!("{}.json", snapshot_date(now)));
+            if !today.exists() {
+                let _ = std::fs::create_dir_all(dir);
+                match word_freq.write_snapshot(&today) {
+                    Ok(()) => tracing::info!("WORD_FREQ_SNAPSHOT_STARTUP path={today:?}"),
+                    Err(e) => tracing::warn!("startup word-freq snapshot failed: {e}"),
+                }
+            }
+            last_word_freq_snapshot_date = Some(ymd_from_epoch_ms(now));
         }
         // Last time the live motor map was flushed to disk. Drives the
         // periodic flush (see `flush_motor_map`); 0 means "never this
@@ -2694,6 +2801,7 @@ pub fn spawn<R: Runtime>(
                                 &mut motor_ledger,
                                 &mut proposer,
                                 &mut motor_map,
+                                &mut word_freq,
                                 &mut word_patterns,
                                 &mut guess_ledger,
                                 &mut funnel,
@@ -3163,6 +3271,7 @@ pub fn spawn<R: Runtime>(
                                                     &mut motor_ledger,
                                                     &mut proposer,
                                                     &mut motor_map,
+                                                    &mut word_freq,
                                                     &mut word_patterns,
                                                     &mut guess_ledger,
                                                     &mut funnel,
@@ -3476,6 +3585,7 @@ pub fn spawn<R: Runtime>(
                         &mut motor_ledger,
                         &mut proposer,
                         &mut motor_map,
+                        &mut word_freq,
                         &mut word_patterns,
                         &mut guess_ledger,
                         &mut funnel,
@@ -3536,6 +3646,16 @@ pub fn spawn<R: Runtime>(
                     ) {
                         funnel.word_pattern_saves += 1;
                     }
+
+                    // C5e: same cadence for the local vocabulary tally's own
+                    // file. Observe-only — no funnel counter (it's a downstream
+                    // tally, not a capture stage that can silently drop data).
+                    flush_word_freq(
+                        &mut word_freq,
+                        word_freq_path.as_deref(),
+                        now_ms(),
+                        &mut last_word_freq_save_ms,
+                    );
 
                     // Phase 1 guesser accuracy scoreboard: same cadence, its own
                     // file. Observe-only — measurement, no injection.
@@ -3658,6 +3778,25 @@ pub fn spawn<R: Runtime>(
                                 }
                             }
                             last_snapshot_date = Some(today);
+                        }
+                    }
+
+                    // C5e: daily word-tally snapshot (Principle #6), same
+                    // calendar-roll logic as the motor map, its own directory +
+                    // date guard. Never overwrites an existing dated file.
+                    if let Some(dir) = word_freq_snapshots_dir.as_deref() {
+                        let today = ymd_from_epoch_ms(now_ms());
+                        if last_word_freq_snapshot_date != Some(today) {
+                            let path =
+                                dir.join(format!("{:04}-{:02}-{:02}.json", today.0, today.1, today.2));
+                            if !path.exists() {
+                                let _ = std::fs::create_dir_all(dir);
+                                match word_freq.write_snapshot(&path) {
+                                    Ok(()) => tracing::info!("WORD_FREQ_SNAPSHOT_DAILY path={path:?}"),
+                                    Err(e) => tracing::warn!("word-freq snapshot failed: {e}"),
+                                }
+                            }
+                            last_word_freq_snapshot_date = Some(today);
                         }
                     }
                 }
