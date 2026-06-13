@@ -179,7 +179,7 @@
             <span>Accessibility is on — I can read your keystrokes now. You’re all set for this step.</span>
           </p>
           <p class="ob-fine">
-            I skip password fields, and everything I keep stays on this Mac — just how your keys land and the little typo-and-fix habits your hands repeat, never the sentences you write.
+            I skip password fields, and everything I keep stays on this Mac — just how your keys land, the little typo-and-fix habits your hands repeat, and the everyday words you use — never the sentences you write.
           </p>
         {:else}
           <p class="ob-body-t">
@@ -190,7 +190,7 @@
             Open Accessibility settings
           </button>
           <p class="ob-fine">
-            I skip password fields, and everything I keep stays on this Mac — just how your keys land and the little typo-and-fix habits your hands repeat, never the sentences you write.
+            I skip password fields, and everything I keep stays on this Mac — just how your keys land, the little typo-and-fix habits your hands repeat, and the everyday words you use — never the sentences you write.
           </p>
         {/if}
       {:else}

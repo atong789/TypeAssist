@@ -275,6 +275,8 @@ Open questions surfaced during development that don't have a settled answer yet.
 
 - **L2 fatigue and temporal aggregators are deferred until after L4 correction exists.** Both are **modifiers** — they adjust *how much help* the correction engine gives (e.g. lean in more as a hand or finger tires within a session; bias differently for cold-start morning vs steady afternoon). With no correction engine to modulate, there's nothing for them to act on, so building them now would be observation-without-purpose. Revisit once L4 is live — the fatigue-aware "help more when you're tiring" idea is valuable then.
 
+- **TODO — Privacy & Terms route is unbuilt (placeholder only).** The `privacy` route in `apps/tauri/src/App.svelte` renders only the generic "Shell only — this screen's content is coming next." placeholder; there is no real copy yet. **Canonical copy spec lives in design doc v23** — the *What I learn*, *What I never keep*, and *Why it works this way* (philosophy) strings. When this route is built, author the page to match design-doc v23 verbatim (mind the app's em-dash + curly-quote punctuation style). Note v23's copy already accounts for the C5e local vocabulary tally (the "everyday vocabulary / private count of dictionary words" line).
+
 ## Things to never do
 
 - Do not introduce a slider control anywhere in the UI.
