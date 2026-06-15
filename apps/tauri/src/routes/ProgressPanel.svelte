@@ -78,8 +78,13 @@
   // has tabindex 0 (the roving key); the rest are -1.
   let rovingKey = "q";
   let keyEls: Record<string, HTMLButtonElement> = {};
-  // The row that opened the keyboard, so focus is restored to it on back.
-  let openerEl: HTMLElement | null = null;
+  // The score whose row opened the keyboard, so focus is restored to that exact
+  // row on back. We track the score (not the DOM node) because the overview is
+  // torn down while the keyboard is shown — the old button is detached, so
+  // focusing it would silently drop the ring to <body>. `compRowEls` holds the
+  // freshly-rendered row buttons by score so we can re-find the live one.
+  let openerScore: Score | null = null;
+  let compRowEls: Partial<Record<Score, HTMLButtonElement>> = {};
 
   let activeTab: Tab = "statistics";
   let patterns: ImpactPattern[] = [];
@@ -368,13 +373,14 @@
       .catch((e) => console.error("progress panel hide failed:", e));
   }
 
-  // Open the per-key keyboard for a score. Remembers the row that opened it so
-  // focus can be restored on the way back (in-app sub-view rule), and lands the
-  // ring on the back chevron (the sub-view's primary anchor).
+  // Open the per-key keyboard for a score. Remembers which score's row opened it
+  // so focus can be restored to that exact row on the way back (in-app sub-view
+  // rule), and lands the ring on the back chevron (the sub-view's primary
+  // anchor).
   let backEl: HTMLButtonElement;
-  function openKeyboard(score: Score, opener: HTMLElement) {
+  function openKeyboard(score: Score) {
     kbScore = score;
-    openerEl = opener;
+    openerScore = score;
     selectedKey = null;
     hoveredKey = null;
     rovingKey = "q"; // predictable: Tab into the board lands on the top-left key
@@ -383,10 +389,19 @@
   }
 
   function goBack() {
+    const score = openerScore;
+    openerScore = null;
     view = "main";
-    const target = openerEl;
-    openerEl = null;
-    tick().then(() => target?.focus());
+    // Restore the ring to the row drilled in from. The overview re-renders on
+    // this transition, so we focus the freshly-mounted button (looked up by
+    // score), never a stale node — the ring must never fall to <body> here.
+    // Fall back to the Statistics tab if the row isn't present, so focus is
+    // still visible. scrollIntoView in case the row sits below the fold.
+    tick().then(() => {
+      const el = (score && compRowEls[score]) || statTabEl;
+      el?.focus();
+      el?.scrollIntoView({ block: "nearest" });
+    });
   }
 
   // Switch which score the keyboard shows (one-hand: 1/2, no chord).
@@ -709,7 +724,8 @@
                      — opens the per-key keyboard map for this score. -->
                 <button
                   class="comp-row"
-                  on:click={(e) => openKeyboard(row.score, e.currentTarget)}
+                  bind:this={compRowEls[row.score]}
+                  on:click={() => openKeyboard(row.score)}
                   aria-label="{row.name}, {fmt1(row.pct ?? 0)} percent. Open the per-key keyboard map."
                 >
                   <div class="comp-head">
