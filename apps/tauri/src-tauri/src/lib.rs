@@ -9,7 +9,7 @@ mod engine;
 use allow_list::AllowList;
 use engine::{EngineControl, EngineControlSender};
 use tauri::{
-    menu::{CheckMenuItem, IconMenuItem, Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, IconMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
     ActivationPolicy, AppHandle, Emitter, Listener, Manager, Runtime, WindowEvent,
 };
@@ -90,43 +90,162 @@ fn request_motor_stability(sender: tauri::State<EngineControlSender>) -> Result<
         .map_err(|e| format!("engine control channel closed: {e}"))
 }
 
-/// Status-line label text. The active state carries no glyph — the blue accent
-/// dot is the menu item's *icon* (a native `NSMenu` renders text in the menu's
-/// own colour, so a dot can only match the UI's blue as an image, not a text
-/// glyph). The inactive ("paused") wording is a placeholder, left as-is for now
-/// — it still carries a neutral dot inline since it has no coloured icon.
+/// Status-line label text. The dot beside it (the item's *icon*) carries the
+/// state colour — a native `NSMenu` renders text in the menu's own colour, so a
+/// coloured dot can only be an image, not a text glyph. Active = the calm
+/// "is active"; stopped = the plain, unambiguous "has stopped" (the menu-bar
+/// icon, not the wording, carries the alarm — see the design note).
 fn status_text(active: bool) -> &'static str {
     if active {
         "Jordan is active"
     } else {
-        "⚪ Jordan is paused"
+        "Jordan has stopped"
     }
 }
 
-/// A filled dot in the app's blue accent (`--focus-ring`, `#0a84ff` — the same
-/// blue the primary buttons use), built in memory as the status line's icon for
-/// the active state. Anti-aliased edge; rendered in colour (not a template).
-fn accent_dot() -> tauri::image::Image<'static> {
+const UI_BLUE: (u8, u8, u8) = (0x0a, 0x84, 0xff); // --focus-ring, the UI blue
+const UI_GREY: (u8, u8, u8) = (0x8e, 0x8e, 0x93); // system secondary grey (light+dark)
+
+/// The status-line dot, built in memory as the item's icon (rendered in colour,
+/// NOT a template). Trimmed small — it sits beside the text, not as a bullet.
+/// Active = a small filled blue dot; stopped = a small hollow grey ring (so the
+/// state reads by shape too, and it's NEVER red — the no-deficit-framing rule).
+fn status_dot(active: bool) -> tauri::image::Image<'static> {
     const N: u32 = 32;
-    const COLOR: (u8, u8, u8) = (0x0a, 0x84, 0xff); // --focus-ring, the UI blue
     let c = N as f32 / 2.0;
-    let radius = c - 2.0;
+    let r = N as f32 * 0.26; // small — the old dot was full-bleed and oversized
+    let ring = 3.0; // hollow-ring stroke
+    let (cr, cg, cb) = if active { UI_BLUE } else { UI_GREY };
     let mut rgba = vec![0u8; (N * N * 4) as usize];
     for y in 0..N {
         for x in 0..N {
             let dx = x as f32 + 0.5 - c;
             let dy = y as f32 + 0.5 - c;
             let d = (dx * dx + dy * dy).sqrt();
-            // 1px feather for a smooth edge.
-            let cov = (radius - d + 0.5).clamp(0.0, 1.0);
+            let cov = if active {
+                // Filled disc, 1px feather.
+                (r - d + 0.5).clamp(0.0, 1.0)
+            } else {
+                // Hollow ring: within half a stroke of radius r.
+                (1.0 - ((d - r).abs() - ring / 2.0)).clamp(0.0, 1.0)
+            };
             let i = ((y * N + x) * 4) as usize;
-            rgba[i] = COLOR.0;
-            rgba[i + 1] = COLOR.1;
-            rgba[i + 2] = COLOR.2;
+            rgba[i] = cr;
+            rgba[i + 1] = cg;
+            rgba[i + 2] = cb;
             rgba[i + 3] = (cov * 255.0) as u8;
         }
     }
     tauri::image::Image::new_owned(rgba, N, N)
+}
+
+/// Fill coverage (0..1, 1px feather) for a point inside a triangle (a,b,c).
+fn tri_cov(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
+    let edge = |q: (f32, f32), r: (f32, f32)| (p.0 - q.0) * (r.1 - q.1) - (p.1 - q.1) * (r.0 - q.0);
+    let (d1, d2, d3) = (edge(a, b), edge(b, c), edge(c, a));
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    if has_neg && has_pos {
+        0.0
+    } else {
+        1.0
+    }
+}
+
+/// "Restart capture" leading icon: a circular arrow (refresh). Drawn in the UI
+/// blue (a coloured menu-item icon, like the status dot) so the recovery action
+/// stands out from the routine items. 32×32.
+fn refresh_icon() -> tauri::image::Image<'static> {
+    const N: i32 = 32;
+    let c = N as f32 / 2.0;
+    let r = 9.0;
+    let stroke = 3.0;
+    // Ring with a gap at the top; an arrowhead caps the gap's clockwise end so
+    // it reads as a refresh, not a plain ring.
+    let gap_center = -std::f32::consts::FRAC_PI_2; // straight up
+    let half_gap = 0.6_f32; // radians (~34°)
+    let end = gap_center + half_gap; // clockwise end of the arc (upper-right)
+    let p_end = (c + r * end.cos(), c + r * end.sin());
+    // Tangent (clockwise) + radial at the arc end → a small arrowhead triangle.
+    let tan = (-end.sin(), end.cos());
+    let nor = (end.cos(), end.sin());
+    let tip = (p_end.0 + tan.0 * 5.0, p_end.1 + tan.1 * 5.0);
+    let base = (p_end.0 - tan.0 * 2.0, p_end.1 - tan.1 * 2.0);
+    let b1 = (base.0 + nor.0 * 4.0, base.1 + nor.1 * 4.0);
+    let b2 = (base.0 - nor.0 * 4.0, base.1 - nor.1 * 4.0);
+    let mut rgba = vec![0u8; (N * N * 4) as usize];
+    for y in 0..N {
+        for x in 0..N {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let dx = px - c;
+            let dy = py - c;
+            let d = (dx * dx + dy * dy).sqrt();
+            // Angular distance from the gap centre — skip the ring inside the gap.
+            let ang = dy.atan2(dx);
+            let mut da = (ang - gap_center).abs();
+            if da > std::f32::consts::PI {
+                da = std::f32::consts::TAU - da;
+            }
+            let ring_cov = if da > half_gap {
+                (1.0 - ((d - r).abs() - stroke / 2.0)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let cov = ring_cov.max(tri_cov((px, py), tip, b1, b2));
+            let i = ((y * N + x) * 4) as usize;
+            rgba[i] = UI_BLUE.0;
+            rgba[i + 1] = UI_BLUE.1;
+            rgba[i + 2] = UI_BLUE.2;
+            rgba[i + 3] = (cov * 255.0) as u8;
+        }
+    }
+    tauri::image::Image::new_owned(rgba, N as u32, N as u32)
+}
+
+/// "Reconnect…" leading icon: a padlock. Drawn in the UI blue (like the status
+/// dot / refresh) so it stands out as the recovery action. 32×32.
+fn lock_icon() -> tauri::image::Image<'static> {
+    const N: i32 = 32;
+    let n = N as f32;
+    let cx = n / 2.0;
+    // Body: rounded rect in the lower half.
+    let (bw, bh) = (15.0_f32, 12.0_f32);
+    let (bx, by) = (cx, 21.0); // body centre
+    let corner = 2.5;
+    // Shackle: top half of a ring above the body.
+    let s_cy = 13.0;
+    let s_r = 5.0;
+    let s_stroke = 2.5;
+    let body_sdf = |px: f32, py: f32| -> f32 {
+        let qx = (px - bx).abs() - (bw / 2.0 - corner);
+        let qy = (py - by).abs() - (bh / 2.0 - corner);
+        let ax = qx.max(0.0);
+        let ay = qy.max(0.0);
+        (ax * ax + ay * ay).sqrt() + qx.max(qy).min(0.0) - corner
+    };
+    let mut rgba = vec![0u8; (N * N * 4) as usize];
+    for y in 0..N {
+        for x in 0..N {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let body_cov = (-body_sdf(px, py) + 0.5).clamp(0.0, 1.0);
+            // Shackle: ring stroke, upper semicircle only (py above its centre).
+            let d = ((px - cx).powi(2) + (py - s_cy).powi(2)).sqrt();
+            let shackle_cov = if py <= s_cy {
+                (1.0 - ((d - s_r).abs() - s_stroke / 2.0)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let cov = body_cov.max(shackle_cov);
+            let i = ((y * N + x) * 4) as usize;
+            rgba[i] = UI_BLUE.0;
+            rgba[i + 1] = UI_BLUE.1;
+            rgba[i + 2] = UI_BLUE.2;
+            rgba[i + 3] = (cov * 255.0) as u8;
+        }
+    }
+    tauri::image::Image::new_owned(rgba, N as u32, N as u32)
 }
 
 /// Menu-bar (Grammarly model): TypeAssist has no Dock icon and lives entirely
@@ -140,21 +259,43 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
     // The locked design-doc v23 §03 "while-learning" menu, top to bottom:
     //   status · Warm-up · Progress · Open TypeAssist · Settings… · ─── · Quit
     // Status is a non-interactive header (disabled, so it never highlights or
-    // fires); its text + dot are updated live by the capture-health listener
-    // below. The active dot is the app's blue accent, rendered as the item's
-    // icon (see `accent_dot`).
+    // fires); its text + dot are updated live by the debounced capture-UI
+    // listener below. Active = a small filled blue dot; stopped = a small hollow
+    // grey ring (see `status_dot`).
     let status = IconMenuItem::with_id(
         app,
         "status",
         status_text(true),
         false,
-        Some(accent_dot()),
+        Some(status_dot(true)),
         None::<&str>,
     )?;
     let practice = MenuItem::with_id(app, "practice", "Warm-up", true, None::<&str>)?;
     let progress = MenuItem::with_id(app, "progress", "Progress", true, None::<&str>)?;
     let open_main = MenuItem::with_id(app, "open_main", "Open TypeAssist", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
+    // Recovery actions — built now, but NOT in the menu while active. The
+    // debounced capture-UI listener inserts exactly one of them directly under
+    // the status when capture has stopped, chosen by the sidecar's permission
+    // signal: "Restart capture" (re-arm/respawn in place — permission intact) or
+    // "Reconnect…" (open the Reconnect panel — Accessibility was revoked). Each
+    // carries a small leading icon so it stands out from the routine items.
+    let restart_item = IconMenuItem::with_id(
+        app,
+        "restart_capture",
+        "Restart capture",
+        true,
+        Some(refresh_icon()),
+        None::<&str>,
+    )?;
+    let reconnect_item = IconMenuItem::with_id(
+        app,
+        "reconnect",
+        "Reconnect…",
+        true,
+        Some(lock_icon()),
+        None::<&str>,
+    )?;
     // M3 correction Step 1 — the menu-bar master gate (instant, one-action
     // global on/off, the brief's "global off") + the curation panel opener. The
     // check's initial state is read off disk so it reflects the persisted gate;
@@ -211,6 +352,16 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
             "practice" => show_practice(app),
             "progress" => show_progress(app),
             "corrections" => show_corrections(app),
+            // Capture-stopped recovery (permission intact): re-arm the tap /
+            // respawn the sidecar in place — no System Settings round-trip.
+            "restart_capture" => {
+                if let Some(sender) = app.try_state::<EngineControlSender>() {
+                    let _ = sender.send(EngineControl::RestartCapture);
+                }
+            }
+            // Capture-stopped recovery (Accessibility revoked): open the
+            // Reconnect panel, which deep-links to Settings and auto-resumes.
+            "reconnect" => show_reconnect(app),
             "corr_toggle" => {
                 let enabled = toggle_for_menu.is_checked().unwrap_or(false);
                 if let Some(sender) = app.try_state::<EngineControlSender>() {
@@ -226,19 +377,43 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
         })
         .build(app)?;
 
-    // Wire the status line to the engine's capture-health signal: blue accent
-    // dot + "active" while `Live`, neutral dot + "paused" otherwise. The item is
-    // updated in place on each transition (the dot follows the same signal the
-    // capture-health panel uses; payload is `{ "state": "live" | … }`).
+    // Wire the status line + recovery item to the engine's DEBOUNCED capture-UI
+    // signal (engine://capture-ui, payload `{ active, permission_revoked }`).
+    // Using the debounced event — not raw capture-health — keeps the menu from
+    // strobing on a transient tap blip: it only flips to stopped once capture
+    // has stayed down past the self-heal window. On each change we (1) set the
+    // status text + dot, and (2) insert/remove the right recovery item directly
+    // under the status (index 1). The routine items are never touched — they
+    // stay usable while stopped.
     {
         let status_item = status.clone();
-        app.listen(engine::EVT_CAPTURE_HEALTH, move |event| {
-            let active = serde_json::from_str::<serde_json::Value>(event.payload())
-                .ok()
-                .and_then(|v| v.get("state").and_then(|s| s.as_str()).map(|s| s == "live"))
+        let menu_ref = menu.clone();
+        let restart = restart_item.clone();
+        let reconnect = reconnect_item.clone();
+        app.listen(engine::EVT_CAPTURE_UI, move |event| {
+            let v = serde_json::from_str::<serde_json::Value>(event.payload()).ok();
+            let active = v
+                .as_ref()
+                .and_then(|v| v.get("active").and_then(|b| b.as_bool()))
+                .unwrap_or(true);
+            let permission_revoked = v
+                .as_ref()
+                .and_then(|v| v.get("permission_revoked").and_then(|b| b.as_bool()))
                 .unwrap_or(false);
             let _ = status_item.set_text(status_text(active));
-            let _ = status_item.set_icon(if active { Some(accent_dot()) } else { None });
+            let _ = status_item.set_icon(Some(status_dot(active)));
+            // Reconcile the recovery item. remove() on an absent item is a
+            // harmless Err, so clearing both first keeps this idempotent.
+            let _ = menu_ref.remove(&restart);
+            let _ = menu_ref.remove(&reconnect);
+            if !active {
+                let item: &dyn IsMenuItem<R> = if permission_revoked {
+                    &reconnect
+                } else {
+                    &restart
+                };
+                let _ = menu_ref.insert(item, 1);
+            }
         });
     }
 
@@ -392,6 +567,23 @@ fn show_corrections<R: Runtime>(app: &AppHandle<R>) {
 #[tauri::command]
 fn open_corrections(app: AppHandle) {
     show_corrections(&app);
+}
+
+/// Show + focus the Reconnect panel (its own webview window, label "reconnect").
+/// Surfaced by the menu-bar "Reconnect…" recovery item when the sidecar reports
+/// Accessibility was revoked. Centred (not tray-anchored), and — unlike the
+/// other panels — it deliberately does NOT hide on blur: the user has to leave
+/// it to flip the switch in System Settings, so it must survive that round-trip
+/// and stay up until it auto-resumes. `reconnect://open` (re)starts its
+/// permission poll; it dismisses itself once capture comes back (see
+/// `ReconnectPanel.svelte`).
+fn show_reconnect<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(w) = app.get_webview_window("reconnect") {
+        let _ = w.center();
+        let _ = w.show();
+        let _ = w.set_focus();
+        let _ = app.emit("reconnect://open", ());
+    }
 }
 
 /// Tauri command: open System Settings ▸ Privacy & Security ▸ Accessibility so the

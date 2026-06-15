@@ -8,6 +8,7 @@ import PracticePanel from "./routes/PracticePanel.svelte";
 import ProgressPanel from "./routes/ProgressPanel.svelte";
 import AllowlistPanel from "./routes/AllowlistPanel.svelte";
 import Cue from "./routes/Cue.svelte";
+import ReconnectPanel from "./routes/ReconnectPanel.svelte";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 // One build, several windows. The menu-bar panels and the correction cue mount
@@ -23,7 +24,9 @@ const Component =
         ? AllowlistPanel
         : label === "cue"
           ? Cue
-          : App;
+          : label === "reconnect"
+            ? ReconnectPanel
+            : App;
 
 const app = new Component({
   target: document.getElementById("app")!,

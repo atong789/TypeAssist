@@ -166,6 +166,18 @@ pub const EVT_PRACTICE_TREND: &str = "engine://practice-trend";
 /// menu-bar surface will subscribe to the same event without a panel
 /// rewrite. Payload is [`CaptureHealthEvent`].
 pub const EVT_CAPTURE_HEALTH: &str = "engine://capture-health";
+/// **Debounced capture-active signal for the menu-bar UI.** `EVT_CAPTURE_HEALTH`
+/// flips on every raw transition (a 2s tap-timeout blip flicks it to Unhealthy
+/// and straight back), which would make the tray icon and status line strobe.
+/// This event is the *settled* view: `active` only goes false once capture has
+/// stayed non-`Live` continuously past the self-heal window (the sidecar
+/// re-arms a disabled tap in ~2s; the watchdog auto-respawns a dead sidecar at
+/// 15s) — see [`NOT_ACTIVE_DEBOUNCE_MS`]. Recovery to `Live` flips `active` back
+/// true immediately (good news isn't debounced). `permission_revoked` tells the
+/// menu which recovery action to surface: false → "Restart capture" (re-arm in
+/// place), true → "Reconnect…" (the sidecar reported Accessibility missing, so
+/// only re-granting recovers). Payload is [`CaptureUiEvent`].
+pub const EVT_CAPTURE_UI: &str = "engine://capture-ui";
 /// **M3 correction Step 1.** The current correction allow-list + master gate,
 /// emitted whenever the engine mutates it (toggle from the panel/tray, or an
 /// Escape teach-stop) and on an explicit `RequestAllowList`. The allow-list
@@ -210,6 +222,15 @@ pub enum CaptureHealth {
 #[derive(Debug, Clone, Copy, Serialize)]
 struct CaptureHealthEvent {
     state: CaptureHealth,
+}
+
+/// Payload for [`EVT_CAPTURE_UI`] — the debounced, menu-bar-facing view of
+/// capture. `active` is the settled state (see the event's doc); when it's
+/// false, `permission_revoked` chooses the recovery action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct CaptureUiEvent {
+    active: bool,
+    permission_revoked: bool,
 }
 
 /// Control commands the engine task accepts from Tauri commands. Sent
@@ -1035,34 +1056,103 @@ const TREND_LOOKUP_N: usize = 64;
 /// recovering hand with a 20–40% slip on a slow finger lights it clearly.
 const PRACTICE_DOT_SLIP_THRESHOLD: f32 = 0.05;
 
-/// Reflect "weak keys worth practicing" in the menu-bar icon by swapping
-/// between the plain and badge-dot **template** images. The signal is the
-/// dot's SHAPE, not colour (a template icon is monochrome), so it reads for
-/// colour-blind users too. Only touches the OS when the state actually
-/// changes, tracked via `last`.
-fn update_tray_dot<R: Runtime>(
-    app: &AppHandle<R>,
-    last: &mut Option<bool>,
-    report: &StabilityReport,
-) {
-    // `weakest` is sorted worst-first, so the head is the highest slip rate.
-    // Light the dot only when that clears the "worth practicing" bar.
-    let want_dot = report
+/// Whether there's a weak key "worth practicing" — drives the menu-bar badge
+/// dot. `weakest` is sorted worst-first, so the head is the highest slip rate;
+/// light the dot only when that clears the bar.
+fn wants_practice_dot(report: &StabilityReport) -> bool {
+    report
         .weakest
         .first()
-        .is_some_and(|(_, slip_rate)| *slip_rate >= PRACTICE_DOT_SLIP_THRESHOLD);
-    if *last == Some(want_dot) {
+        .is_some_and(|(_, slip_rate)| *slip_rate >= PRACTICE_DOT_SLIP_THRESHOLD)
+}
+
+/// The menu-bar "capture stopped" icon: a hollow version of the keyboard glyph
+/// (rounded-square outline, no filled centre) with a diagonal slash through it —
+/// the universal "off" look (like wifi-off). Built in memory as a **template**
+/// (alpha-only; macOS recolours it for the light/dark bar), so the alarm reads
+/// by SHAPE, never colour — NEVER red (a11y + the no-deficit-framing rule).
+/// 44×44 to match `tray-icon.png`, so swapping it in doesn't resize the icon.
+fn capture_off_icon() -> tauri::image::Image<'static> {
+    const N: i32 = 44;
+    let n = N as f32;
+    // Rounded-square outline, matching the base glyph's bounding box + radius.
+    let margin = 8.0;
+    let half = (n - 2.0 * margin) / 2.0; // half side of the square
+    let cx = n / 2.0;
+    let cy = n / 2.0;
+    let corner = 8.0;
+    let ring = 4.0; // outline stroke width
+    // Diagonal slash, top-right → bottom-left (the "no/off" diagonal).
+    let inset = margin - 1.0;
+    let (ax, ay) = (n - inset, inset); // top-right
+    let (bx, by) = (inset, n - inset); // bottom-left
+    let slash = 4.5; // slash stroke width
+
+    // Signed distance to a rounded rectangle centred at (cx,cy).
+    let rrect_sdf = |px: f32, py: f32| -> f32 {
+        let qx = (px - cx).abs() - (half - corner);
+        let qy = (py - cy).abs() - (half - corner);
+        let ax = qx.max(0.0);
+        let ay = qy.max(0.0);
+        (ax * ax + ay * ay).sqrt() + qx.max(qy).min(0.0) - corner
+    };
+    // Distance from a point to the slash segment A→B.
+    let seg_dist = |px: f32, py: f32| -> f32 {
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 0.0 {
+            (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (qx, qy) = (ax + t * dx, ay + t * dy);
+        ((px - qx).powi(2) + (py - qy).powi(2)).sqrt()
+    };
+
+    let mut rgba = vec![0u8; (N * N * 4) as usize];
+    for y in 0..N {
+        for x in 0..N {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            // Outline coverage: within half a stroke of the rounded-rect edge.
+            let ring_cov = (1.0 - (rrect_sdf(px, py).abs() - ring / 2.0)).clamp(0.0, 1.0);
+            // Slash coverage: within half a stroke of the segment.
+            let slash_cov = (1.0 - (seg_dist(px, py) - slash / 2.0)).clamp(0.0, 1.0);
+            let cov = ring_cov.max(slash_cov);
+            let i = ((y * N + x) * 4) as usize;
+            // Template: opaque black, alpha carries the shape.
+            rgba[i + 3] = (cov * 255.0) as u8;
+        }
+    }
+    tauri::image::Image::new_owned(rgba, N as u32, N as u32)
+}
+
+/// Set the menu-bar icon from the two orthogonal signals, only touching the OS
+/// when the rendered state changes (tracked via `last`). The capture-stopped
+/// alarm WINS over the practice badge — a dead capture is the more urgent thing
+/// to show, and stacking both would muddy the glyph. All three are **template**
+/// images (monochrome, OS-recoloured) so the signal is shape, never colour.
+fn apply_tray_icon<R: Runtime>(
+    app: &AppHandle<R>,
+    not_active: bool,
+    practice_dot: bool,
+    last: &mut Option<(bool, bool)>,
+) {
+    let key = (not_active, practice_dot);
+    if *last == Some(key) {
         return;
     }
     if let Some(tray) = app.tray_by_id("main-tray") {
-        let icon = if want_dot {
+        let icon = if not_active {
+            capture_off_icon()
+        } else if practice_dot {
             tauri::include_image!("icons/tray-icon-dot.png")
         } else {
             tauri::include_image!("icons/tray-icon.png")
         };
         let _ = tray.set_icon(Some(icon));
         let _ = tray.set_icon_as_template(true);
-        *last = Some(want_dot);
+        *last = Some(key);
     }
 }
 
@@ -2059,6 +2149,15 @@ const HEARTBEAT_STOPPED_MS: u128 = 15_000;
 /// when nothing has changed — so a panel that just mounted converges
 /// to truth without waiting for a transition.
 const HEALTH_REPEAT_TICKS: u64 = 5;
+/// How long capture must stay continuously non-`Live` before the menu-bar UI
+/// declares it not-active (drives [`EVT_CAPTURE_UI`]). Measured from the moment
+/// health *left* `Live`. Sized to clear the whole self-heal window: a disabled
+/// tap re-arms in the sidecar within ~2s, and a dead sidecar is auto-respawned
+/// at [`HEARTBEAT_STOPPED_MS`] (15s) with its first fresh heartbeat ~2s later —
+/// so 16s gives that one automatic respawn time to land before we alarm. A
+/// transient blip recovers to `Live` (clearing the timer) long before this, so
+/// the icon never strobes; only a genuine, persistent stop trips it.
+const NOT_ACTIVE_DEBOUNCE_MS: u128 = 16_000;
 
 /// Spawn (or respawn) the Swift sidecar — `app.shell().sidecar()` plus
 /// the `TYPEASSIST_AX_PROMPT=1` env that opts into the macOS
@@ -2511,9 +2610,26 @@ pub fn spawn<R: Runtime>(
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut watchdog_ticks: u64 = 0;
 
-        // Last menu-bar dot state (Some(true) = dot shown). `None` until the
-        // first stability emit, so the icon is set once we know the state.
-        let mut last_tray_dot: Option<bool> = None;
+        // Menu-bar icon state, reconciled from two signals (capture-stopped +
+        // practice-dot). `last_tray_icon` is the last `(not_active, practice_dot)`
+        // actually pushed to the OS (`None` until the first set). `current_practice_dot`
+        // persists the latest badge decision between stability emits so a
+        // health-driven icon refresh keeps the badge correct.
+        let mut last_tray_icon: Option<(bool, bool)> = None;
+        let mut current_practice_dot = false;
+
+        // Debounced menu-bar "capture active?" state (drives EVT_CAPTURE_UI).
+        // `non_live_since` = when health last LEFT Live (None while Live), so the
+        // debounce is measured from the start of the outage; `ui_not_active` is
+        // the settled flag the UI renders. `permission_ok` tracks the sidecar's
+        // Accessibility grant — flipped false on a `PermissionRequired`, true on
+        // any heartbeat (a heartbeat means the sidecar built a tap → grant in
+        // effect) — and chooses the recovery action. `last_ui_emit` dedupes the
+        // EVT_CAPTURE_UI emit.
+        let mut non_live_since: Option<Instant> = None;
+        let mut ui_not_active = false;
+        let mut permission_ok = true;
+        let mut last_ui_emit: Option<CaptureUiEvent> = None;
 
         // The receive loop selects between the sidecar event stream,
         // the control channel, and the capture-health watchdog so:
@@ -2706,6 +2822,11 @@ pub fn spawn<R: Runtime>(
                                 "sidecar reports Accessibility permission missing — \
                                  grant in System Settings › Privacy & Security › Accessibility"
                             );
+                            // The Accessibility grant is gone (revoked, or never
+                            // granted on a fresh launch). Remember it so the
+                            // not-active menu surfaces "Reconnect…" rather than
+                            // "Restart capture" — only re-granting can recover.
+                            permission_ok = false;
                         }
                         InputEvent::Heartbeat { tap_enabled, .. } => {
                             // Capture-health proof-of-life. Stamp the
@@ -2717,6 +2838,11 @@ pub fn spawn<R: Runtime>(
                             // last_heartbeat_at to drive staleness
                             // transitions when this arm isn't firing.
                             last_heartbeat_at = Some(Instant::now());
+                            // A heartbeat means the sidecar is alive and built a
+                            // CGEventTap — which requires the Accessibility
+                            // grant — so the permission is in effect again
+                            // (clears a prior revoke once a re-grant takes hold).
+                            permission_ok = true;
                             let new_health = if tap_enabled {
                                 CaptureHealth::Live
                             } else {
@@ -3518,7 +3644,13 @@ pub fn spawn<R: Runtime>(
                             // weakest-keys at session start). Read-only.
                             let report: StabilityReport =
                                 motor_map.stability_report(WEAKEST_PREVIEW_N);
-                            update_tray_dot(&app_handle, &mut last_tray_dot, &report);
+                            current_practice_dot = wants_practice_dot(&report);
+                            apply_tray_icon(
+                                &app_handle,
+                                ui_not_active,
+                                current_practice_dot,
+                                &mut last_tray_icon,
+                            );
                             let _ = app_handle.emit(EVT_MOTOR_STABILITY, report);
                         }
                         EngineControl::RequestPracticeTrend { keys } => {
@@ -3726,7 +3858,9 @@ pub fn spawn<R: Runtime>(
                             motor_map.stability_report(WEAKEST_PREVIEW_N);
                         // Tray "dot" reflects whether there are weak keys worth
                         // practicing — shape, not colour (it's a template icon).
-                        update_tray_dot(&app_handle, &mut last_tray_dot, &report);
+                        // The actual icon push happens below (after the health
+                        // debounce), so capture-stopped can override the badge.
+                        current_practice_dot = wants_practice_dot(&report);
                         let _ = app_handle.emit(EVT_MOTOR_STABILITY, report);
                     }
 
@@ -3785,6 +3919,45 @@ pub fn spawn<R: Runtime>(
                             EVT_CAPTURE_HEALTH,
                             CaptureHealthEvent { state: current_capture_health },
                         );
+                    }
+
+                    // ---- Debounced menu-bar "capture active?" signal. --------
+                    // The raw health above flips on every transient blip; the
+                    // menu-bar icon/status must NOT strobe, so we settle it: not
+                    // active only once capture has been continuously non-Live
+                    // past NOT_ACTIVE_DEBOUNCE_MS (the self-heal window). Going
+                    // back to Live flips active true immediately — good news
+                    // isn't debounced.
+                    if matches!(current_capture_health, CaptureHealth::Live) {
+                        non_live_since = None;
+                    } else if non_live_since.is_none() {
+                        non_live_since = Some(Instant::now());
+                    }
+                    ui_not_active = non_live_since.is_some_and(|since| {
+                        Instant::now().duration_since(since).as_millis() >= NOT_ACTIVE_DEBOUNCE_MS
+                    });
+
+                    // Push the menu-bar icon (capture-stopped overrides the
+                    // practice badge); no-op when unchanged.
+                    apply_tray_icon(
+                        &app_handle,
+                        ui_not_active,
+                        current_practice_dot,
+                        &mut last_tray_icon,
+                    );
+
+                    // Emit the settled UI state on change, and periodically so a
+                    // freshly-registered listener (the tray) converges. The
+                    // recovery action only matters while not active, so pin
+                    // permission_revoked to false when active (avoids a spurious
+                    // change emit from a stale flag).
+                    let ui = CaptureUiEvent {
+                        active: !ui_not_active,
+                        permission_revoked: ui_not_active && !permission_ok,
+                    };
+                    if last_ui_emit != Some(ui) || watchdog_ticks % HEALTH_REPEAT_TICKS == 0 {
+                        let _ = app_handle.emit(EVT_CAPTURE_UI, ui);
+                        last_ui_emit = Some(ui);
                     }
 
                     // Component 5c: daily motor-map snapshot (Principle #6).
