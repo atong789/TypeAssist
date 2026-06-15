@@ -44,6 +44,6 @@ correction-engine = { path = "../../../crates/correction-engine" }
 # pinned to what tauri/muda already resolve, so the NSMenu types are identical.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSNotification", "NSString", "NSArray", "NSOperation"] }
-objc2-app-kit = { version = "0.3", features = ["NSMenu", "NSMenuItem"] }
+objc2-foundation = { version = "0.3", features = ["NSNotification", "NSString", "NSArray", "NSOperation", "NSGeometry"] }
+objc2-app-kit = { version = "0.3", features = ["NSMenu", "NSMenuItem", "NSEvent", "NSApplication", "NSResponder", "NSGraphicsContext"] }
 block2 = "0.6"
