@@ -39,8 +39,8 @@ use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
 use correction_engine::{
     classify_slip, decide, has_motor_evidence, measure_token_motor, normalize_word,
     ranked_known_candidates, score_candidates, should_log, target_is_recordable, AnchorTracker,
-    Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome, GuessLedger,
-    Lexicon, LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver,
+    Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome, GuessLedger, Lexicon,
+    LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver,
     PatternReadiness, ScoredCandidate, SlipClass, StabilityReport, Token, TokenKind, Tokenizer,
     WordFreq, WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
     MAX_PATTERN_EDIT_DISTANCE, MAX_PATTERN_LENGTH_DIFF, SCORE_VERSION,
@@ -1082,7 +1082,7 @@ fn capture_off_icon() -> tauri::image::Image<'static> {
     let cy = n / 2.0;
     let corner = 8.0;
     let ring = 4.0; // outline stroke width
-    // Diagonal slash, top-right → bottom-left (the "no/off" diagonal).
+                    // Diagonal slash, top-right → bottom-left (the "no/off" diagonal).
     let inset = margin - 1.0;
     let (ax, ay) = (n - inset, inset); // top-right
     let (bx, by) = (inset, n - inset); // bottom-left
@@ -2819,13 +2819,17 @@ pub fn spawn<R: Runtime>(
                         }
                         InputEvent::PermissionRequired => {
                             tracing::warn!(
-                                "sidecar reports Accessibility permission missing — \
-                                 grant in System Settings › Privacy & Security › Accessibility"
+                                "sidecar reports a capture permission missing — grant in \
+                                 System Settings › Privacy & Security › Accessibility AND \
+                                 Input Monitoring (capture needs both; an update can revoke \
+                                 either independently)"
                             );
-                            // The Accessibility grant is gone (revoked, or never
-                            // granted on a fresh launch). Remember it so the
-                            // not-active menu surfaces "Reconnect…" rather than
-                            // "Restart capture" — only re-granting can recover.
+                            // A required grant is gone (Accessibility OR Input
+                            // Monitoring — the tap needs Input Monitoring, the AX
+                            // API needs Accessibility), revoked or never granted.
+                            // Remember it so the not-active menu surfaces
+                            // "Reconnect…" rather than "Restart capture" — only
+                            // re-granting can recover.
                             permission_ok = false;
                         }
                         InputEvent::Heartbeat { tap_enabled, .. } => {
@@ -2839,9 +2843,10 @@ pub fn spawn<R: Runtime>(
                             // transitions when this arm isn't firing.
                             last_heartbeat_at = Some(Instant::now());
                             // A heartbeat means the sidecar is alive and built a
-                            // CGEventTap — which requires the Accessibility
-                            // grant — so the permission is in effect again
-                            // (clears a prior revoke once a re-grant takes hold).
+                            // CGEventTap — which requires BOTH the Accessibility
+                            // and Input Monitoring grants — so permissions are in
+                            // effect again (clears a prior revoke once the
+                            // re-grant(s) take hold).
                             permission_ok = true;
                             let new_health = if tap_enabled {
                                 CaptureHealth::Live

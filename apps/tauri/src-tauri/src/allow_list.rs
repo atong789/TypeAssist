@@ -281,7 +281,8 @@ mod tests {
         // A corrupt allow-list must NOT error (which would block startup) and
         // must NOT silently wipe the user's curated list: it's moved aside and
         // the safe-dark default (gate off, no patterns) is returned.
-        let path = std::env::temp_dir().join(format!("ta_allow_corrupt_{}.json", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("ta_allow_corrupt_{}.json", std::process::id()));
         fs::write(&path, b"}{ not valid allow-list json").unwrap();
 
         let al = AllowList::load_from(&path).expect("corrupt load must not error");
@@ -299,7 +300,11 @@ mod tests {
                     && n.contains(".corrupt-")
             })
             .collect();
-        assert_eq!(quarantined.len(), 1, "exactly one quarantine file preserved");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly one quarantine file preserved"
+        );
         let _ = fs::remove_file(quarantined[0].path());
     }
 }

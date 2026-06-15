@@ -5,6 +5,8 @@
 
 mod allow_list;
 mod engine;
+#[cfg(target_os = "macos")]
+mod menu_focus;
 
 use allow_list::AllowList;
 use engine::{EngineControl, EngineControlSender};
@@ -324,13 +326,7 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
     let menu = Menu::with_items(
         app,
         &[
-            &status,
-            &practice,
-            &progress,
-            &open_main,
-            &settings,
-            &sep,
-            &quit,
+            &status, &practice, &progress, &open_main, &settings, &sep, &quit,
         ],
     )?;
 
@@ -590,20 +586,35 @@ fn show_reconnect<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// Tauri command: open System Settings ▸ Accessibility *from the Reconnect panel*
-/// and step the panel out of the way so the user can actually reach the toggle.
-/// The reconnect window is `alwaysOnTop` (so it surfaces over other apps when the
-/// menu opens it); left as-is it floats above System Settings and hides the very
-/// switch the user came to flip. So we drop always-on-top here and let `open`
-/// bring System Settings frontmost — the panel sits behind it. The panel stays
-/// OPEN (it never hides on blur), so it survives the round-trip and is ready to
-/// surface its "reconnected" confirmation via `reconnect_surface`.
-#[tauri::command]
-fn reconnect_open_accessibility(app: AppHandle) {
+/// Step the Reconnect panel out of the way so the user can reach a Settings
+/// toggle. The reconnect window is `alwaysOnTop` (so it surfaces over other apps
+/// when the menu opens it); left as-is it floats above System Settings and hides
+/// the very switch the user came to flip. Dropping always-on-top lets the
+/// subsequent `open` bring System Settings frontmost — the panel sits behind it.
+/// The panel stays OPEN (it never hides on blur), so it survives the round-trip
+/// and is ready to surface its "reconnected" confirmation via `reconnect_surface`.
+fn step_reconnect_aside<R: Runtime>(app: &AppHandle<R>) {
     if let Some(w) = app.get_webview_window("reconnect") {
         let _ = w.set_always_on_top(false);
     }
+}
+
+/// Tauri command: from the Reconnect panel, open System Settings ▸ Accessibility
+/// (one of the two grants capture needs) and step the panel aside.
+#[tauri::command]
+fn reconnect_open_accessibility(app: AppHandle) {
+    step_reconnect_aside(&app);
     open_accessibility_settings();
+}
+
+/// Tauri command: from the Reconnect panel, open System Settings ▸ Input
+/// Monitoring (the other grant capture needs) and step the panel aside. Re-granting
+/// Accessibility alone does NOT restore capture — the keystroke tap needs this
+/// one — so the panel offers a button for each pane.
+#[tauri::command]
+fn reconnect_open_input_monitoring(app: AppHandle) {
+    step_reconnect_aside(&app);
+    open_input_monitoring_settings();
 }
 
 /// Tauri command: bring the Reconnect panel back to the front to show its
@@ -620,15 +631,32 @@ fn reconnect_surface(app: AppHandle) {
     }
 }
 
-/// Tauri command: open System Settings ▸ Privacy & Security ▸ Accessibility so the
-/// user can grant the one permission TypeAssist needs (read keystrokes), used by
-/// the first-run onboarding. Pure UI convenience — it launches the OS settings
-/// pane and reads/writes no user data.
+/// Deep-link a specific System Settings ▸ Privacy & Security pane by its
+/// `x-apple.systempreferences:` anchor. Pure UI convenience — launches the OS
+/// settings pane and reads/writes no user data.
+fn open_privacy_pane(anchor: &str) {
+    let _ = std::process::Command::new("open")
+        .arg(format!(
+            "x-apple.systempreferences:com.apple.preference.security?{anchor}"
+        ))
+        .spawn();
+}
+
+/// Tauri command: open System Settings ▸ Privacy & Security ▸ Accessibility, the
+/// grant the AX API (secure-field focus, correction injection) needs. Used by
+/// first-run onboarding.
 #[tauri::command]
 fn open_accessibility_settings() {
-    let _ = std::process::Command::new("open")
-        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-        .spawn();
+    open_privacy_pane("Privacy_Accessibility");
+}
+
+/// Tauri command: open System Settings ▸ Privacy & Security ▸ Input Monitoring,
+/// the grant the keystroke-capture CGEventTap needs. SEPARATE from Accessibility
+/// and revoked independently (e.g. by an app update), so the reconnect flow must
+/// be able to point the user here too.
+#[tauri::command]
+fn open_input_monitoring_settings() {
+    open_privacy_pane("Privacy_ListenEvent");
 }
 
 /// Tauri command: bring the main window back to the front. Used by onboarding
@@ -926,7 +954,9 @@ pub fn run() {
             open_progress,
             open_corrections,
             open_accessibility_settings,
+            open_input_monitoring_settings,
             reconnect_open_accessibility,
+            reconnect_open_input_monitoring,
             reconnect_surface,
             focus_main_window,
             set_correction_enabled,
@@ -967,9 +997,7 @@ pub fn run() {
                 // C5e: the warm-up / Practice round is gone — resume feeding the
                 // word-freq vocabulary tally from ambient (real) typing.
                 if window.label() == "practice" {
-                    if let Some(sender) =
-                        window.app_handle().try_state::<EngineControlSender>()
-                    {
+                    if let Some(sender) = window.app_handle().try_state::<EngineControlSender>() {
                         let _ = sender.send(EngineControl::SetPromptedCaptureActive(false));
                     }
                 }
@@ -990,6 +1018,12 @@ pub fn run() {
             restore_main_position(app.handle());
 
             let corr_toggle = build_tray(app.handle())?;
+
+            // Make the native tray menu's first keyboard focus land on the
+            // topmost ACTIONABLE item (skipping the disabled status header),
+            // in every state — not AppKit's stale default. See `menu_focus`.
+            #[cfg(target_os = "macos")]
+            menu_focus::install();
 
             // Keep the menu-bar master-gate check in sync with the engine's
             // authoritative state: the engine echoes the whole allow-list on

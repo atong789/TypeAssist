@@ -78,7 +78,7 @@
         "label": "reconnect",
         "title": "Reconnect",
         "width": 440,
-        "height": 380,
+        "height": 440,
         "resizable": false,
         "decorations": false,
         "transparent": true,

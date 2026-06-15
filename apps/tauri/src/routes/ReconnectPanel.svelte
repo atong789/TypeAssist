@@ -1,19 +1,26 @@
 <!-- Reconnect panel — its own webview window (label "reconnect"), shown by the
-     menu-bar "Reconnect…" recovery item when capture has stopped because the
-     Accessibility permission was revoked (e.g. after an update). Reuses
-     onboarding step 2's visual language (privacy/permission framing + the one
-     "Open Accessibility settings" action) but WITHOUT the Back/Next flow.
+     menu-bar "Reconnect…" recovery item when capture has stopped because a
+     required permission was revoked (e.g. after an update). It reuses onboarding
+     step 2's checkmark / "you're all set" VISUAL STYLING for its confirmation —
+     NOT the onboarding component itself: no Back/Next, no dots, no full page.
+     This is a small, self-contained window.
 
-     AUTO-RESUME: while open it polls the permission by asking the engine to
-     restart capture every few seconds; a successful re-arm fires
-     `engine://capture-health` → `live`. Rather than vanish silently, we bring
-     the panel back to the front (System Settings is frontmost then) and show a
-     brief "Reconnected — Jordan is active again" confirmation, then auto-dismiss
-     after ~3s (Done / Esc / ✕ close it sooner). The user gets a clear "it
-     worked." Rust shows + centres the window and does NOT hide it on blur (the
-     user must leave to flip the switch in System Settings), and `Open
-     Accessibility Settings` drops the panel below Settings so the toggle is
-     reachable — so the panel survives that round-trip. -->
+     TWO PERMISSIONS. Capture needs both Accessibility (the AX API: secure-field
+     focus, correction injection) AND Input Monitoring (the keystroke-capture
+     CGEventTap) — separate macOS grants that an update can revoke
+     independently. Re-granting Accessibility alone does NOT restore capture, so
+     the panel offers a button per pane and lets the user grant whatever's off.
+
+     AUTO-RESUME: while open it polls by asking the engine to restart capture
+     every few seconds; capture-health is the SOURCE OF TRUTH — only its
+     `engine://capture-health` → `live` (both grants in effect + tap armed)
+     confirms reconnection. On `live` we bring the panel back to the front
+     (System Settings is frontmost then) and show a "Reconnected — Jordan is
+     active again" confirmation that STAYS until the user dismisses it (Done /
+     Esc / ✕) — no auto-dismiss; a too-fast vanish was unreadable. Rust shows +
+     centres the window and does NOT hide it on blur (the user must leave to flip
+     the switch), and the open-settings buttons drop the panel below Settings so
+     the toggle is reachable — so the panel survives that round-trip. -->
 <script lang="ts">
   import { onMount, onDestroy, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
@@ -31,16 +38,14 @@
   let polling = false;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-  // Once capture is back we don't silently vanish — we surface a brief
-  // "Reconnected" confirmation (mirrors onboarding step 2's "you're all set"),
-  // then auto-dismiss. `reconnected` swaps the panel body to that confirmation.
+  // Once capture is back we don't silently vanish — we surface a "Reconnected"
+  // confirmation (mirrors onboarding step 2's "you're all set" styling) that
+  // STAYS until the user dismisses it. `reconnected` swaps the panel body to it.
   let reconnected = false;
-  const CONFIRM_MS = 3000;
-  let confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Re-check the permission by asking the engine to restart capture. If the
-  // grant is back, the sidecar boots and its first heartbeat flips health to
-  // `live` (handled in onHealth → dismiss). If it's still revoked, the sidecar
+  // Re-check permissions by asking the engine to restart capture. If both grants
+  // are back, the sidecar boots and its first heartbeat flips health to `live`
+  // (handled in onHealth → confirm). If either is still revoked, the sidecar
   // exits again and nothing changes — we just try again on the next tick.
   const POLL_MS = 3000;
   function poll() {
@@ -48,7 +53,6 @@
   }
   function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
-    clearConfirmTimer();
     reconnected = false;
     polling = true;
     poll(); // try immediately, don't wait a full interval
@@ -62,23 +66,18 @@
     }
   }
 
+  // Each open-settings button drops this panel below System Settings (it's
+  // always-on-top) so the user can actually reach the toggle, then opens the
+  // matching pane. The panel stays open and surfaces again once capture returns.
   function openAccessibility() {
-    // Drops this panel below System Settings (it's always-on-top) so the user
-    // can actually reach the toggle, then opens the Accessibility pane. The
-    // panel stays open and surfaces again once capture returns.
     invoke("reconnect_open_accessibility").catch(() => {});
   }
-
-  function clearConfirmTimer() {
-    if (confirmTimer) {
-      clearTimeout(confirmTimer);
-      confirmTimer = null;
-    }
+  function openInputMonitoring() {
+    invoke("reconnect_open_input_monitoring").catch(() => {});
   }
 
   function dismiss() {
     stopPolling();
-    clearConfirmTimer();
     reconnected = false;
     getCurrentWindow()
       .hide()
@@ -86,16 +85,17 @@
   }
 
   function onHealth(state: string | undefined) {
-    // Capture is back — re-armed and live. Don't vanish silently: bring the
-    // panel back to the front (System Settings is frontmost at this point) and
-    // show a brief confirmation, then auto-dismiss after ~3s. The menu-bar
-    // status returns to "Jordan is active" on its own (driven by capture-ui).
+    // Capture is back — both grants in effect and the tap armed (capture-health
+    // is the source of truth). Don't vanish silently: bring the panel to the
+    // front (System Settings is frontmost at this point) and show the
+    // confirmation. It STAYS until the user dismisses it (Done / Esc / ✕) — no
+    // auto-dismiss. The menu-bar status returns to "Jordan is active" on its own
+    // (driven by capture-ui).
     if (!polling || state !== "live" || reconnected) return;
     stopPolling();
     reconnected = true;
     invoke("reconnect_surface").catch(() => {});
     tick().then(() => doneBtn?.focus());
-    confirmTimer = setTimeout(dismiss, CONFIRM_MS);
   }
 
   function onKeydown(event: KeyboardEvent) {
@@ -139,7 +139,6 @@
   });
   onDestroy(() => {
     stopPolling();
-    clearConfirmTimer();
     unlistenHealth?.();
     unlistenOpen?.();
   });
@@ -170,13 +169,18 @@
     </div>
     <h1 class="title">Jordan needs permission again</h1>
     <p class="body">
-      TypeAssist lost access to watch your typing — this can happen after an update. Turn it back on
-      under Accessibility, and Jordan picks up right where it left off.
+      TypeAssist lost access to watch your typing — this can happen after an update. It needs two
+      switches turned back on, then Jordan picks up right where it left off.
     </p>
-    <button class="btn-primary" bind:this={openBtn} on:click={openAccessibility}>
-      Open Accessibility Settings
-    </button>
-    <p class="note">No need to come back here — it reconnects the moment you flip the switch.</p>
+    <div class="actions">
+      <button class="btn-primary" bind:this={openBtn} on:click={openAccessibility}>
+        Open Accessibility Settings
+      </button>
+      <button class="btn-primary" on:click={openInputMonitoring}>
+        Open Input Monitoring Settings
+      </button>
+    </div>
+    <p class="note">No need to come back here — it reconnects the moment both are on.</p>
   {/if}
 </div>
 
@@ -269,6 +273,14 @@
     color: var(--text-secondary);
   }
 
+  /* The two open-settings buttons stack — one per required pane. */
+  .actions {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.55rem;
+    width: 100%;
+  }
   .btn-primary {
     display: inline-flex;
     align-items: center;

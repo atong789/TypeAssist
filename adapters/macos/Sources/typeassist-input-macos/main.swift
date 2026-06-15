@@ -1,5 +1,6 @@
-import Foundation
+import CoreGraphics
 import CoreFoundation
+import Foundation
 
 let bridge = Bridge()
 
@@ -8,12 +9,43 @@ let bridge = Bridge()
 // prompt suppressed — L5 owns that conversation (see Accessibility.swift).
 let promptForAccessibility = ProcessInfo.processInfo.environment["TYPEASSIST_AX_PROMPT"] == "1"
 
-guard Accessibility.isTrusted(prompt: promptForAccessibility) else {
+// Emit permission_required + exit non-zero, staying alive just long enough for
+// the parent to read the event before deciding to relaunch after a grant. Used
+// for BOTH permissions the capture pipeline needs — see below.
+func exitNeedingPermission() -> Never {
     bridge.emit(.permissionRequired)
-    // Stay alive briefly so the parent process can read the event,
-    // then exit non-zero so the parent can decide to relaunch after the user grants.
     Thread.sleep(forTimeInterval: 0.25)
     exit(2)
+}
+
+guard Accessibility.isTrusted(prompt: promptForAccessibility) else {
+    exitNeedingPermission()
+}
+
+// Input Monitoring ("Listen Events") is a SEPARATE TCC grant from Accessibility
+// on macOS 10.15+, and the two are revoked independently — notably an app update
+// can drop Input Monitoring while leaving Accessibility intact. The split is by
+// API: the AX API (secure-field focus, correction injection) needs
+// Accessibility, but the CGEventTap that actually CAPTURES keystrokes needs
+// Input Monitoring. Re-granting Accessibility alone does NOT restore capture.
+//
+// Without this gate, a missing Input Monitoring grant makes the tap below fail
+// to install (exit 3) with no permission signal — so the engine thinks
+// permission is fine and the not-active menu offers a useless "Restart capture"
+// that can never recover. Surfacing permission_required instead routes the menu
+// to "Reconnect…", whose panel guides the user to the Input Monitoring pane.
+//
+// CGRequestListenEventAccess() both (a) prompts on a first, undetermined launch
+// and (b) registers TypeAssist in the Input Monitoring list so the user has a
+// toggle to flip when they get there; once decided it just returns the current
+// state without re-prompting. CGPreflightListenEventAccess() is the pure check.
+if !CGPreflightListenEventAccess() {
+    _ = CGRequestListenEventAccess()
+    if !CGPreflightListenEventAccess() {
+        FileHandle.standardError.write(
+            Data("Input Monitoring permission missing — grant in System Settings › Privacy & Security › Input Monitoring\n".utf8))
+        exitNeedingPermission()
+    }
 }
 
 // Secure-field gate (Layer 2 cache): start tracking focus BEFORE the tap so
@@ -24,8 +56,14 @@ secureMonitor.start()
 
 let tap = EventTap(bridge: bridge, secureMonitor: secureMonitor)
 guard tap.start() else {
-    FileHandle.standardError.write(Data("failed to install CGEventTap\n".utf8))
-    exit(3)
+    // We passed both preflights above, yet the tap still wouldn't install. The
+    // overwhelmingly likely cause is Input Monitoring being revoked in the
+    // window between the check and tapCreate (or a TCC state that preflight
+    // reported stale). Treat it as a permission issue — not a silent exit 3 —
+    // so the menu routes to "Reconnect…" rather than a "Restart capture" that
+    // can't recover. (The tapCreate attempt also (re)lists us in the pane.)
+    FileHandle.standardError.write(Data("failed to install CGEventTap — Input Monitoring likely missing\n".utf8))
+    exitNeedingPermission()
 }
 
 bridge.emit(.ready)
