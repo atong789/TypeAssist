@@ -6,10 +6,14 @@
 
      AUTO-RESUME: while open it polls the permission by asking the engine to
      restart capture every few seconds; a successful re-arm fires
-     `engine://capture-health` → `live`, and we dismiss ourselves. The user
-     never has to come back here. Rust shows + centres the window and does NOT
-     hide it on blur (the user must leave to flip the switch in System
-     Settings), so the panel survives that round-trip. -->
+     `engine://capture-health` → `live`. Rather than vanish silently, we bring
+     the panel back to the front (System Settings is frontmost then) and show a
+     brief "Reconnected — Jordan is active again" confirmation, then auto-dismiss
+     after ~3s (Done / Esc / ✕ close it sooner). The user gets a clear "it
+     worked." Rust shows + centres the window and does NOT hide it on blur (the
+     user must leave to flip the switch in System Settings), and `Open
+     Accessibility Settings` drops the panel below Settings so the toggle is
+     reachable — so the panel survives that round-trip. -->
 <script lang="ts">
   import { onMount, onDestroy, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
@@ -18,6 +22,7 @@
 
   let rootEl: HTMLElement;
   let openBtn: HTMLButtonElement | undefined;
+  let doneBtn: HTMLButtonElement | undefined;
 
   // We only react to capture coming back (and only keep respawning the sidecar)
   // while the panel is actually open — `polling` gates both, so a `live` event
@@ -25,6 +30,13 @@
   // churn the sidecar in the background.
   let polling = false;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Once capture is back we don't silently vanish — we surface a brief
+  // "Reconnected" confirmation (mirrors onboarding step 2's "you're all set"),
+  // then auto-dismiss. `reconnected` swaps the panel body to that confirmation.
+  let reconnected = false;
+  const CONFIRM_MS = 3000;
+  let confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Re-check the permission by asking the engine to restart capture. If the
   // grant is back, the sidecar boots and its first heartbeat flips health to
@@ -36,6 +48,8 @@
   }
   function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
+    clearConfirmTimer();
+    reconnected = false;
     polling = true;
     poll(); // try immediately, don't wait a full interval
     pollTimer = setInterval(poll, POLL_MS);
@@ -49,20 +63,39 @@
   }
 
   function openAccessibility() {
-    invoke("open_accessibility_settings").catch(() => {});
+    // Drops this panel below System Settings (it's always-on-top) so the user
+    // can actually reach the toggle, then opens the Accessibility pane. The
+    // panel stays open and surfaces again once capture returns.
+    invoke("reconnect_open_accessibility").catch(() => {});
+  }
+
+  function clearConfirmTimer() {
+    if (confirmTimer) {
+      clearTimeout(confirmTimer);
+      confirmTimer = null;
+    }
   }
 
   function dismiss() {
     stopPolling();
+    clearConfirmTimer();
+    reconnected = false;
     getCurrentWindow()
       .hide()
       .catch((e) => console.error("reconnect panel hide failed:", e));
   }
 
   function onHealth(state: string | undefined) {
-    // Capture is back — re-armed and live. Auto-resume: dismiss; the menu-bar
+    // Capture is back — re-armed and live. Don't vanish silently: bring the
+    // panel back to the front (System Settings is frontmost at this point) and
+    // show a brief confirmation, then auto-dismiss after ~3s. The menu-bar
     // status returns to "Jordan is active" on its own (driven by capture-ui).
-    if (polling && state === "live") dismiss();
+    if (!polling || state !== "live" || reconnected) return;
+    stopPolling();
+    reconnected = true;
+    invoke("reconnect_surface").catch(() => {});
+    tick().then(() => doneBtn?.focus());
+    confirmTimer = setTimeout(dismiss, CONFIRM_MS);
   }
 
   function onKeydown(event: KeyboardEvent) {
@@ -106,6 +139,7 @@
   });
   onDestroy(() => {
     stopPolling();
+    clearConfirmTimer();
     unlistenHealth?.();
     unlistenOpen?.();
   });
@@ -120,18 +154,30 @@
     </svg>
   </button>
 
-  <div class="badge" aria-hidden="true">
-    <i class="ti ti-lock"></i>
-  </div>
-  <h1 class="title">Jordan needs permission again</h1>
-  <p class="body">
-    TypeAssist lost access to watch your typing — this can happen after an update. Turn it back on
-    under Accessibility, and Jordan picks up right where it left off.
-  </p>
-  <button class="btn-primary" bind:this={openBtn} on:click={openAccessibility}>
-    Open Accessibility Settings
-  </button>
-  <p class="note">No need to come back here — it reconnects the moment you flip the switch.</p>
+  {#if reconnected}
+    <div class="badge badge-ok" aria-hidden="true">
+      <i class="ti ti-circle-check"></i>
+    </div>
+    <h1 class="title">Reconnected</h1>
+    <p class="confirm">
+      <i class="ti ti-circle-check confirm-icon" aria-hidden="true"></i>
+      <span>Reconnected — Jordan is active again.</span>
+    </p>
+    <button class="btn-primary" bind:this={doneBtn} on:click={dismiss}>Done</button>
+  {:else}
+    <div class="badge" aria-hidden="true">
+      <i class="ti ti-lock"></i>
+    </div>
+    <h1 class="title">Jordan needs permission again</h1>
+    <p class="body">
+      TypeAssist lost access to watch your typing — this can happen after an update. Turn it back on
+      under Accessibility, and Jordan picks up right where it left off.
+    </p>
+    <button class="btn-primary" bind:this={openBtn} on:click={openAccessibility}>
+      Open Accessibility Settings
+    </button>
+    <p class="note">No need to come back here — it reconnects the moment you flip the switch.</p>
+  {/if}
 </div>
 
 <style>
@@ -186,6 +232,28 @@
   }
   .badge .ti {
     font-size: 1.3rem;
+  }
+  /* Reconnected state — blue check, never green (mirrors onboarding step 2). */
+  .badge-ok {
+    background: color-mix(in srgb, var(--link) 14%, canvas);
+    color: var(--link);
+  }
+
+  /* "you're all set" confirmation line — same shape as onboarding's .ob-granted. */
+  .confirm {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    margin: 0 0 1.1rem;
+    font-size: 0.95rem;
+    line-height: 1.55;
+    color: canvastext;
+  }
+  .confirm-icon {
+    flex-shrink: 0;
+    margin-top: 0.05rem;
+    font-size: 1.15rem;
+    color: var(--link);
   }
 
   .title {

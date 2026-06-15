@@ -579,10 +579,44 @@ fn open_corrections(app: AppHandle) {
 /// `ReconnectPanel.svelte`).
 fn show_reconnect<R: Runtime>(app: &AppHandle<R>) {
     if let Some(w) = app.get_webview_window("reconnect") {
+        // Re-arm always-on-top in case a previous open dropped it to reach the
+        // Settings toggle (see `reconnect_open_accessibility`) — a fresh open
+        // should surface above other apps.
+        let _ = w.set_always_on_top(true);
         let _ = w.center();
         let _ = w.show();
         let _ = w.set_focus();
         let _ = app.emit("reconnect://open", ());
+    }
+}
+
+/// Tauri command: open System Settings ▸ Accessibility *from the Reconnect panel*
+/// and step the panel out of the way so the user can actually reach the toggle.
+/// The reconnect window is `alwaysOnTop` (so it surfaces over other apps when the
+/// menu opens it); left as-is it floats above System Settings and hides the very
+/// switch the user came to flip. So we drop always-on-top here and let `open`
+/// bring System Settings frontmost — the panel sits behind it. The panel stays
+/// OPEN (it never hides on blur), so it survives the round-trip and is ready to
+/// surface its "reconnected" confirmation via `reconnect_surface`.
+#[tauri::command]
+fn reconnect_open_accessibility(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("reconnect") {
+        let _ = w.set_always_on_top(false);
+    }
+    open_accessibility_settings();
+}
+
+/// Tauri command: bring the Reconnect panel back to the front to show its
+/// "reconnected" confirmation. Capture returns while System Settings is
+/// frontmost, so we re-activate our window over it and restore always-on-top
+/// (dropped by `reconnect_open_accessibility`) so the confirmation is what the
+/// user sees.
+#[tauri::command]
+fn reconnect_surface(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("reconnect") {
+        let _ = w.set_always_on_top(true);
+        let _ = w.show();
+        let _ = w.set_focus();
     }
 }
 
@@ -892,6 +926,8 @@ pub fn run() {
             open_progress,
             open_corrections,
             open_accessibility_settings,
+            reconnect_open_accessibility,
+            reconnect_surface,
             focus_main_window,
             set_correction_enabled,
             set_pattern_enabled,
