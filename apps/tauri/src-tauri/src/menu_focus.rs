@@ -6,21 +6,20 @@
 //! NOTHING highlighted, so the user must press a key first, and Tab (not a menu
 //! key) jumps past Warm-up/Progress to "Open TypeAssist". The disabled status
 //! header must be skipped and the first actionable item (Warm-up while active;
-//! Reconnect… / Restart capture while stopped) should be lit the moment the menu
-//! opens.
+//! Reconnect… / Restart capture while stopped) is lit the moment the menu opens.
 //!
 //! What didn't work, and why this does. Setting `highlightedItem` is a no-op on
 //! macOS 26 (verified on device). Posting a synthetic Down-arrow AT
 //! begin-tracking also did nothing — the tracking run-loop hasn't started
 //! pumping events yet when that notification fires, so the event is never
-//! consumed (verified on device: rows ARE arrow-navigable, but the open-time
-//! post had no effect). The fix: DEFER into the tracking run-loop. We reach the
-//! menu via the public `NSMenuDidBeginTracking` notification, then
+//! consumed. The fix: DEFER into the tracking run-loop. We reach the menu via
+//! the public `NSMenuDidBeginTracking` notification, then
 //! `performSelector:withObject:afterDelay:inModes:[NSEventTrackingRunLoopMode]`
 //! schedules our callback to run a beat later, WHILE the menu is actively
-//! tracking. From there we (a) try the highlight setter at the right timing and
-//! (b) if it still didn't take, post a Down-arrow — which the now-pumping
-//! tracking loop consumes, moving the highlight to the first selectable row.
+//! tracking. From there we (a) try the highlight setter (a fast path for any OS
+//! where it works) and (b) if it didn't take, post a Down-arrow — which the
+//! now-pumping tracking loop consumes, moving the highlight to the first
+//! selectable row. Verified on device (macOS 26): Warm-up is lit on open.
 //!
 //! Capture integrity (Principle #7). The Down-arrow is posted with
 //! `NSApplication.postEvent:atStart:` — the app's Cocoa event queue, NOT the
@@ -28,8 +27,7 @@
 //!
 //! Scope + safety. Everything is gated to OUR menu (first row = the disabled
 //! "Jordan …" status header), so other menus are untouched, and a stray Down in
-//! our own tracking session is harmless. A one-time `MENU_FOCUS` stderr dump of
-//! the items + the post-attempt highlight state aids any future diagnosis.
+//! our own tracking session is harmless.
 
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, Sel};
@@ -41,9 +39,7 @@ use objc2_app_kit::{
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSNotification, NSNotificationCenter, NSPoint, NSString,
 };
-use std::io::Write;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use block2::RcBlock;
 
@@ -51,17 +47,6 @@ use block2::RcBlock;
 const KEYCODE_DOWN: u16 = 125;
 /// `NSDownArrowFunctionKey` — the unicode the arrow key carries.
 const DOWN_ARROW_UNICHAR: &str = "\u{F701}";
-
-/// Emit the one-time item dump once (avoid one block per open).
-static DUMP_DONE: AtomicBool = AtomicBool::new(false);
-
-/// Verbose trace for the first few opens while behaviour is being nailed down.
-static TRACE_FIRES: AtomicUsize = AtomicUsize::new(0);
-fn trace(msg: &str) {
-    if TRACE_FIRES.load(Ordering::Relaxed) < 16 {
-        let _ = writeln!(std::io::stderr(), "MENU_FOCUS {msg}");
-    }
-}
 
 define_class!(
     /// Carries our deferred "select the first item" callback so it can be
@@ -108,7 +93,6 @@ pub fn install() {
         )
     };
     std::mem::forget(token);
-    trace("observer installed");
 }
 
 fn on_menu_begin_tracking(notif: &NSNotification) {
@@ -118,11 +102,6 @@ fn on_menu_begin_tracking(notif: &NSNotification) {
     };
     if !is_our_tray_menu(menu) {
         return;
-    }
-    TRACE_FIRES.fetch_add(1, Ordering::Relaxed);
-
-    if !DUMP_DONE.swap(true, Ordering::SeqCst) {
-        dump_items(menu);
     }
 
     // Defer selection into the tracking run-loop: the tracking loop isn't
@@ -147,7 +126,6 @@ fn on_menu_begin_tracking(notif: &NSNotification) {
             inModes: &*modes,
         ];
     }
-    trace("scheduled mid-tracking selection");
 }
 
 /// Identify our tray menu: its first row is the status header — the only menu we
@@ -174,23 +152,20 @@ fn first_actionable_item(menu: &NSMenu) -> Option<Retained<NSMenuItem>> {
 }
 
 /// Runs WHILE the menu is tracking. Try to set the highlight directly; if that
-/// still doesn't take (the setter is a no-op on this macOS), post a Down-arrow,
-/// which the now-pumping tracking loop consumes to select the first item.
+/// doesn't take (the setter is a no-op on macOS 26), post a Down-arrow, which
+/// the now-pumping tracking loop consumes to select the first item.
 fn select_first_item_mid_tracking(menu: &NSMenu) {
     let Some(item) = first_actionable_item(menu) else {
-        trace("mid-tracking: no actionable item");
         return;
     };
     try_set_highlight(menu, &item);
     if menu.highlightedItem().is_none() {
         post_down_arrow();
-        trace("mid-tracking: setter no-op → posted Down-arrow");
-    } else {
-        trace("mid-tracking: setter applied");
     }
 }
 
-/// Try the known private highlight setters (object-arg). A no-op if none stick.
+/// Try the known private highlight setters (object-arg). A no-op if none stick
+/// (the case on macOS 26); kept as a fast path for any OS where it does work.
 fn try_set_highlight(menu: &NSMenu, item: &NSMenuItem) {
     let known: [Sel; 4] = [
         sel!(setHighlightedItem:),
@@ -235,26 +210,4 @@ fn post_down_arrow() {
     if let Some(event) = event {
         app.postEvent_atStart(&event, true);
     }
-}
-
-/// One-time stderr dump of every row's title + keyboard-relevant flags.
-fn dump_items(menu: &NSMenu) {
-    let n = menu.numberOfItems();
-    let mut out = String::from("items: ");
-    for i in 0..n {
-        let Some(it) = menu.itemAtIndex(i) else {
-            continue;
-        };
-        let kind = if it.isSeparatorItem() { "sep" } else { "item" };
-        out.push_str(&format!(
-            "[{kind} '{}' en={} hid={} sub={} act={} view={}] ",
-            it.title(),
-            it.isEnabled(),
-            it.isHidden(),
-            it.hasSubmenu(),
-            it.action().is_some(),
-            it.view().is_some(),
-        ));
-    }
-    trace(&out);
 }
