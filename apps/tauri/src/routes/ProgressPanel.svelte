@@ -73,6 +73,11 @@
   // The figure is revealed only on tap/focus/hover (brief: no numbers on keys).
   let selectedKey: string | null = null;
   let hoveredKey: string | null = null;
+  // Roving tabindex over the QWERTY board: it's a spatial grid, so it's ONE Tab
+  // stop and the arrow keys move between keys (Tab → arrows). Exactly one key
+  // has tabindex 0 (the roving key); the rest are -1.
+  let rovingKey = "q";
+  let keyEls: Record<string, HTMLButtonElement> = {};
   // The row that opened the keyboard, so focus is restored to it on back.
   let openerEl: HTMLElement | null = null;
 
@@ -372,6 +377,7 @@
     openerEl = opener;
     selectedKey = null;
     hoveredKey = null;
+    rovingKey = "q"; // predictable: Tab into the board lands on the top-left key
     view = "keyboard";
     tick().then(() => backEl?.focus());
   }
@@ -383,19 +389,57 @@
     tick().then(() => target?.focus());
   }
 
-  // Switch which score the keyboard shows (one-hand: 1/2 or ←/→, no chord).
+  // Switch which score the keyboard shows (one-hand: 1/2, no chord).
   function setScore(score: Score) {
     kbScore = score;
     selectedKey = null;
     hoveredKey = null;
   }
 
+  // Arrow navigation across the QWERTY board (the board is a spatial grid, so
+  // keys move with arrows, not Tab). Left/Right step within the row; Up/Down
+  // land on the nearest key in the row above/below (clamped to that row's
+  // length). Row ends are predictable: Left at column 0 / Right at the last
+  // column stays put, and Up from the top row / Down from the bottom row is a
+  // no-op (left to bubble — the window handler ignores ↑/↓ in this view).
+  // stopPropagation keeps the window-level ←/→ handler from also firing.
+  function onKeyKeydown(event: KeyboardEvent, r: number, c: number) {
+    let nr = r;
+    let nc = c;
+    switch (event.key) {
+      case "ArrowLeft":
+        nc = Math.max(0, c - 1);
+        break;
+      case "ArrowRight":
+        nc = Math.min(KB_ROWS[r].length - 1, c + 1);
+        break;
+      case "ArrowUp":
+        if (r === 0) return;
+        nr = r - 1;
+        nc = Math.min(c, KB_ROWS[nr].length - 1);
+        break;
+      case "ArrowDown":
+        if (r === KB_ROWS.length - 1) return;
+        nr = r + 1;
+        nc = Math.min(c, KB_ROWS[nr].length - 1);
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    keyEls[KB_ROWS[nr][nc]]?.focus();
+  }
+
   // Minimal focus trap — a separate window, so App.svelte's trap doesn't cover
   // it (same pattern as PracticePanel). Also owns the one-hand tab switching.
   function tabbables(): HTMLElement[] {
     if (!rootEl) return [];
+    // Exclude tabindex="-1" everywhere — the QWERTY board is a roving-tabindex
+    // grid, so only its one roving key is a real Tab stop (the rest are -1 and
+    // must not count as trap boundaries).
     const sel =
-      'a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])';
+      'a[href]:not([tabindex="-1"]), button:not([disabled]):not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])';
     return Array.from(rootEl.querySelectorAll<HTMLElement>(sel)).filter(
       (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length),
     );
@@ -414,9 +458,9 @@
       return;
     }
 
-    // 1/2 or ←/→ commit immediately, no chord. In the keyboard sub-view they
-    // switch which score is shown; on the tabs they switch tab. ↑/↓/space are
-    // left alone so they scroll natively.
+    // 1/2 commit immediately, no chord. In the keyboard sub-view they switch
+    // which score is shown; on the tabs they switch tab. ↑/↓/space are left
+    // alone so they scroll natively.
     if (event.key === "1") {
       event.preventDefault();
       if (view === "keyboard") setScore("precision");
@@ -430,12 +474,12 @@
       return;
     }
     if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      // On the tabs, ←/→ switch tab. In the keyboard sub-view the arrows move
+      // between keys (handled on the focused key button via onKeyKeydown), so
+      // the window leaves them alone here.
+      if (view === "keyboard") return;
       event.preventDefault();
-      if (view === "keyboard") {
-        setScore(kbScore === "precision" ? "coordination" : "precision");
-      } else {
-        selectTab(activeTab === "statistics" ? "impact" : "statistics", true);
-      }
+      selectTab(activeTab === "statistics" ? "impact" : "statistics", true);
       return;
     }
 
@@ -564,17 +608,23 @@
         <div class="kb-board" role="group" aria-label="{scoreLabel(kbScore)} by key">
           {#each KB_ROWS as rowKeys, r}
             <div class="kb-row" style="padding-left: {KB_STAGGER[r] * 2.5}rem">
-              {#each rowKeys.split("") as letter}
+              {#each rowKeys.split("") as letter, c}
                 {@const k = scoreByKey.get(letter)}
                 <button
                   class="kb-key"
                   class:muted={!k || !k.well_sampled}
                   class:selected={selectedKey === letter}
                   style={keyStyle(letter)}
+                  tabindex={rovingKey === letter ? 0 : -1}
                   aria-label={keyReadout(letter)}
                   aria-pressed={selectedKey === letter}
+                  bind:this={keyEls[letter]}
                   on:click={() => (selectedKey = selectedKey === letter ? null : letter)}
-                  on:focus={() => (hoveredKey = letter)}
+                  on:keydown={(e) => onKeyKeydown(e, r, c)}
+                  on:focus={() => {
+                    rovingKey = letter;
+                    hoveredKey = letter;
+                  }}
                   on:blur={() => (hoveredKey = null)}
                   on:mouseenter={() => (hoveredKey = letter)}
                   on:mouseleave={() => (hoveredKey = null)}
