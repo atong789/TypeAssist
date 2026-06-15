@@ -305,7 +305,22 @@ fn show_main<R: Runtime>(app: &AppHandle<R>, route: &str) {
 
 /// Anchor the Practice panel under the tray icon, show + focus it. It hides on
 /// blur (see `on_window_event`), so it behaves like a menu-bar dropdown.
+///
+/// Warm-up is a full-screen takeover, not a second window: hide the main window
+/// first so the warm-up panel is the only thing on screen (no two windows
+/// competing when launched from Today). When warm-up ends — finish, close, or
+/// blur — it just hides and returns to the menu bar; nothing here reopens the
+/// main window, so a launch from Today and a launch from the menu end the same
+/// way. Hiding main *before* showing practice avoids any focus shuffle blurring
+/// the practice window into the hide-on-blur path.
 fn show_practice<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.hide();
+        // A native hide doesn't fire visibilitychange, so signal the webview to
+        // drop keyboard focus — same as the CloseRequested path — or a stale
+        // focus ring returns on the next open.
+        let _ = app.emit("app://main-hidden", ());
+    }
     if let Some(w) = app.get_webview_window("practice") {
         let _ = w.move_window(Position::TrayBottomCenter);
         let _ = w.show();
