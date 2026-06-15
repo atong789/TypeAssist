@@ -595,7 +595,7 @@
     class="scroll"
     role="tabpanel"
     id="panel-progress"
-    tabindex="0"
+    tabindex={view === "keyboard" ? -1 : 0}
     aria-labelledby={activeTab === "statistics" ? "tab-statistics" : "tab-impact"}
     bind:this={scrollEl}
   >
@@ -1111,6 +1111,12 @@
     display: flex;
     flex-direction: column;
     gap: 1rem;
+    /* The focused-key ring is outset (outline-offset: 2px + 3px outline = 5px
+       beyond the key). The board is the scroll region's content and `.scroll`
+       clips overflow (overflow-y: auto makes overflow-x compute to auto too),
+       so without room the top-row and edge rings get clipped. This padding
+       gives the ring space to draw fully on every edge. */
+    padding: 6px;
   }
   .kb-board {
     display: flex;
