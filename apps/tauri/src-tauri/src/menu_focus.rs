@@ -39,9 +39,19 @@ use objc2_app_kit::{NSMenu, NSMenuDelegate, NSMenuDidBeginTrackingNotification, 
 use objc2_foundation::{MainThreadMarker, NSNotification, NSNotificationCenter};
 use std::io::Write;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use block2::RcBlock;
+
+/// Verbose trace for the first few menu opens so we can see, on stderr, whether
+/// the hook fires, whether we identify our menu, and which setter applied —
+/// ground truth while the behavior is still being nailed down. Quiet afterward.
+static TRACE_FIRES: AtomicUsize = AtomicUsize::new(0);
+fn trace(msg: &str) {
+    if TRACE_FIRES.load(Ordering::Relaxed) < 12 {
+        let _ = writeln!(std::io::stderr(), "MENU_FOCUS {msg}");
+    }
+}
 
 /// Whether our delegate is installed yet (installed once, on the first open of
 /// our menu). The highlight itself runs on EVERY open, from two timings that are
@@ -99,15 +109,26 @@ pub fn install() {
         )
     };
     std::mem::forget(token);
+    trace("observer installed");
 }
 
 fn on_menu_begin_tracking(notif: &NSNotification) {
     // The notification's `object` is the NSMenu that began tracking.
     let Some(obj) = notif.object() else { return };
     let Some(menu) = obj.downcast_ref::<NSMenu>() else {
+        trace("beginTracking: object is not an NSMenu");
         return;
     };
-    if !is_our_tray_menu(menu) {
+    let ours = is_our_tray_menu(menu);
+    let first_title = menu
+        .itemArray()
+        .firstObject()
+        .map(|it| it.title().to_string());
+    trace(&format!(
+        "beginTracking fired; ours={ours} firstItem={first_title:?}"
+    ));
+    TRACE_FIRES.fetch_add(1, Ordering::Relaxed);
+    if !ours {
         return;
     }
 
@@ -154,9 +175,16 @@ fn first_actionable_item(menu: &NSMenu) -> Option<Retained<NSMenuItem>> {
 
 fn highlight_first_actionable(menu: &NSMenu) {
     let Some(item) = first_actionable_item(menu) else {
+        trace("no actionable item found");
         return;
     };
-    if try_set_highlight(menu, &item).is_none() && !DIAG_DONE.swap(true, Ordering::SeqCst) {
+    let applied = try_set_highlight(menu, &item);
+    trace(&format!(
+        "target='{}' setterApplied={applied:?} highlightedNow={:?}",
+        item.title(),
+        menu.highlightedItem().map(|h| h.title().to_string()),
+    ));
+    if applied.is_none() && !DIAG_DONE.swap(true, Ordering::SeqCst) {
         // Nothing applied — emit ground-truth ONCE so the working selector can
         // be pinned without another guessing round.
         dump_diagnostics(menu);
