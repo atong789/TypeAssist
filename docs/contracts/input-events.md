@@ -39,10 +39,18 @@ Broken out from `key` because self-corrections are signal, not noise. L4 records
 
 ### `permission_required`
 
-Emitted at startup if the OS-level Accessibility permission is missing. The sidecar exits with status 2 immediately after.
+Emitted at startup if a required OS-level permission is missing (Accessibility OR Input Monitoring — capture needs both). The sidecar exits with status 2 immediately after. A `permission_status` (below) is emitted just *before* this, so a partial grant is observable even on a spawn that's about to exit.
 
 ```json
 { "type": "permission_required" }
+```
+
+### `permission_status`
+
+Reports the two **independent** macOS grants the capture pipeline needs — `accessibility` (the AX API: secure-field focus + correction injection) and `input_monitoring` (the CGEventTap that captures keystrokes). Both are read-only, no-prompt checks (`AXIsProcessTrusted` / `IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)`), safe to poll. Emitted **before** the startup permission gates (on every spawn) and again on each `heartbeat`. Unlike the aggregate capture-health `live` flag — which can only be observed once *both* grants are in effect, because the sidecar exits before its first heartbeat otherwise — this surfaces a partial grant, so first-run onboarding and the Reconnect panel can tick each permission row the moment its own grant lands.
+
+```json
+{ "type": "permission_status", "accessibility": true, "input_monitoring": false }
 ```
 
 ### `ready`

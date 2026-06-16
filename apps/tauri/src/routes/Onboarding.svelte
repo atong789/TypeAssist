@@ -20,11 +20,29 @@
   let step = 1;
   let name = ""; // starts empty on a true first run; kept across Back/Next
   let restoreOpen = false;
-  let axOn = false; // is Accessibility (capture) currently on? (drives step 2)
+  // Capture needs TWO macOS grants — Accessibility (AX: focus + injection) AND
+  // Input Monitoring (the keystroke CGEventTap). Two signals drive step 2:
+  //  • `engine://permission-status` gives each grant's OWN read-only state
+  //    (`axGranted` / `imGranted`), so each row ticks the moment ITS permission
+  //    lands — even while the other is still pending (the whole point of the
+  //    screen: people didn't realise BOTH were required).
+  //  • `engine://capture-health` → `live` means both grants are in effect AND
+  //    the tap is armed. That stays the gate for auto-advance + Next; the two
+  //    booleans drive only the per-row visual status.
+  let axGranted = false;
+  let imGranted = false;
+  let captureLive = false;
+  // `live` implies both grants, but it can arrive a beat before a fresh
+  // permission-status snapshot (or when we arrive already-on via Back/replay
+  // before any snapshot lands) — so fold it in to avoid a row flashing "pending"
+  // when capture is demonstrably running.
+  $: axOn = axGranted || captureLive;
+  $: imOn = imGranted || captureLive;
 
   let rootEl: HTMLElement;
   let inputEl: HTMLInputElement | undefined;
-  let openBtn: HTMLButtonElement | undefined;
+  let openBtn: HTMLButtonElement | undefined; // Accessibility row's "Open …" button
+  let openImBtn: HTMLButtonElement | undefined; // Input Monitoring row's "Open …" button
   let nextBtn: HTMLButtonElement | undefined;
   let getStartedBtn: HTMLButtonElement | undefined;
 
@@ -37,50 +55,89 @@
   async function goTo(n: number) {
     persistName();
     step = Math.max(1, Math.min(3, n));
+    // Poll for the grants only while sitting on step 2 with capture still off
+    // (mirrors Reconnect's auto-resume). Arriving already-live (Back/replay) does
+    // NOT poll — we hold still and just show the two confirmations.
+    if (step === 2 && !captureLive) ensurePolling();
+    else stopPolling();
     await tick();
     focusStep();
   }
 
   // Focus on arrival lands directly on the step's MAIN ACTION — no Tab needed.
-  // Step 2's main action depends on whether Accessibility is already on: the
-  // "Open Accessibility settings" button when off, otherwise Next. The ring shows
-  // immediately (controls style :focus, not only :focus-visible). A rAF re-apply
-  // corrects any late focus shift — e.g. a just-removed button dumping focus.
+  // Step 2 lands on the first STILL-PENDING permission's "Open … Settings"
+  // button (so a half-granted return points at the one left to do); once both
+  // are granted it lands on Next. The ring shows immediately (controls style
+  // :focus, not only :focus-visible). A rAF re-apply corrects any late focus
+  // shift — e.g. a just-removed button dumping focus.
+  function step2Target() {
+    if (captureLive) return nextBtn;
+    if (!axOn) return openBtn;
+    if (!imOn) return openImBtn;
+    return nextBtn; // both granted, tap still arming — Next enables on `live`
+  }
   function focusStep() {
-    const target = () =>
-      step === 1 ? inputEl : step === 2 ? (axOn ? nextBtn : openBtn) : getStartedBtn;
+    const target = () => (step === 1 ? inputEl : step === 2 ? step2Target() : getStartedBtn);
     const apply = () => target()?.focus();
     apply();
     requestAnimationFrame(apply);
   }
 
+  // The two open-settings buttons reuse the existing per-pane Rust commands —
+  // Privacy_Accessibility and Privacy_ListenEvent (Input Monitoring). Same two
+  // panes the Reconnect panel opens.
   function openAccessibility() {
-    // Opens System Settings ▸ Privacy & Security ▸ Accessibility (Rust command).
     invoke("open_accessibility_settings").catch(() => {});
   }
+  function openInputMonitoring() {
+    invoke("open_input_monitoring_settings").catch(() => {});
+  }
 
-  // ---- Step 2: Accessibility state, watched for the whole flow so step 2 always
-  // reflects the truth on arrival. `engine://capture-health` reports `live` when
-  // the sidecar's tap is enabled (the grant in effect) — BUT the watchdog also
+  // ---- Step 2: capture-health, watched for the whole flow so step 2 always
+  // reflects the truth on arrival. `engine://capture-health` reports `live` only
+  // when BOTH grants are in effect and the tap is armed — BUT the watchdog also
   // RE-EMITS the current state every few seconds, so merely receiving `live` is
-  // not a grant. We act only on the off→on TRANSITION (otherwise a re-emit would
-  // bounce the screen).
+  // not a fresh grant. We auto-advance only on the off→on TRANSITION.
+  //
+  // Reconnect-style auto-resume: while on step 2 and not yet live, we re-probe by
+  // asking the engine to restart capture every few seconds, so a dead sidecar
+  // (it exits when a grant is missing) is respawned the moment both switches are
+  // on and health flips to `live`.
+  const POLL_MS = 3000;
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  function ensurePolling() {
+    if (pollTimer) return;
+    invoke("restart_capture").catch(() => {}); // probe immediately
+    pollTimer = setInterval(() => invoke("restart_capture").catch(() => {}), POLL_MS);
+  }
+  function stopPolling() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
   let unlistenHealth: (() => void) | null = null;
+  let unlistenPerms: (() => void) | null = null;
   function onHealth(state: string | undefined) {
     const live = state === "live";
-    const wasOn = axOn;
-    axOn = live;
-    // ONLY the moment Accessibility flips off→on while the user is on step 2
-    // (returning from System Settings) do we re-activate our window and move focus
-    // to Next. We never auto-advance — the user continues at their own pace.
-    // Arriving at step 2 already-on (Back from step 3, or a replay) is NOT a
-    // transition, so nothing fires: the "on" state just shows, ring on Next.
-    if (!wasOn && live && step === 2) onGrantedOnStep2();
+    const wasLive = captureLive;
+    captureLive = live;
+    if (step === 2) {
+      // Keep probing until both grants land; stop the moment capture is live.
+      if (live) stopPolling();
+      else ensurePolling();
+    }
+    // ONLY the moment capture flips off→on while the user is on step 2 (returning
+    // from System Settings with the last switch flipped) do we auto-advance —
+    // mirroring Reconnect's auto-resume. Arriving at step 2 already-live (Back
+    // from step 3, or a replay) is NOT a transition, so nothing fires: the two
+    // confirmations just show and Next is enabled as a manual fallback.
+    if (!wasLive && live && step === 2) advanceFromStep2();
   }
-  async function onGrantedOnStep2() {
+  async function advanceFromStep2() {
     await invoke("focus_main_window").catch(() => {}); // bring our window to front
-    await tick(); // step 2 re-rendered to its "on" state — land focus on Next
-    nextBtn?.focus();
+    goTo(3); // both grants are in — move on automatically
   }
 
   function finish() {
@@ -132,14 +189,30 @@
   }
 
   onMount(() => {
-    // Track Accessibility state for the whole flow (the watchdog re-emits every
-    // few seconds, so this converges to truth without waiting for a transition).
+    // Aggregate capture-health drives the gate (Next + auto-advance). The
+    // watchdog re-emits every few seconds, so this converges to truth without
+    // waiting for a transition.
     listen<{ state: string }>("engine://capture-health", (e) => onHealth(e.payload?.state)).then(
       (un) => (unlistenHealth = un),
     );
+    // Per-grant snapshot drives the two row statuses independently. The sidecar
+    // emits it on every spawn (even when about to exit for a missing grant), so
+    // while we poll on step 2 each row reflects ITS own permission within a poll
+    // cycle of the user flipping that switch.
+    listen<{ accessibility: boolean; input_monitoring: boolean }>(
+      "engine://permission-status",
+      (e) => {
+        axGranted = !!e.payload?.accessibility;
+        imGranted = !!e.payload?.input_monitoring;
+      },
+    ).then((un) => (unlistenPerms = un));
     tick().then(() => inputEl?.focus());
   });
-  onDestroy(() => unlistenHealth?.());
+  onDestroy(() => {
+    stopPolling();
+    unlistenHealth?.();
+    unlistenPerms?.();
+  });
 </script>
 
 <svelte:window on:keydown={onKeydown} />
@@ -167,32 +240,65 @@
       {:else if step === 2}
         <div class="ob-promise">
           <i class="ti ti-lock" aria-hidden="true"></i>
-          <span>Everything stays on your Mac.</span>
+          <span>Everything stays on your Mac</span>
         </div>
         <p class="ob-lede">
-          Every keystroke you make stays right here — no cloud, no account, nobody else can see it.
+          Jordan works entirely on this Mac — but macOS still needs your OK. Turn on both below and
+          Jordan starts catching your slips right away.
         </p>
-        <div class="ob-rule" role="presentation"></div>
-        {#if axOn}
-          <p class="ob-granted">
-            <i class="ti ti-circle-check ob-granted-icon" aria-hidden="true"></i>
-            <span>Accessibility is on — I can read your keystrokes now. You’re all set for this step.</span>
-          </p>
-          <p class="ob-fine">
-            I skip password fields, and everything I keep stays on this Mac — just how your keys land, the little typo-and-fix habits your hands repeat, and the everyday words you use — never the sentences you write.
-          </p>
-        {:else}
-          <p class="ob-body-t">
-            To learn your hands, I need your permission to read your keystrokes. macOS will ask you
-            to switch on Accessibility for TypeAssist.
-          </p>
-          <button class="ob-btn-primary" bind:this={openBtn} on:click={openAccessibility}>
-            Open Accessibility settings
-          </button>
-          <p class="ob-fine">
-            I skip password fields, and everything I keep stays on this Mac — just how your keys land, the little typo-and-fix habits your hands repeat, and the everyday words you use — never the sentences you write.
-          </p>
-        {/if}
+
+        <!-- Each row reflects its OWN grant (`axOn` / `imOn` from the per-grant
+             permission-status snapshot), so a half-granted state shows exactly
+             which one is still pending. Blue check on grant — never green/red. -->
+        <div class="ob-perms">
+          <div class="ob-perm" class:granted={axOn}>
+            <span class="ob-perm-status" aria-hidden="true">
+              {#if axOn}
+                <i class="ti ti-circle-check"></i>
+              {:else}
+                <span class="ob-perm-ring"></span>
+              {/if}
+            </span>
+            <div class="ob-perm-body">
+              <span class="ob-perm-label">Accessibility</span>
+              <span class="ob-perm-sub">Lets Jordan see which text field you’re in, and fix it.</span>
+              {#if axOn}
+                <span class="ob-perm-allowed">
+                  <i class="ti ti-check" aria-hidden="true"></i>Allowed
+                </span>
+              {:else}
+                <button class="ob-perm-btn" bind:this={openBtn} on:click={openAccessibility}>
+                  Open Accessibility Settings
+                </button>
+              {/if}
+            </div>
+          </div>
+
+          <div class="ob-perm" class:granted={imOn}>
+            <span class="ob-perm-status" aria-hidden="true">
+              {#if imOn}
+                <i class="ti ti-circle-check"></i>
+              {:else}
+                <span class="ob-perm-ring"></span>
+              {/if}
+            </span>
+            <div class="ob-perm-body">
+              <span class="ob-perm-label">Input Monitoring</span>
+              <span class="ob-perm-sub">Lets Jordan see the keys as you press them.</span>
+              {#if imOn}
+                <span class="ob-perm-allowed">
+                  <i class="ti ti-check" aria-hidden="true"></i>Allowed
+                </span>
+              {:else}
+                <button class="ob-perm-btn" bind:this={openImBtn} on:click={openInputMonitoring}>
+                  Open Input Monitoring Settings
+                </button>
+              {/if}
+            </div>
+          </div>
+        </div>
+
+        <p class="ob-fine">Jordan moves on the moment both are on.</p>
       {:else}
         <h1 class="ob-hi">{name.trim() ? `All set, ${name.trim()}.` : "All set."}</h1>
         <p class="ob-lede">
@@ -221,7 +327,15 @@
       </div>
 
       {#if step < 3}
-        <button class="ob-btn next" bind:this={nextBtn} on:click={() => goTo(step + 1)}>Next</button>
+        <!-- Step 2 gates Next on both grants (manual fallback if detection lags). -->
+        <button
+          class="ob-btn next"
+          bind:this={nextBtn}
+          disabled={step === 2 && !captureLive}
+          on:click={() => goTo(step + 1)}
+        >
+          Next
+        </button>
       {:else}
         <span class="ob-nav-end" aria-hidden="true"></span>
       {/if}
@@ -270,28 +384,94 @@
     line-height: 1.6;
     color: var(--text-secondary);
   }
-  .ob-body-t {
-    margin: 0 0 0.9rem;
-    font-size: 0.95rem;
-    line-height: 1.55;
-    color: var(--text-secondary);
+  /* ---- Step 2: the two permission rows ---- */
+  .ob-perms {
+    display: flex;
+    flex-direction: column;
+    gap: 0.85rem;
+    margin: 0.3rem 0 1rem;
   }
-
-  /* Step 2 "Accessibility is on" confirmation — blue check, never green. */
-  .ob-granted {
+  .ob-perm {
     display: flex;
     align-items: flex-start;
-    gap: 0.5rem;
-    margin: 0 0 0.9rem;
-    font-size: 0.95rem;
-    line-height: 1.55;
+    gap: 0.7rem;
+  }
+  .ob-perm-status {
+    flex-shrink: 0;
+    width: 1.5rem;
+    height: 1.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 0.1rem;
+  }
+  /* Not granted: hollow grey ring. Granted: it fills to a blue check (the
+     ti-circle-check below) — never green, never red. */
+  .ob-perm-ring {
+    width: 1.15rem;
+    height: 1.15rem;
+    border-radius: 999px;
+    border: 2px solid color-mix(in srgb, canvastext 32%, canvas);
+    box-sizing: border-box;
+  }
+  .ob-perm-status .ti {
+    font-size: 1.45rem;
+    color: var(--link); /* app blue */
+  }
+  .ob-perm-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    min-width: 0;
+  }
+  .ob-perm-label {
+    font-size: 0.98rem;
+    font-weight: 600;
     color: canvastext;
   }
-  .ob-granted-icon {
-    flex-shrink: 0;
-    margin-top: 0.05rem;
-    font-size: 1.15rem;
-    color: var(--link);
+  .ob-perm-sub {
+    font-size: 0.88rem;
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+  /* Per-row action button — same blue primary, sized for a row. */
+  .ob-perm-btn {
+    align-self: flex-start;
+    margin-top: 0.2rem;
+    display: inline-flex;
+    align-items: center;
+    min-height: 36px;
+    padding: 0.45rem 0.95rem;
+    font: inherit;
+    font-size: 0.92rem;
+    font-weight: 500;
+    border-radius: 9px;
+    border: none;
+    background: var(--focus-ring);
+    color: #fff;
+    cursor: pointer;
+  }
+  .ob-perm-btn:hover {
+    background: color-mix(in srgb, var(--focus-ring) 88%, black);
+  }
+  .ob-perm-btn:focus {
+    outline: 3px solid var(--focus-ring);
+    outline-offset: 2px;
+  }
+  /* Granted: quiet, non-actionable "Allowed" with a small blue check. */
+  .ob-perm-allowed {
+    align-self: flex-start;
+    margin-top: 0.25rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+  .ob-perm-allowed .ti {
+    font-size: 1.05rem;
+    color: var(--link); /* app blue */
   }
 
   .ob-input {
@@ -330,12 +510,6 @@
   .ob-promise .ti {
     font-size: 1.05rem;
   }
-  .ob-rule {
-    height: 1px;
-    background: var(--hairline);
-    margin: 1.1rem 0;
-  }
-
   .ob-btn-primary {
     display: inline-flex;
     align-items: center;
@@ -394,6 +568,16 @@
   }
   .ob-btn.next:hover {
     background: color-mix(in srgb, var(--focus-ring) 88%, black);
+  }
+  /* Step 2: Next is disabled until both grants land (manual fallback). */
+  .ob-btn.next:disabled {
+    background: color-mix(in srgb, var(--focus-ring) 38%, canvas);
+    border-color: transparent;
+    color: color-mix(in srgb, #fff 75%, transparent);
+    cursor: default;
+  }
+  .ob-btn.next:disabled:hover {
+    background: color-mix(in srgb, var(--focus-ring) 38%, canvas);
   }
   .ob-btn:focus {
     outline: 3px solid var(--focus-ring);

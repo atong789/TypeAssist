@@ -547,6 +547,16 @@ fn open_progress(app: AppHandle) {
     show_progress(&app);
 }
 
+/// Tauri command: the menu-bar Impact glance's "See the full list in the app →"
+/// link. Shows + focuses the main window and routes it to the Progress tab — the
+/// integrated keyboard+corrections view, in its default all-corrections state (no
+/// key selected). Reuses the existing `show_main` / `app://route` deep-link; the
+/// caller hides the popover.
+#[tauri::command]
+fn open_main_progress(app: AppHandle) {
+    show_main(&app, "progress");
+}
+
 /// Anchor the Corrections (allow-list) panel under the tray icon, show + focus
 /// it. Same menu-bar-dropdown behaviour as Practice/Progress (hides on blur).
 /// `corrections://open` tells it to (re)load its state on each open.
@@ -749,6 +759,14 @@ struct ImpactPattern {
     obs: f32,
     ready: bool,
     class: Option<&'static str>,
+    /// Char indices in `target` of the letter(s) the correction changed, so the
+    /// Impact view can softly mark them (`couod → could` ⇒ `[3]`, the `l`).
+    /// Derived on read; never persisted. Empty when the fix only removed a key.
+    highlight: Vec<usize>,
+    /// The keyboard keys this correction involves, so the Progress map can filter
+    /// the panel to a selected key (coordination: the transposed pair; precision:
+    /// the wrong + intended key). Derived on read; never persisted.
+    keys: Vec<char>,
 }
 
 /// Tauri command: read `~/.typeassist/word_patterns.json` straight off disk and
@@ -775,12 +793,16 @@ fn read_word_patterns() -> Result<Vec<ImpactPattern>, String> {
         .into_iter()
         .map(|s| {
             let class = correction_engine::classify_slip(&s.typed, &s.target).map(|c| c.as_tag());
+            let highlight = correction_engine::corrected_target_indices(&s.typed, &s.target);
+            let keys = correction_engine::involved_keys(&s.typed, &s.target);
             ImpactPattern {
                 typed: s.typed,
                 target: s.target,
                 obs: s.weight,
                 ready: s.weight >= correction_engine::TIER1_MIN_OBSERVATIONS,
                 class,
+                highlight,
+                keys,
             }
         })
         .collect();
@@ -952,6 +974,7 @@ pub fn run() {
             request_practice_trend,
             open_practice,
             open_progress,
+            open_main_progress,
             open_corrections,
             open_accessibility_settings,
             open_input_monitoring_settings,

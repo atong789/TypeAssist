@@ -18,6 +18,22 @@ func exitNeedingPermission() -> Never {
     exit(2)
 }
 
+// Read-only, no-prompt snapshot of the two independent grants capture needs.
+// Emitted HERE — before the permission gates below — so a partial grant is
+// visible to the UI even when this spawn is about to exit for the *other*
+// missing permission. (The aggregate capture-health `live` flag can't show
+// this: it requires both grants, and the process exits before its first
+// heartbeat if either is missing.) The onboarding / Reconnect permission rows
+// read this to tick each grant independently. Re-emitted on each heartbeat
+// (below) so a long-running process reflects a runtime revoke too.
+func emitPermissionStatus() {
+    bridge.emit(.permissionStatus(
+        accessibility: Accessibility.isTrusted(),
+        inputMonitoring: Accessibility.inputMonitoringGranted()
+    ))
+}
+emitPermissionStatus()
+
 guard Accessibility.isTrusted(prompt: promptForAccessibility) else {
     exitNeedingPermission()
 }
@@ -90,6 +106,9 @@ let heartbeatTimer = CFRunLoopTimerCreateWithHandler(
 ) { _ in
     let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
     bridge.emit(.heartbeat(timestampMs: nowMs, tapEnabled: tap.isTapEnabled()))
+    // Refresh the per-grant snapshot alongside proof-of-life so the UI catches
+    // a runtime revoke (e.g. Input Monitoring pulled while running) too.
+    emitPermissionStatus()
 }
 CFRunLoopAddTimer(CFRunLoopGetMain(), heartbeatTimer, .commonModes)
 
@@ -99,6 +118,7 @@ bridge.emit(.heartbeat(
     timestampMs: UInt64(Date().timeIntervalSince1970 * 1000),
     tapEnabled: tap.isTapEnabled()
 ))
+emitPermissionStatus()
 
 // Phase 0 / M3 overlay feasibility probe (opt-in via TYPEASSIST_AX_PROBE=1).
 // Mirrors the throwaway spike (`adapters/macos/spike/ax_probe.swift`) but runs

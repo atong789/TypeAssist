@@ -28,8 +28,15 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
   let rootEl: HTMLElement;
-  let openBtn: HTMLButtonElement | undefined;
+  let openBtn: HTMLButtonElement | undefined; // Accessibility row's "Open …" button
+  let openImBtn: HTMLButtonElement | undefined; // Input Monitoring row's "Open …" button
   let doneBtn: HTMLButtonElement | undefined;
+
+  // Land focus on the first STILL-PENDING permission's button, so a half-revoked
+  // recovery points straight at the one left to grant.
+  function focusFirstPending() {
+    (axGranted ? openImBtn : openBtn)?.focus();
+  }
 
   // We only react to capture coming back (and only keep respawning the sidecar)
   // while the panel is actually open — `polling` gates both, so a `live` event
@@ -42,6 +49,14 @@
   // confirmation (mirrors onboarding step 2's "you're all set" styling) that
   // STAYS until the user dismisses it. `reconnected` swaps the panel body to it.
   let reconnected = false;
+
+  // Per-grant live status (from the sidecar's read-only probes via
+  // `engine://permission-status`, the SAME signal onboarding uses). Drives the
+  // two permission rows so a user mid-recovery sees exactly WHICH grant is still
+  // off — not just two undifferentiated buttons. Capture-health `live` (→
+  // `reconnected`) remains the gate that means "both back + tap armed".
+  let axGranted = false;
+  let imGranted = false;
 
   // Re-check permissions by asking the engine to restart capture. If both grants
   // are back, the sidecar boots and its first heartbeat flips health to `live`
@@ -125,21 +140,33 @@
   }
 
   let unlistenHealth: (() => void) | null = null;
+  let unlistenPerms: (() => void) | null = null;
   let unlistenOpen: (() => void) | null = null;
   onMount(() => {
     listen<{ state: string }>("engine://capture-health", (e) => onHealth(e.payload?.state)).then(
       (un) => (unlistenHealth = un),
     );
+    // Per-grant status for the two rows. While polling, each sidecar spawn emits
+    // this even when it's about to exit for a missing grant, so each row reflects
+    // its own permission within a poll cycle of the user flipping that switch.
+    listen<{ accessibility: boolean; input_monitoring: boolean }>(
+      "engine://permission-status",
+      (e) => {
+        axGranted = !!e.payload?.accessibility;
+        imGranted = !!e.payload?.input_monitoring;
+      },
+    ).then((un) => (unlistenPerms = un));
     // Each time the panel is shown, (re)start the poll and land focus on the
     // primary action — the ring shows immediately (controls style :focus).
     listen("reconnect://open", () => {
       startPolling();
-      tick().then(() => openBtn?.focus());
+      tick().then(() => focusFirstPending());
     }).then((un) => (unlistenOpen = un));
   });
   onDestroy(() => {
     stopPolling();
     unlistenHealth?.();
+    unlistenPerms?.();
     unlistenOpen?.();
   });
 </script>
@@ -169,16 +196,54 @@
     </div>
     <h1 class="title">Jordan needs permission again</h1>
     <p class="body">
-      TypeAssist lost access to watch your typing — this can happen after an update. It needs two
-      switches turned back on, then Jordan picks up right where it left off.
+      TypeAssist lost access to watch your typing — this can happen after an update. Turn the one
+      that’s off back on and Jordan picks up right where it left off.
     </p>
-    <div class="actions">
-      <button class="btn-primary" bind:this={openBtn} on:click={openAccessibility}>
-        Open Accessibility Settings
-      </button>
-      <button class="btn-primary" on:click={openInputMonitoring}>
-        Open Input Monitoring Settings
-      </button>
+
+    <!-- Per-grant rows so the user sees exactly which switch is still off — each
+         reflects its OWN live status (blue check on grant, never green/red). -->
+    <div class="perms">
+      <div class="perm" class:granted={axGranted}>
+        <span class="perm-status" aria-hidden="true">
+          {#if axGranted}
+            <i class="ti ti-circle-check"></i>
+          {:else}
+            <span class="perm-ring"></span>
+          {/if}
+        </span>
+        <div class="perm-body">
+          <span class="perm-label">Accessibility</span>
+          <span class="perm-sub">Lets Jordan see which text field you’re in, and fix it.</span>
+          {#if axGranted}
+            <span class="perm-allowed"><i class="ti ti-check" aria-hidden="true"></i>Allowed</span>
+          {:else}
+            <button class="perm-btn" bind:this={openBtn} on:click={openAccessibility}>
+              Open Accessibility Settings
+            </button>
+          {/if}
+        </div>
+      </div>
+
+      <div class="perm" class:granted={imGranted}>
+        <span class="perm-status" aria-hidden="true">
+          {#if imGranted}
+            <i class="ti ti-circle-check"></i>
+          {:else}
+            <span class="perm-ring"></span>
+          {/if}
+        </span>
+        <div class="perm-body">
+          <span class="perm-label">Input Monitoring</span>
+          <span class="perm-sub">Lets Jordan see the keys as you press them.</span>
+          {#if imGranted}
+            <span class="perm-allowed"><i class="ti ti-check" aria-hidden="true"></i>Allowed</span>
+          {:else}
+            <button class="perm-btn" bind:this={openImBtn} on:click={openInputMonitoring}>
+              Open Input Monitoring Settings
+            </button>
+          {/if}
+        </div>
+      </div>
     </div>
     <p class="note">No need to come back here — it reconnects the moment both are on.</p>
   {/if}
@@ -273,14 +338,97 @@
     color: var(--text-secondary);
   }
 
-  /* The two open-settings buttons stack — one per required pane. */
-  .actions {
+  /* Per-grant permission rows — one per required pane, each showing its own
+     live status. Mirrors onboarding step 2's row layout. */
+  .perms {
     display: flex;
     flex-direction: column;
-    align-items: flex-start;
-    gap: 0.55rem;
+    gap: 0.85rem;
     width: 100%;
+    margin: 0 0 0.2rem;
   }
+  .perm {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.7rem;
+  }
+  .perm-status {
+    flex-shrink: 0;
+    width: 1.5rem;
+    height: 1.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 0.1rem;
+  }
+  /* Not granted: hollow grey ring. Granted: it fills to a blue check (the
+     ti-circle-check) — never green, never red. */
+  .perm-ring {
+    width: 1.15rem;
+    height: 1.15rem;
+    border-radius: 999px;
+    border: 2px solid color-mix(in srgb, canvastext 32%, canvas);
+    box-sizing: border-box;
+  }
+  .perm-status .ti {
+    font-size: 1.45rem;
+    color: var(--link); /* app blue */
+  }
+  .perm-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    min-width: 0;
+  }
+  .perm-label {
+    font-size: 0.98rem;
+    font-weight: 600;
+    color: canvastext;
+  }
+  .perm-sub {
+    font-size: 0.88rem;
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+  .perm-btn {
+    align-self: flex-start;
+    margin-top: 0.2rem;
+    display: inline-flex;
+    align-items: center;
+    min-height: 36px;
+    padding: 0.45rem 0.95rem;
+    font: inherit;
+    font-size: 0.92rem;
+    font-weight: 500;
+    border-radius: 9px;
+    border: none;
+    background: var(--focus-ring);
+    color: #fff;
+    cursor: pointer;
+  }
+  .perm-btn:hover {
+    background: color-mix(in srgb, var(--focus-ring) 88%, black);
+  }
+  .perm-btn:focus {
+    outline: 3px solid var(--focus-ring);
+    outline-offset: 2px;
+  }
+  /* Granted: quiet, non-actionable "Allowed" with a small blue check. */
+  .perm-allowed {
+    align-self: flex-start;
+    margin-top: 0.25rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+  .perm-allowed .ti {
+    font-size: 1.05rem;
+    color: var(--link); /* app blue */
+  }
+
   .btn-primary {
     display: inline-flex;
     align-items: center;

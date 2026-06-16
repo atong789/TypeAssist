@@ -33,6 +33,20 @@ pub enum InputEvent {
     /// hasn't yet re-armed it. The engine's watchdog uses this plus
     /// the heartbeat timestamp to drive the `capture-health` state.
     Heartbeat { timestamp_ms: u64, tap_enabled: bool },
+    /// **Per-grant permission snapshot.** Reports the two *independent* macOS
+    /// grants the capture pipeline needs: `accessibility` (the AX API — focus +
+    /// correction injection) and `input_monitoring` (the CGEventTap that captures
+    /// keystrokes). Both are read-only, no-prompt checks (`AXIsProcessTrusted`
+    /// and `IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)`), safe to poll.
+    ///
+    /// Distinct from the aggregate `Heartbeat.tap_enabled` / capture-health
+    /// `live` flag, which can only be observed once BOTH grants are in effect:
+    /// the adapter EXITS at its permission gates before its first heartbeat if
+    /// either grant is missing. This snapshot is emitted *before* those gates (on
+    /// every spawn) and on each heartbeat, so a PARTIAL grant (e.g. Accessibility
+    /// on, Input Monitoring still pending) is observable — first-run onboarding
+    /// uses it to tick each permission row the moment its own grant lands.
+    PermissionStatus { accessibility: bool, input_monitoring: bool },
     /// **Caret may have moved somewhere the engine can't dead-reckon.**
     /// Emitted by the L1 adapter on a mouse / trackpad click or a focus / app
     /// change — gestures that reposition the caret with no key the engine can
@@ -131,6 +145,24 @@ mod tests {
         };
         let json = serde_json::to_string(&down).unwrap();
         assert!(json.contains("\"tap_enabled\":false"));
+    }
+
+    #[test]
+    fn permission_status_event_round_trips() {
+        // The sidecar emits this on every spawn (before its permission gates) and
+        // on each heartbeat. Both grants are independent booleans; the snake_case
+        // tag + field names must match what the Swift bridge writes.
+        let e = InputEvent::PermissionStatus {
+            accessibility: true,
+            input_monitoring: false,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"permission_status","accessibility":true,"input_monitoring":false}"#
+        );
+        let back: InputEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
     }
 
     #[test]

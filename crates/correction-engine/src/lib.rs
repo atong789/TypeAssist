@@ -80,7 +80,10 @@ pub use score::{
     confidence_for, score_candidates, Confidence, ConfidenceReport, EditType, ScoredCandidate,
     CONFIDENCE_HIGH_FLOOR, CONFIDENCE_LOW_FLOOR, CONFIDENCE_MEDIUM_FLOOR, SCORE_VERSION,
 };
-pub use slip_class::{classify_slip, transposition_keys, SlipClass, SLIP_CLASS_VERSION};
+pub use slip_class::{
+    classify_slip, corrected_target_indices, involved_keys, transposition_keys, SlipClass,
+    SLIP_CLASS_VERSION,
+};
 pub use tokenizer::{Token, TokenKind, Tokenizer, TOKENIZER_VERSION};
 pub use trigram::{target_is_recordable, TrigramModel};
 pub use word_freq::{WordFreq, WORD_FREQ_VERSION};

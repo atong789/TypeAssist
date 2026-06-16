@@ -121,7 +121,7 @@ TypeAssist surfaces insight across three surfaces — **Today**, **Progress**, *
 
 ### Progress — the menu-bar dashboard (Statistics + Impact)
 
-A menu-bar dashboard so the user reads their own typing data without Console.app. Its own webview window (label `progress`), mirroring Practice Mode: tray-anchored, click-away to close, no Dock icon, fixed ~400×560 (the Impact ledger scrolls **internally** — the panel never grows toward the Dock). Reloads its data each open. Reduce Motion honored by construction (no tab-switch animation — the highlight jumps). Lives in `apps/tauri/src/routes/ProgressPanel.svelte`; reads via the `read_word_patterns` / `read_progress_stats` Tauri commands. **Observe-only** — no correction yet.
+A menu-bar dashboard so the user reads their own typing data without Console.app. Its own webview window (label `progress`), mirroring Practice Mode: tray-anchored, click-away to close, no Dock icon, fixed **400×600** — sized so the Impact glance (top 5 Coordination + top 5 Precision + the footer link) fits without internal scroll; longer content (e.g. Statistics) still scrolls within the panel region. Reloads its data each open. Reduce Motion honored by construction (no tab-switch animation — the highlight jumps). Lives in `apps/tauri/src/routes/ProgressPanel.svelte`; reads via the `read_word_patterns` / `read_progress_stats` Tauri commands. **Observe-only** — no correction yet.
 
 - **Navigation — one-hand, no chords (hard rule).** Segmented control `Statistics | Impact`: switch by click, or single key `1`/`2` or `←`/`→` — **never** a modifier combo. Scroll = wheel/trackpad or single `↑`/`↓`/space. The keyboard focus ring follows the selected tab (roving tabindex) — ring and visible tab always agree.
 

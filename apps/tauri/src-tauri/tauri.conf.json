@@ -38,7 +38,7 @@
         "label": "progress",
         "title": "Progress",
         "width": 400,
-        "height": 560,
+        "height": 600,
         "resizable": false,
         "decorations": false,
         "transparent": true,

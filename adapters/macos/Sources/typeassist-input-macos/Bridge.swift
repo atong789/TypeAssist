@@ -26,6 +26,13 @@ enum InputEvent {
     /// user is currently typing. `tapEnabled` is our own view of the
     /// CGEvent tap state.
     case heartbeat(timestampMs: UInt64, tapEnabled: Bool)
+    /// Per-grant permission snapshot — the two independent TCC grants capture
+    /// needs (Accessibility for the AX API, Input Monitoring for the tap). Both
+    /// are read-only no-prompt checks. Emitted BEFORE the startup permission
+    /// gates (so a pending grant is visible even though the process is about to
+    /// exit) and on each heartbeat. See `InputEvent::PermissionStatus` in
+    /// `crates/behavioural-model/src/events.rs`.
+    case permissionStatus(accessibility: Bool, inputMonitoring: Bool)
     /// The caret may have moved somewhere the engine can't dead-reckon — a
     /// mouse/trackpad click (from the tap) or a focus/app change (from the
     /// secure-field AX observer). Content-free: `reason` is only a log tag.
@@ -113,6 +120,12 @@ final class Bridge {
                 "type": "heartbeat",
                 "timestamp_ms": ts,
                 "tap_enabled": tapEnabled,
+            ]
+        case let .permissionStatus(accessibility, inputMonitoring):
+            payload = [
+                "type": "permission_status",
+                "accessibility": accessibility,
+                "input_monitoring": inputMonitoring,
             ]
         case let .caretMoved(reason):
             payload = ["type": "caret_moved", "reason": reason]

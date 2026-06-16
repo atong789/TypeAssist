@@ -27,6 +27,32 @@
     { value: "en-US", label: "English (US)" },
     { value: "en-GB", label: "English (UK)" },
   ];
+  // Grouped control → app-wide keyboard convention: ONE Tab stop (roving
+  // tabindex); Left/Right (and Home/End) switch WITHIN it. Tab moves between
+  // controls, not between the three options.
+  let segEls: HTMLButtonElement[] = [];
+  function onSegKeydown(event: KeyboardEvent, i: number) {
+    let ni: number;
+    switch (event.key) {
+      case "ArrowRight":
+        ni = (i + 1) % LANGS.length;
+        break;
+      case "ArrowLeft":
+        ni = (i - 1 + LANGS.length) % LANGS.length;
+        break;
+      case "Home":
+        ni = 0;
+        break;
+      case "End":
+        ni = LANGS.length - 1;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    lang = LANGS[ni].value;
+    segEls[ni]?.focus();
+  }
 
   // ---- Corrections master gate — the SAME on/off as the menu-bar toggle. Off by
   // default; the engine never flips it on (Fluent only REVEALS it). Read on mount
@@ -103,13 +129,17 @@
 <!-- 2) Warm-up language -->
 <section class="group">
   <h2 class="group-label">Warm-up language</h2>
-  <div class="segmented" role="group" aria-label="Warm-up language">
-    {#each LANGS as o}
+  <div class="segmented" role="radiogroup" aria-label="Warm-up language">
+    {#each LANGS as o, i}
       <button
         class="seg-btn"
         class:on={lang === o.value}
-        aria-pressed={lang === o.value}
-        on:click={() => (lang = o.value)}>{o.label}</button
+        role="radio"
+        aria-checked={lang === o.value}
+        tabindex={lang === o.value ? 0 : -1}
+        bind:this={segEls[i]}
+        on:click={() => (lang = o.value)}
+        on:keydown={(e) => onSegKeydown(e, i)}>{o.label}</button
       >
     {/each}
   </div>

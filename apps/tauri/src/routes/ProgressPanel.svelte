@@ -4,13 +4,17 @@
      hidden on click-away (see lib.rs `on_window_event`). Two tabs:
 
        Statistics — how I type   (built in step 4, on verified engine numbers)
-       Impact     — what the system has learned and is ready to fix
+       Impact     — the glance: the corrections behind your slip rate, top 5 in
+                    each of Coordination / Precision, ranked by count. The full
+                    list lives in the app (the integrated main-window Progress
+                    tab), reached via "See the full list in the app →".
 
      Navigation is one-hand, no chords (brief): switch by click, or `1`/`2`, or
      `←`/`→`. Never a modifier combo. Scroll = wheel/trackpad or `↑`/`↓`/space.
      Reduce Motion is honoured by having NO tab-switch animation — the highlight
-     just jumps. The panel is a fixed height; the Impact ledger scrolls
-     internally so the window never grows down toward the Dock.
+     just jumps. The window is a fixed height, sized so the Impact glance (its
+     ten rows + the footer link) fits WITHOUT internal scroll (~600px); longer
+     content (e.g. Statistics) still scrolls within the panel region.
 
      Design principles (do not violate): mirror not coach, report observed
      (keystrokes) never assumed (fingers), facts not commentary, mirror not
@@ -20,12 +24,13 @@
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import CorrectionPair from "../lib/CorrectionPair.svelte";
 
   type Tab = "statistics" | "impact";
 
   // One learned correction, as the engine sees it. `obs` is the DECAYED weight
-  // (matches the kill-switch's view); `ready` means obs >= the 12-observation
-  // threshold. coord/precis tag arrives in step 3 — absent for now.
+  // (matches the kill-switch's view); `class` groups it (coord/precis); `highlight`
+  // are the target char indices the fix changed (soft-blue mark). Derived on read.
   interface ImpactPattern {
     typed: string;
     target: string;
@@ -34,11 +39,11 @@
     // "coord" | "precis", derived engine-side from the pair; null for the rare
     // pair that isn't a clean motor slip.
     class: string | null;
+    highlight: number[];
   }
 
-  // 12 catches = consent (brief): if the user didn't want it fixed, it wouldn't
-  // have been caught 12×. Mirrors TIER1_MIN_OBSERVATIONS engine-side.
-  const READY_THRESHOLD = 12;
+  // The Impact tab is a glance: the top few corrections in each group, by count.
+  const TOP_N = 5;
 
   // One calendar day's typing rollup, as the engine persists it (UTC-dated, to
   // match the dated motor snapshots). coord + precis === slips always.
@@ -90,10 +95,12 @@
   let patterns: ImpactPattern[] = [];
   let progressDays: ProgressDay[] = [];
 
-  // The command already returns patterns sorted by obs desc, so each group keeps
-  // that order (the brief's "sorted by obs desc").
-  $: ready = patterns.filter((p) => p.ready);
-  $: observing = patterns.filter((p) => !p.ready);
+  // The command returns patterns sorted by obs desc, so each group is already
+  // ranked by count; the glance shows the top few in each.
+  $: topCoord = patterns.filter((p) => p.class === "coord").slice(0, TOP_N);
+  $: topPrecis = patterns.filter((p) => p.class === "precis").slice(0, TOP_N);
+  $: hasImpact = topCoord.length > 0 || topPrecis.length > 0;
+  const obsCount = (o: number) => Math.round(o);
 
   // ---- Statistics derivations -------------------------------------------
   //
@@ -371,6 +378,14 @@
     getCurrentWindow()
       .hide()
       .catch((e) => console.error("progress panel hide failed:", e));
+  }
+
+  // "See the full list in the app →" — hand off to the main window's Progress
+  // tab (the integrated keyboard + corrections view, default all-corrections
+  // state) and dismiss this glance. Rust shows + routes the main window.
+  function openFullList() {
+    invoke("open_main_progress").catch(() => {});
+    close();
   }
 
   // Open the per-key keyboard for a score. Remembers which score's row opened it
@@ -758,57 +773,56 @@
         </div>
       {/if}
     {:else}
-      <!-- Impact — what TypeAssist has learned and is ready to smooth. Fully
-           read-only: no buttons, no actions, no tap targets (brief). -->
+      <!-- Impact — the glance: the top few corrections in each group, by count.
+           Read-only (no pills, no thresholds); the full list lives in the app. -->
       <div class="impact">
-        <p class="banner">
-          Observe-only for now — nothing is changed yet. This is what TypeAssist
-          is ready to smooth once correction turns on.
-        </p>
+        <p class="impact-lead">The corrections behind your slip rate</p>
 
-        {#if patterns.length === 0}
+        {#if !hasImpact}
           <p class="impact-empty">
-            Nothing learned yet — TypeAssist is still getting to know how you
-            type.
+            Nothing to show yet — the corrections you make as you type will gather here.
           </p>
         {:else}
-          <p class="summary">
-            {ready.length} {ready.length === 1 ? "pattern" : "patterns"} ready ·
-            {observing.length} still observing
-          </p>
-
-          {#if ready.length > 0}
-            <ul class="ledger">
-              {#each ready as p}
-                <li class="row">
-                  <span class="pair">{p.typed} → {p.target}</span>
-                  <span class="meta">
-                    {#if p.class}<span class="tag">{p.class}</span>{/if}
-                    <span class="obs">{Math.round(p.obs)} obs</span>
-                    <span class="pill ready">Ready</span>
-                  </span>
-                </li>
-              {/each}
-            </ul>
-          {/if}
-
-          {#if observing.length > 0}
-            <div class="divider" aria-hidden="true">
-              <span>{READY_THRESHOLD}-observation threshold</span>
+          <!-- Tell the user this is a subset before they read the rows. -->
+          <p class="t5">Your top 5 of each.</p>
+          {#if topCoord.length > 0}
+            <div class="grp">
+              <div class="grp-head">
+                <span class="grp-name">Coordination</span>
+                <span class="grp-cap">right keys, right order</span>
+              </div>
+              <ul class="rows">
+                {#each topCoord as p}
+                  <li class="crow">
+                    <CorrectionPair typed={p.typed} target={p.target} highlight={p.highlight} />
+                    <span class="count">{obsCount(p.obs)}×</span>
+                  </li>
+                {/each}
+              </ul>
             </div>
-            <ul class="ledger">
-              {#each observing as p}
-                <li class="row">
-                  <span class="pair">{p.typed} → {p.target}</span>
-                  <span class="meta">
-                    {#if p.class}<span class="tag">{p.class}</span>{/if}
-                    <span class="obs">{Math.round(p.obs)} / {READY_THRESHOLD}</span>
-                    <span class="pill observing">Observing</span>
-                  </span>
-                </li>
-              {/each}
-            </ul>
           {/if}
+
+          {#if topPrecis.length > 0}
+            <div class="grp">
+              <div class="grp-head">
+                <span class="grp-name">Precision</span>
+                <span class="grp-cap">right key, clean hit</span>
+              </div>
+              <ul class="rows">
+                {#each topPrecis as p}
+                  <li class="crow">
+                    <CorrectionPair typed={p.typed} target={p.target} highlight={p.highlight} />
+                    <span class="count">{obsCount(p.obs)}×</span>
+                  </li>
+                {/each}
+              </ul>
+            </div>
+          {/if}
+
+          <p class="impact-note">The five you correct most often, in each.</p>
+          <button class="impact-link" on:click={openFullList}>
+            See the full list in the app →
+          </button>
         {/if}
       </div>
     {/if}
@@ -936,9 +950,12 @@
     overflow-y: auto;
     outline: none;
   }
+  /* Subtle focus cue only — a thin, faint inset hint so a keyboard user can tell
+     the list has focus (↑/↓/space scroll it), WITHOUT the bold blue box that
+     crowded the rows against the border. */
   .scroll:focus-visible {
-    outline: 3px solid var(--focus-ring);
-    outline-offset: -3px;
+    outline: 2px solid color-mix(in srgb, var(--focus-ring) 30%, transparent);
+    outline-offset: -2px;
     border-radius: 10px;
   }
 
@@ -1243,100 +1260,89 @@
   .impact {
     display: flex;
     flex-direction: column;
-    gap: 0.85rem;
   }
-  .banner {
-    margin: 0;
-    padding: 0.7rem 0.85rem;
-    border-radius: 10px;
-    font-size: 0.85rem;
-    line-height: 1.4;
+  .impact-lead {
+    margin: 0 0 0.25rem;
+    font-size: 0.98rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
     color: canvastext;
-    background: color-mix(in srgb, var(--focus-ring) 10%, canvas);
-    border: 1px solid color-mix(in srgb, var(--focus-ring) 28%, canvas);
+  }
+  /* Quiet secondary sub-line: "this is a subset" before the rows. */
+  .t5 {
+    margin: 0 0 0.2rem;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
   }
   .impact-empty {
     margin: 0;
     color: var(--text-secondary);
-    font-size: 0.95rem;
+    font-size: 0.92rem;
     line-height: 1.5;
   }
-  .summary {
-    margin: 0;
-    color: var(--text-secondary);
-    font-size: 0.9rem;
+  .grp {
+    margin-top: 0.55rem;
   }
-  .ledger {
+  .grp-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding-bottom: 0.25rem;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .grp-name {
+    font-size: 0.92rem;
+    font-weight: 600;
+  }
+  .grp-cap {
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+  }
+  .rows {
     margin: 0;
     padding: 0;
     list-style: none;
-    display: flex;
-    flex-direction: column;
   }
-  .row {
+  /* Compact rows so all ten (5 + 5) fit the fixed window with no inner scroll. */
+  .crow {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 0.75rem;
-    padding: 0.55rem 0;
-    border-bottom: 1px solid var(--hairline);
+    padding: 0.3rem 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--hairline) 60%, transparent);
   }
-  .pair {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 0.98rem;
-  }
-  .meta {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
+  .count {
     flex-shrink: 0;
-  }
-  .tag {
-    color: var(--text-secondary);
-    font-size: 0.72rem;
-    letter-spacing: 0.02em;
-    padding: 0.1rem 0.4rem;
-    border-radius: 6px;
-    background: color-mix(in srgb, canvastext 6%, canvas);
-  }
-  .obs {
-    color: var(--text-secondary);
-    font-size: 0.85rem;
+    font-size: 0.84rem;
     font-variant-numeric: tabular-nums;
-  }
-  .pill {
-    padding: 0.15rem 0.55rem;
-    border-radius: 999px;
-    font-size: 0.78rem;
-    font-weight: 600;
-    white-space: nowrap;
-  }
-  .pill.ready {
-    color: canvastext;
-    background: color-mix(in srgb, var(--focus-ring) 16%, canvas);
-    border: 1px solid color-mix(in srgb, var(--focus-ring) 34%, canvas);
-  }
-  .pill.observing {
     color: var(--text-secondary);
-    background: color-mix(in srgb, canvastext 7%, canvas);
-    border: 1px solid var(--hairline);
   }
-
-  /* Threshold divider between the Ready and Observing groups. */
-  .divider {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    margin: 0.35rem 0;
+  .impact-note {
+    margin: 0.7rem 0 0;
+    font-size: 0.82rem;
     color: var(--text-secondary);
-    font-size: 0.78rem;
   }
-  .divider::before,
-  .divider::after {
-    content: "";
-    flex: 1;
-    height: 1px;
-    background: var(--hairline);
+  /* Quiet link to the full list — app blue, never a heavy button. */
+  .impact-link {
+    align-self: flex-start;
+    margin-top: 0.4rem;
+    padding: 0.2rem 0.1rem;
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--focus-ring);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+  }
+  .impact-link:hover {
+    text-decoration: underline;
+  }
+  .impact-link:focus {
+    outline: 3px solid var(--focus-ring);
+    outline-offset: 2px;
+    border-radius: 5px;
   }
 
   /* ---- footer hint ---- */

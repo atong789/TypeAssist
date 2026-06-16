@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
+import IOKit.hid
 
 enum Accessibility {
     /// Returns true if this process has been granted Accessibility permission.
@@ -13,6 +14,16 @@ enum Accessibility {
     static func isTrusted(prompt: Bool = false) -> Bool {
         let opts: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as NSString: prompt]
         return AXIsProcessTrustedWithOptions(opts as CFDictionary)
+    }
+
+    /// Read-only, no-prompt check of the Input Monitoring ("Listen Events")
+    /// grant — a SEPARATE TCC permission from Accessibility (see main.swift for
+    /// why the two are split and revoked independently). `IOHIDCheckAccess`
+    /// only reports the current state; unlike `IOHIDRequestAccess` it never
+    /// shows a dialog, so it is safe to poll on the heartbeat. This is the
+    /// per-grant signal the onboarding / Reconnect permission rows read.
+    static func inputMonitoringGranted() -> Bool {
+        return IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
     }
 
     /// Replace the just-typed word in the focused field: synthesize

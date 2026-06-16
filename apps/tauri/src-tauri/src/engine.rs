@@ -166,6 +166,18 @@ pub const EVT_PRACTICE_TREND: &str = "engine://practice-trend";
 /// menu-bar surface will subscribe to the same event without a panel
 /// rewrite. Payload is [`CaptureHealthEvent`].
 pub const EVT_CAPTURE_HEALTH: &str = "engine://capture-health";
+/// **Per-grant permission status for the permission rows.** Forwards the
+/// sidecar's [`InputEvent::PermissionStatus`] verbatim — the two independent
+/// macOS grants capture needs (Accessibility + Input Monitoring), each a
+/// read-only no-prompt probe. Emitted on EVERY receipt (not transition-gated
+/// like capture-health), so a freshly-opened onboarding or Reconnect window
+/// converges to current truth within a poll cycle. Crucially this surfaces a
+/// PARTIAL grant — which `EVT_CAPTURE_HEALTH`'s `live` can never show, because
+/// the sidecar exits before its first heartbeat if either grant is missing —
+/// so the UI can tick each permission row independently. `live` (both grants +
+/// tap armed) stays the gate for "capture is actually running". Payload is
+/// [`PermissionStatusEvent`].
+pub const EVT_PERMISSION_STATUS: &str = "engine://permission-status";
 /// **Debounced capture-active signal for the menu-bar UI.** `EVT_CAPTURE_HEALTH`
 /// flips on every raw transition (a 2s tap-timeout blip flicks it to Unhealthy
 /// and straight back), which would make the tray icon and status line strobe.
@@ -222,6 +234,16 @@ pub enum CaptureHealth {
 #[derive(Debug, Clone, Copy, Serialize)]
 struct CaptureHealthEvent {
     state: CaptureHealth,
+}
+
+/// Payload for [`EVT_PERMISSION_STATUS`] — the two independent grants, each
+/// reported by the sidecar's read-only probes. The UI shows a per-permission
+/// row for each so a user mid-recovery (or mid-onboarding) sees exactly which
+/// grant is still pending, not just an aggregate "capture is off".
+#[derive(Debug, Clone, Copy, Serialize)]
+struct PermissionStatusEvent {
+    accessibility: bool,
+    input_monitoring: bool,
 }
 
 /// Payload for [`EVT_CAPTURE_UI`] — the debounced, menu-bar-facing view of
@@ -2857,6 +2879,27 @@ pub fn spawn<R: Runtime>(
                                 &app_handle,
                                 &mut current_capture_health,
                                 new_health,
+                            );
+                        }
+                        InputEvent::PermissionStatus {
+                            accessibility,
+                            input_monitoring,
+                        } => {
+                            // Per-grant snapshot from the sidecar (read-only AX +
+                            // IOHID checks). Forward it verbatim to the UI so the
+                            // onboarding / Reconnect permission rows can tick each
+                            // grant the moment ITS own permission lands. Emitted on
+                            // every receipt (not transition-gated) so a window that
+                            // opens mid-flow converges to truth within a poll cycle.
+                            // Independent of capture-health: `live` (both grants +
+                            // tap armed) remains the gate for "capture is running".
+                            // Not a keystroke — nothing to count in the funnel.
+                            let _ = app_handle.emit(
+                                EVT_PERMISSION_STATUS,
+                                PermissionStatusEvent {
+                                    accessibility,
+                                    input_monitoring,
+                                },
                             );
                         }
                         InputEvent::Shutdown => break 'engine_loop,
