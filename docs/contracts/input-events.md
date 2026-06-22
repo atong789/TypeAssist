@@ -33,8 +33,18 @@ A character-producing key event. Emitted on key-up so `dwell_ms` is known.
 
 Broken out from `key` because self-corrections are signal, not noise. L4 records these as evidence of `SelfCorrected` outcomes.
 
+Emitted on **keyDown, including OS auto-repeat** — so a held backspace produces one event per deletion. (Text keys are emitted on keyUp to measure dwell, but backspace dwell is unused, so it rides keyDown to keep the engine's dead-reckoned line buffer in step with reality when the user holds it down.)
+
 ```json
 { "type": "backspace", "timestamp_ms": 1729000000123 }
+```
+
+### `autorepeat_dropped`
+
+Emitted when the adapter **drops a non-backspace auto-repeat keyDown**. A held text key fires repeated OS keyDowns, but the adapter only emits that key once (on keyUp, for dwell), so the repeats are lost. This content-free marker lets the engine's capture funnel count that loss instead of hiding it (Principle #7), and reveals whether held *letter* keys drop in real use. Carries no key, no count, no timing. Backspace is exempt — it forwards every keyDown (above).
+
+```json
+{ "type": "autorepeat_dropped" }
 ```
 
 ### `permission_required`

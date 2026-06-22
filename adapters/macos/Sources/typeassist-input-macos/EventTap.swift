@@ -185,8 +185,38 @@ final class EventTap {
 
         switch type {
         case .keyDown:
-            keyDownTimestamps[keycode] = timestampNs
+            // **Auto-repeat is load-bearing for backspace.** Holding a key fires
+            // repeated `.keyDown` events but only ONE `.keyUp` on release. Text
+            // keys are emitted on `.keyUp` (so dwell = press-to-release), which
+            // means an auto-repeated keyDown is a keystroke the engine never
+            // sees. When a user HOLDS backspace to erase a word — the target
+            // user's most common erase gesture — the OS deletes N characters but
+            // the engine only ever heard one, so its dead-reckoned line buffer
+            // desyncs and glues separate retype attempts together (the
+            // stale-line-buffer / `edndd` class). Fix: emit backspace on EVERY
+            // keyDown (incl. repeats). Backspace dwell is unused (the engine
+            // treats it as 0), so moving it off keyUp loses nothing — and it is
+            // NOT re-emitted on keyUp below.
+            let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+            if keycode == 51 {
+                bridge.emit(.backspace(timestampMs: timestampMs))
+            } else {
+                keyDownTimestamps[keycode] = timestampNs
+                // Any OTHER key on auto-repeat is still emitted once on keyUp, so
+                // its repeats are dropped. Emit a content-free marker (Principle
+                // #7: capture must see its own loss) — it also reveals whether
+                // held *letter* keys drop in real use, the only thing that would
+                // justify moving every key onto keyDown later.
+                if isRepeat {
+                    bridge.emit(.autorepeatDropped)
+                }
+            }
         case .keyUp:
+            // Keycode 51 = backspace — emitted on keyDown now (see above),
+            // never here. (Nothing was stored in keyDownTimestamps for it.)
+            if keycode == 51 {
+                break
+            }
             let dwellMs: UInt32
             if let downNs = keyDownTimestamps.removeValue(forKey: keycode) {
                 dwellMs = UInt32((timestampNs - downNs) / 1_000_000)
@@ -194,10 +224,7 @@ final class EventTap {
                 dwellMs = 0
             }
 
-            // Keycode 51 = delete/backspace
-            if keycode == 51 {
-                bridge.emit(.backspace(timestampMs: timestampMs))
-            } else if keycode == 53 {
+            if keycode == 53 {
                 // Keycode 53 = Escape. `keyboardGetUnicodeString` returns an
                 // EMPTY string for it (it's not a text-producing key), so the
                 // engine would never see it. Emit an explicit U+001B — the

@@ -325,6 +325,30 @@ impl MotorMap {
 
         match outcome {
             Outcome::Kept => {
+                // Plausibility guard (defense-in-depth, Principle #7). This is
+                // the only motor-map write path with no edit-distance check, so
+                // a line-buffer desync that glues several retype attempts into
+                // one giant token (the stale-line-buffer class) would otherwise
+                // credit every char of the glob as a "correct" observation —
+                // silently inflating per-key confidence, un-scrubbably (it's
+                // blended into per-key counts, not a deletable record). Skip a
+                // Kept token that doesn't look like a real word, using the SAME
+                // generous test the word-pattern / scoreboard paths use
+                // (`is_known` OR letter-trigram plausible): every real word —
+                // long ones included — passes, and short (<3-letter) words defer
+                // to `is_known`, so this only ever catches an implausible glob.
+                // Mirrors the `CorrectedToOther` rewrite guard below.
+                let norm: String = normalize(typed).into_iter().collect();
+                if !crate::target_is_recordable(&norm, crate::Lexicon::shared()) {
+                    // debug!, not info!: prints the raw typed word (privacy).
+                    tracing::debug!(
+                        target: "motor_map",
+                        "MOTOR_OBSERVE_SKIP_IMPLAUSIBLE typed={:?} len={}",
+                        typed,
+                        norm.chars().count()
+                    );
+                    return ObserveReport::default();
+                }
                 let mut chars = 0u32;
                 for c in normalize(typed) {
                     self.bump_correct(c, now);
@@ -1095,6 +1119,36 @@ mod tests {
             loaded.query_probable_intent('s'),
             map.query_probable_intent('s')
         );
+    }
+
+    #[test]
+    fn kept_skips_implausible_glob_but_keeps_real_long_word() {
+        // Defense-in-depth (Principle #7): a stale-line-buffer desync can hand
+        // the Kept arm a glued glob of several retype attempts run together. It
+        // must NOT credit per-key observations — that inflates confidence
+        // un-scrubbably (blended into per-key counts, not a deletable record).
+        // But a genuine long word must still be fully observed, even one absent
+        // from the bundled dictionary that passes only on trigram-plausibility.
+        let mut map = MotorMap::new();
+
+        // 34-char glob (three "anticipated" attempts run together, as seen in a
+        // real desync): not a word, not trigram-plausible → skipped, nothing
+        // written.
+        map.observe_outcome(
+            Outcome::Kept,
+            "anticioviatedanticicpatanticipated",
+            None,
+            T0,
+        );
+        assert_eq!(map.total_observations(), 0, "implausible glob is skipped");
+        assert!(map.is_empty(), "no per-key counts written for a glob");
+
+        // A real long word that is NOT is_known (so it passes only via
+        // trigram-plausibility) is still fully observed — the guard must never
+        // skip a real word, however long.
+        map.observe_outcome(Outcome::Kept, "antidisestablishmentarianism", None, T0);
+        assert_eq!(map.total_observations(), 1, "real long word is observed");
+        assert!(!map.is_empty(), "its keys are credited");
     }
 
     #[test]

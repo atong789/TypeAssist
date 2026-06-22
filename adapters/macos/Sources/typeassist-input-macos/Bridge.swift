@@ -37,6 +37,12 @@ enum InputEvent {
     /// mouse/trackpad click (from the tap) or a focus/app change (from the
     /// secure-field AX observer). Content-free: `reason` is only a log tag.
     case caretMoved(reason: String)
+    /// **An auto-repeated keystroke the adapter did NOT forward.** Holding a
+    /// (non-backspace) key fires repeated keyDowns but the adapter only emits
+    /// that key once, on keyUp — so the repeats are lost. This content-free
+    /// marker lets the engine's funnel count that loss (Principle #7: capture
+    /// must see its own drop). Carries nothing — no key, no count, no timing.
+    case autorepeatDropped
 }
 
 enum OutboundCommand {
@@ -129,6 +135,8 @@ final class Bridge {
             ]
         case let .caretMoved(reason):
             payload = ["type": "caret_moved", "reason": reason]
+        case .autorepeatDropped:
+            payload = ["type": "autorepeat_dropped"]
         }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
               let s = String(data: data, encoding: .utf8) else {

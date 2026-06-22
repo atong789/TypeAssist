@@ -611,6 +611,14 @@ fn now_ms() -> u64 {
 struct Funnel {
     /// L1: raw Key/Backspace events received from the sidecar.
     keystrokes_received: u64,
+    /// **L1 capture loss made visible (Principle #7).** Non-backspace
+    /// auto-repeat keyDowns the adapter dropped (it emits a text key once, on
+    /// keyUp, so held-key repeats are lost). This is NOT part of `received` —
+    /// these never reached the pipeline. A healthy run keeps this ~0; a climbing
+    /// count means held *letter* keys are dropping in real use (held backspace
+    /// is already forwarded, so it never lands here). It exists so the drop is
+    /// counted, not silent.
+    autorepeat_dropped: u64,
     /// After filtering (modifier/Cmd-Ctrl drops, non-text nav, pause).
     keystrokes_accepted: u64,
     /// Fresh Word/Acronym seals (a new anchor registered). Replay re-seals
@@ -666,13 +674,15 @@ impl Funnel {
     /// callers (the Cmd+Shift+F chord and the 60s auto-dump).
     fn dump(&self) {
         tracing::info!(
-            "FUNNEL_DUMP {{ c_keystrokes_received: {}, c_keystrokes_accepted: {}, \
+            "FUNNEL_DUMP {{ c_keystrokes_received: {}, c_autorepeat_dropped: {}, \
+             c_keystrokes_accepted: {}, \
              c_tokens_sealed: {}, c_records_admitted: {}, c_verdicts_resolved: {{kept: {}, \
              corr_sug: {}, corr_oth: {}, abandoned: {}}}, c_motor_observations: {{kept: {}, \
              slip: {}}}, c_motor_saves: {}, c_word_patterns: {{observed: {}, skipped: {}}}, \
              c_word_pattern_saves: {}, c_corrections: {{applied: {}, undone: {}}}, \
              session_started_at: {} }}",
             self.keystrokes_received,
+            self.autorepeat_dropped,
             self.keystrokes_accepted,
             self.tokens_sealed,
             self.records_admitted,
@@ -2838,6 +2848,12 @@ pub fn spawn<R: Runtime>(
                     match parsed {
                         InputEvent::Ready => {
                             tracing::info!("sidecar ready — engine listening");
+                        }
+                        InputEvent::AutorepeatDropped => {
+                            // L1 dropped a non-backspace auto-repeat keystroke.
+                            // Count it so capture loss is visible (Principle #7);
+                            // it carries no content and feeds no pipeline stage.
+                            funnel.autorepeat_dropped += 1;
                         }
                         InputEvent::PermissionRequired => {
                             tracing::warn!(

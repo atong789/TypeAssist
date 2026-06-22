@@ -58,6 +58,14 @@ pub enum InputEvent {
         #[serde(default)]
         reason: Option<String>,
     },
+    /// **An auto-repeated keystroke the L1 adapter did NOT forward.** Holding a
+    /// (non-backspace) key fires repeated OS keyDowns, but the adapter emits a
+    /// text key once, on keyUp, so the repeats are lost. The engine counts these
+    /// in its capture funnel so the drop is visible rather than silent (Principle
+    /// #7). Content-free by construction (Principle #9): no key, no count, no
+    /// timing. (Backspace is exempt — the adapter forwards every backspace
+    /// keyDown, so held-backspace deletions are not dropped.)
+    AutorepeatDropped,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,6 +188,17 @@ mod tests {
 
         let bare: InputEvent = serde_json::from_str(r#"{"type":"caret_moved"}"#).unwrap();
         assert_eq!(bare, InputEvent::CaretMoved { reason: None });
+    }
+
+    #[test]
+    fn autorepeat_dropped_event_round_trips() {
+        // The Swift sidecar emits this (content-free) when it drops a
+        // non-backspace auto-repeat keyDown. snake_case tag, no fields.
+        let e = InputEvent::AutorepeatDropped;
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(json, r#"{"type":"autorepeat_dropped"}"#);
+        let back: InputEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
     }
 
     #[test]
