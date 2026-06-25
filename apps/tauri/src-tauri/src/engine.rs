@@ -196,10 +196,21 @@ pub const EVT_CAPTURE_UI: &str = "engine://capture-ui";
 /// panel and the tray master toggle render from this so the UI always reflects
 /// the engine's authoritative state. Payload is [`crate::allow_list::AllowList`].
 pub const EVT_CORRECTION_STATE: &str = "corrections://state";
-/// **M3 correction Step 1.** A live correction was just injected — fired once
-/// per applied fix so the HUD cue can show `typed → target` briefly. Payload is
-/// [`CorrectionAppliedEvent`]. (Principle #7: every correction is observable.)
+/// **M3 correction bubble.** A confident correction is being SUGGESTED for the
+/// just-sealed word — the bubble HUD shows it; *nothing changes on screen*. The
+/// fix is applied only if the user taps Shift (accept). Payload is
+/// [`CorrectionSuggestedEvent`]. (Principle #9: never a silent auto-apply.)
+pub const EVT_CORRECTION_SUGGESTED: &str = "corrections://suggested";
+/// **M3 correction bubble.** A correction was just APPLIED (the user accepted
+/// with Shift) or reverted (Esc) — fired so the bubble can show the post-accept
+/// "Fixed — Esc to undo" cue (and so every correction stays observable,
+/// Principle #7). Payload is [`CorrectionAppliedEvent`] (`undo` flags a revert).
 pub const EVT_CORRECTION_APPLIED: &str = "corrections://applied";
+/// **M3 correction bubble.** A pending suggestion was dropped WITHOUT being
+/// accepted — the user edited the word / typed on / moved the caret, the gate
+/// went off, or it timed out. Tells the bubble to hide immediately, so a visible
+/// bubble always means Shift will work (no "dead bubble"). No payload.
+pub const EVT_CORRECTION_DISMISSED: &str = "corrections://dismissed";
 
 /// Engine-derived view of the sidecar's capture state. Transitions
 /// are observation-only this phase — driven by the Heartbeat
@@ -331,14 +342,6 @@ pub enum EngineControl {
     /// allow-list. The instant global on/off the tray toggle posts. The engine
     /// persists and echoes the new state on [`EVT_CORRECTION_STATE`].
     SetCorrectionEnabled(bool),
-    /// **M3 correction Step 1 — per-pattern toggle.** Enable (add) or disable
-    /// (remove) one `typed → target` pattern in the allow-list, from the panel.
-    /// Persists + echoes [`EVT_CORRECTION_STATE`].
-    SetPatternEnabled {
-        typed: String,
-        target: String,
-        enabled: bool,
-    },
     /// **M3 correction Step 1.** Ask the engine to emit the current allow-list
     /// on [`EVT_CORRECTION_STATE`] — the panel/tray pull fresh state on open.
     RequestAllowList,
@@ -521,15 +524,92 @@ struct KeystrokePayload {
     ingest_latency_ms: f64,
 }
 
-/// Payload for [`EVT_CORRECTION_APPLIED`] — what the HUD cue shows. Carries the
-/// before/after words and whether this event is a fix or its undo, so one cue
-/// component renders both (`teh → the` on apply, `the → teh` reverting on undo).
+/// Payload for [`EVT_CORRECTION_APPLIED`] — what the bubble shows after an accept
+/// or revert. Carries the before/after words and whether this event is a fix or
+/// its undo (`teh → the` on apply, `the → teh` reverting on undo).
 #[derive(Serialize, Clone)]
 struct CorrectionAppliedEvent {
     typed: String,
     target: String,
-    /// `false` for an injected fix, `true` for an Escape teach-stop revert.
+    /// `false` for an applied fix, `true` for an Escape revert.
     undo: bool,
+}
+
+/// Payload for [`EVT_CORRECTION_SUGGESTED`] — the bubble's before→after, with the
+/// changed target letters (`highlight`) marked soft-blue. Nothing is injected
+/// until the user accepts with Shift.
+#[derive(Serialize, Clone)]
+struct CorrectionSuggestedEvent {
+    typed: String,
+    target: String,
+    highlight: Vec<usize>,
+}
+
+/// A correction the engine is currently SUGGESTING (the bubble is up), retained
+/// until the user accepts it with an isolated Shift tap. Stays ACCEPTABLE for a
+/// generous window even after the user types ON, via an ANCHORED replace keyed
+/// off `word_end` (the word's end position in the line). Dropped the moment the
+/// user edits the source word / navigates / the caret moves, exceeds the
+/// distance cap, or the window expires — bias hard toward dismiss (a missed
+/// accept is fine; a wrong-place edit is not). `word_len`/`boundary` reproduce
+/// the immediate (no-typing-since) delete+retype; `word_end` anchors the
+/// positional replace once the caret has moved on.
+#[derive(Debug, Clone)]
+struct PendingSuggestion {
+    typed: String,
+    target: String,
+    boundary: char,
+    word_len: usize,
+    /// The word's end position in the line buffer at seal (= `tok.end`). Fixed
+    /// while pending (it dismisses if anything edits at/before it), so the accept
+    /// can compute how far the caret has moved on.
+    word_end: usize,
+    armed_at_ms: u64,
+}
+
+/// How long a suggestion stays up if the user neither accepts (Shift) nor types —
+/// the generous "window." Sized for the target user, who types slowly: long
+/// enough to notice + accept, short enough that an ignored one doesn't overstay.
+/// (The bubble's own SUGGEST_MS backstop sits above this.) **Tunable.**
+const SUGGESTION_TIMEOUT_MS: u64 = 5_000;
+
+/// Distance cap for the anchored accept: how many chars the caret may have moved
+/// PAST the word and still let Shift land it (≈ 1–2 words). Beyond this the
+/// dead-reckoning drift risk is too high → dismiss. Deliberately tight (the
+/// target user types slowly — they won't be far ahead). **Tunable.**
+const MAX_ANCHOR_CHARS: usize = 20;
+
+/// Master switch for the ANCHORED accept (Shift *after* the caret has typed past
+/// the word). **OFF.** A wrong-place anchored replace doubled a word in the live
+/// field — `settgings` + ~3 words + Shift produced `Settingsettings` — because
+/// the engine dead-reckons the caret from keystrokes and that model had drifted
+/// from the real field (autocap / untracked edits the tap never observes). For
+/// this audience, garbling text is the one failure we cannot ship, so until the
+/// anchored path is *provably* safe Shift accepts ONLY on the immediate
+/// no-arrows path (`after_len == 1`). Re-enabling requires L1 to confirm the word
+/// at the position from the AX field (ground truth) — the dead-reckoned model
+/// alone cannot make this safe. A missed accept is fine; a wrong-place edit is
+/// not. See [`word_at_anchor`].
+const ANCHORED_ACCEPT_ENABLED: bool = false;
+
+/// Fail-safe check for the anchored accept: before an anchored replace
+/// deletes/types, verify the engine's own line model still holds the ORIGINAL
+/// word (`typed`) at the anchored position (`line_buf[word_end - word_len ..
+/// word_end]`). A mismatch means the model has drifted — inject nothing.
+///
+/// This catches model-INTERNAL desync (retokenisation / miscounted positions).
+/// It cannot catch divergence the model never observed (autocap rewriting the
+/// field), because `line_buf` is itself the dead-reckoned model — which is why
+/// anchored stays gated by [`ANCHORED_ACCEPT_ENABLED`] until L1 supplies the
+/// field's ground truth. Necessary, not sufficient.
+fn word_at_anchor(line_buf: &[char], word_end: usize, word_len: usize, typed: &str) -> bool {
+    let Some(start) = word_end.checked_sub(word_len) else {
+        return false;
+    };
+    match line_buf.get(start..word_end) {
+        Some(slice) => slice.iter().copied().eq(typed.chars()),
+        None => false,
+    }
 }
 
 /// The just-fired correction, retained so a single Escape can revert it within
@@ -541,6 +621,12 @@ struct LastCorrection {
     typed: String,
     target: String,
     boundary: char,
+    /// `after_len` from the accept: 1 = immediate (caret at the boundary), >1 =
+    /// the caret had moved on (anchored accept). The revert mirrors the accept —
+    /// caret-relative for the immediate case, anchored (arrow-keyed) otherwise.
+    /// Safe because `last_correction` disarms on ANY non-Esc keystroke, so an Esc
+    /// undo only ever fires with the caret exactly where the accept left it.
+    after_len: usize,
     fired_at_ms: u64,
 }
 
@@ -567,6 +653,52 @@ struct DecisionPayload {
     active_tier: ConfidenceTier,
     decide_time_ms: f64,
     decision_version: u32,
+}
+
+/// Re-apply the user's capitalisation pattern to a (lowercase) correction
+/// target, so a fix never changes their casing: `Teh → The`, `WAHT → WHAT`,
+/// `teh → the`. All-caps (2+ letters) → upper; leading capital → capitalise the
+/// first letter; otherwise verbatim. Case is read from the RAW typed word.
+fn match_source_case(typed_raw: &str, target_lower: &str) -> String {
+    let letters: Vec<char> = typed_raw.chars().filter(|c| c.is_alphabetic()).collect();
+    let all_caps = letters.len() >= 2 && letters.iter().all(|c| c.is_uppercase());
+    if all_caps {
+        return target_lower.to_uppercase();
+    }
+    let leading_cap = typed_raw.chars().next().is_some_and(|c| c.is_uppercase());
+    if leading_cap {
+        let mut out = String::new();
+        let mut chars = target_lower.chars();
+        if let Some(f) = chars.next() {
+            out.extend(f.to_uppercase());
+        }
+        out.push_str(chars.as_str());
+        return out;
+    }
+    target_lower.to_string()
+}
+
+/// The "contraction filter" (locked principle): TypeAssist owns idiosyncratic
+/// MOTOR garbles, not missing apostrophes / contractions / possessives — that's
+/// Auto-Correct's job. Returns true for an apostrophe-only fix so the engine
+/// suppresses it: the target has an apostrophe AND, with apostrophes removed and
+/// case-folded, it equals the typed form (a pure apostrophe insert, `dont → don't`,
+/// `todays → today's`) or the typed form + `s` (possessive completion, `key' →
+/// key's`). A genuine motor garble in an apostrophe word (`doens't → doesn't`,
+/// the letters differ by a transposition) is NOT suppressed.
+fn is_apostrophe_fix(typed: &str, target: &str) -> bool {
+    if !target.contains('\'') {
+        return false;
+    }
+    let strip = |s: &str| -> String {
+        s.chars()
+            .filter(|&c| c != '\'')
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    };
+    let st = strip(typed);
+    let sg = strip(target);
+    st == sg || sg == format!("{st}s")
 }
 
 /// Emission wrapper for an anchor snapshot. The pure
@@ -658,6 +790,13 @@ struct Funnel {
     /// that reverted one. A healthy run reconciles `undone ≤ applied`.
     corrections_applied: u64,
     corrections_undone: u64,
+    /// **M3 autocorrect coexistence — "Watch Dog Not Attack Dog" (Principle
+    /// #7).** Times Jordan stood down on a host-redundant (common) suggestion
+    /// because he behaviourally sensed an active competing corrector
+    /// ([`CompetitorSense`]). A deliberate, visible drop — a suggestion the
+    /// engine WOULD have surfaced but withheld so it doesn't double-correct the
+    /// host. Idiosyncratic fixes are never counted here (they always fire).
+    competitor_deferred: u64,
     /// Session start (ms since epoch), stamped at task spawn.
     session_started_ms: u64,
 }
@@ -680,7 +819,7 @@ impl Funnel {
              corr_sug: {}, corr_oth: {}, abandoned: {}}}, c_motor_observations: {{kept: {}, \
              slip: {}}}, c_motor_saves: {}, c_word_patterns: {{observed: {}, skipped: {}}}, \
              c_word_pattern_saves: {}, c_corrections: {{applied: {}, undone: {}}}, \
-             session_started_at: {} }}",
+             c_competitor_deferred: {}, session_started_at: {} }}",
             self.keystrokes_received,
             self.autorepeat_dropped,
             self.keystrokes_accepted,
@@ -698,6 +837,7 @@ impl Funnel {
             self.word_pattern_saves,
             self.corrections_applied,
             self.corrections_undone,
+            self.competitor_deferred,
             self.session_started_ms,
         );
     }
@@ -710,6 +850,87 @@ impl Funnel {
     fn reset(&mut self, now: u64) {
         *self = Funnel::new(now);
         tracing::info!("FUNNEL_RESET — counters zeroed, new run from {}", now);
+    }
+}
+
+/// **EASILY-FLIPPED CONSTANT — placeholder (decision iii).** Host-redundant
+/// footprints required before Jordan stands down on the common lane. N=2 so a
+/// single stray correction (a one-off self-fix) never trips deferral; small
+/// enough to engage quickly when a host corrector is genuinely active.
+const COMPETITOR_EVIDENCE_THRESHOLD: u32 = 2;
+
+/// **EASILY-FLIPPED CONSTANT — placeholder (decision iii).** Idle gap with no
+/// fresh footprint after which the competitor is treated as gone: Jordan
+/// re-arms and fires common fixes again. ~45s — long enough to span the pauses
+/// of a slow-typing user mid-paragraph, short enough that toggling the host
+/// corrector off is felt within a sentence or two.
+const COMPETITOR_REARM_IDLE_MS: u64 = 45_000;
+
+/// **Watch Dog Not Attack Dog (M3 autocorrect coexistence).** Jordan's purely
+/// *behavioural* sense of whether another corrector (a host app's autocorrect)
+/// is actively fixing words right now. He never reads the app's or system's
+/// autocorrect switch (content-blind, Principle #8); he senses a competitor by
+/// **footprint** — a `CorrectedToOther` in the host-redundant lane that he did
+/// **not** cause (an external agent made a common fix). His own accepts can't be
+/// footprints: their injected echo is dropped before the pipeline
+/// (`pending_echo`), so they never resolve `CorrectedToOther`.
+///
+/// After [`COMPETITOR_EVIDENCE_THRESHOLD`] footprints he *defers* on
+/// host-redundant (common) suggestions **only**; idiosyncratic fixes always
+/// fire (his core value — never suppressed). He re-arms when the competitor goes
+/// quiet ([`Self::decay`], ~45s idle) or on app/focus change ([`Self::reset`]).
+///
+/// **Global, not per-app** (decision ii): a single counter reset on focus
+/// change, so **no app identity is ever held or persisted** — the strongest
+/// Principle #8 posture. Cost: returning to an autocorrect app re-fires up to
+/// N common bubbles before re-deferring (fail-toward-firing, accepted).
+///
+/// **Output-only:** this gates whether Jordan *suggests*, never what he
+/// *learns* — the motor ledger / word-patterns learn from all ambient
+/// resolution regardless (`tick_resolver`, the motor pass).
+#[derive(Debug, Default)]
+struct CompetitorSense {
+    /// Footprints sensed in the current armed window. Saturates; zeroed by
+    /// [`Self::decay`] (idle re-arm) or [`Self::reset`] (focus change).
+    evidence: u32,
+    /// Wall-clock (ms) of the most recent footprint; drives idle re-arm.
+    last_footprint_ms: u64,
+}
+
+impl CompetitorSense {
+    /// A competing corrector just made a host-redundant fix Jordan didn't
+    /// cause. Bumps evidence and stamps the time.
+    fn note_footprint(&mut self, now: u64) {
+        self.evidence = self.evidence.saturating_add(1);
+        self.last_footprint_ms = now;
+    }
+
+    /// True when a competitor is currently sensed: enough footprints AND the
+    /// last one within the re-arm window. Pure read (always fresh) — the time
+    /// guard means deferral lapses the instant the window passes, even before
+    /// [`Self::decay`] zeroes the counter.
+    fn is_deferring(&self, now: u64) -> bool {
+        self.evidence >= COMPETITOR_EVIDENCE_THRESHOLD
+            && now.saturating_sub(self.last_footprint_ms) < COMPETITOR_REARM_IDLE_MS
+    }
+
+    /// Re-arm if the competitor has gone quiet: once a full idle window passes
+    /// with no footprint, zero the evidence so a fresh competitor must clear
+    /// the threshold again (preserves the N-footprint hysteresis across quiet
+    /// gaps). Called from the 1s watchdog. Idempotent.
+    fn decay(&mut self, now: u64) {
+        if self.evidence > 0
+            && now.saturating_sub(self.last_footprint_ms) >= COMPETITOR_REARM_IDLE_MS
+        {
+            self.evidence = 0;
+        }
+    }
+
+    /// Hard reset on app/focus change — a new app may have a different
+    /// corrector regime, so re-arm immediately (fail toward firing).
+    fn reset(&mut self) {
+        self.evidence = 0;
+        self.last_footprint_ms = 0;
     }
 }
 
@@ -781,6 +1002,17 @@ fn word_freq_snapshots_dir() -> Option<PathBuf> {
 /// in-memory default that ships dark, so nothing fires).
 fn allow_list_path() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("allow_list.json"))
+}
+
+/// `~/.typeassist/shadow_suggestions.log` — the **live dry-run** shadow log
+/// (M3 observe-only). Whenever the classifier WOULD surface a suggestion for a
+/// just-sealed word, one line is appended here; **nothing is applied to the
+/// user's text.** A tail-able diagnostic so the builder can type and watch what
+/// the engine *would* have suggested in real time. Honors `TYPEASSIST_DATA_DIR`.
+/// `None` when HOME is unset. (No new privacy surface: the same `typed → target`
+/// pairs already live in `word_patterns.json`.)
+fn shadow_log_path() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("shadow_suggestions.log"))
 }
 
 /// Minimum interval between live motor-map flushes when there are unsaved
@@ -1362,6 +1594,7 @@ fn tick_resolver<R: Runtime>(
     guess_ledger: &mut GuessLedger,
     funnel: &mut Funnel,
     tally: &mut DailyTally,
+    competitor_sense: &mut CompetitorSense,
 ) {
     let now = now_ms();
 
@@ -1438,6 +1671,29 @@ fn tick_resolver<R: Runtime>(
                             anchors.anchors(),
                             line_buf,
                         );
+                        // Watch Dog Not Attack Dog (M3 autocorrect coexistence):
+                        // a word was just corrected toward a COMMON target that
+                        // Jordan didn't cause (his own accepts are echo-skipped
+                        // before this pipeline, so they never reach here). That's
+                        // a competing-corrector footprint — sense it so the fire
+                        // gate can defer on the redundant lane. OUTPUT-path only:
+                        // this reads the resolved pair and bumps the behavioural
+                        // sense; the learning writes below are untouched. Skip
+                        // during Practice/warm-up — that text is our own prompts,
+                        // not ambient host activity. (The self-correction case is
+                        // made moot by scope: deferral only ever applies to the
+                        // host-redundant common lane; idiosyncratic always fires.)
+                        if !prompted_capture_active {
+                            if let Some(c) = corrected.as_deref() {
+                                if correction_engine::is_host_redundant(
+                                    &rec.original_text,
+                                    c,
+                                    Lexicon::shared(),
+                                ) {
+                                    competitor_sense.note_footprint(now);
+                                }
+                            }
+                        }
                         // C5d word-pattern store: learn the typed→target pair
                         // (observe-only; kill-switch off). Counts observed vs
                         // skipped so the rewrite-filter drop is auditable.
@@ -1542,13 +1798,14 @@ fn tick_resolver<R: Runtime>(
                                     // Read-only (kill-switch OFF): log what this
                                     // just-updated pattern WOULD be classified as,
                                     // so the M3 decision is observable as evidence
-                                    // accrues (e.g. the flip to Tier1Ready when
-                                    // weight crosses the threshold). No injection.
+                                    // accrues (e.g. the flip to Suggest when weight
+                                    // crosses the risk-tiered bar). No injection.
                                     let readiness = correction_engine::classify(
                                         &rec.original_text,
                                         c,
                                         word_patterns,
                                         Lexicon::shared(),
+                                        motor_map,
                                     );
                                     // debug!, not info!: prints raw typed + target words (privacy).
                                     tracing::debug!(
@@ -1840,46 +2097,232 @@ fn send_inject_correction(
     }
 }
 
+/// Anchored replace (M3 bubble accept-after-typing-on): Left × `left`,
+/// Backspace × `delete_count`, type `replacement`, Right × `right`. The whole
+/// burst echoes back through the tap; the caller adds `left + delete_count +
+/// replacement.chars() + right` to `pending_echo` to drop it.
+fn send_inject_anchored(
+    child: &mut tauri_plugin_shell::process::CommandChild,
+    left: u32,
+    delete_count: u32,
+    replacement: String,
+    right: u32,
+) -> bool {
+    let cmd = OutboundCommand::InjectAnchored {
+        left,
+        delete_count,
+        replacement,
+        right,
+    };
+    let mut line = match serde_json::to_string(&cmd) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("failed to serialize InjectAnchored: {e}");
+            return false;
+        }
+    };
+    line.push('\n');
+    match child.write(line.as_bytes()) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("InjectAnchored write to sidecar failed: {e}");
+            false
+        }
+    }
+}
+
+/// One line of the live shadow dry-run: the strongest learned pattern for a
+/// just-typed word that the classifier WOULD surface as a suggestion. Read-only.
+struct ShadowSuggestion {
+    typed: String,
+    target: String,
+    tier: &'static str,
+    /// Decayed evidence weight the classifier saw (the "N obs" count).
+    evidence: f32,
+    /// How far off the slip was — Levenshtein edit distance typed→target.
+    edit_distance: usize,
+    /// Most-affected involved key's slip rate, `[0,1]` (the Motor-Map signal).
+    affectedness: f32,
+    /// The evidence bar actually applied (eased by affectedness).
+    bar_used: f32,
+    /// The un-eased tier base bar — what would apply with no motor evidence.
+    base_bar: f32,
+    /// This suggestion surfaced ONLY because the affected-key bonus eased the
+    /// bar (weight is below the base bar). The signal to watch for sharp-vs-noisy.
+    surfaced_early: bool,
+}
+
+/// Observe-only dry run: for a just-sealed `typed` word, return the strongest
+/// learned `typed → target` pattern the risk-tiered, Motor-Map-aware classifier
+/// WOULD surface as a suggestion, or `None`. Applies nothing — pure read over the
+/// store + lexicon + motor map. `snapshots()` is strongest-first, so the first
+/// matching `Suggest` is the best.
+///
+/// Uses the **length-scaled shadow curve** (`classify_explained_scaled`): a
+/// length-scaled non-word evidence bar (2–3 → 4, 4–6 → 3, 7+ → 1; real-word
+/// source unchanged at the high bar) and a length-scaled motor-edit budget (2–3 →
+/// 1, 4+ → up to 2). Every other gate is unchanged, and nothing is ever applied
+/// (`correction_enabled` stays off) — this only changes what the dry-run log says
+/// it WOULD suggest. The live Impact ledger and KILL_SWITCH_CLASSIFY line keep the
+/// flat 4/12 + budget-1 classifier.
+fn shadow_suggestion(
+    typed: &str,
+    store: &WordPatternStore,
+    lexicon: &Lexicon,
+    motor_map: &MotorMap,
+) -> Option<ShadowSuggestion> {
+    let typed_n = normalize_word(typed);
+    if typed_n.is_empty() {
+        return None;
+    }
+    for s in store.snapshots() {
+        if s.typed != typed_n {
+            continue;
+        }
+        let ex = correction_engine::classify_explained_scaled(
+            &s.typed, &s.target, store, lexicon, motor_map,
+        );
+        if let PatternReadiness::Suggest { tier } = ex.readiness {
+            let tier = match tier {
+                correction_engine::SuggestTier::NonWordSource => "non_word_source",
+                correction_engine::SuggestTier::RealWordSource => "real_word_source",
+            };
+            let edit_distance = correction_engine::edit_distance(&s.typed, &s.target);
+            return Some(ShadowSuggestion {
+                typed: s.typed,
+                target: s.target,
+                tier,
+                evidence: s.weight,
+                edit_distance,
+                affectedness: ex.affectedness,
+                bar_used: ex.bar_used,
+                base_bar: ex.base_bar,
+                surfaced_early: ex.surfaced_early,
+            });
+        }
+    }
+    None
+}
+
+/// Append one shadow-suggestion line to the tail-able dry-run log. Best-effort:
+/// a write failure is logged and dropped (the dry run must never disturb the
+/// pipeline). The line is human-readable and `tail -f`-friendly. An `EARLY`
+/// marker flags suggestions that surfaced only via the affected-key bonus, with
+/// the affectedness score and the bar used, so the builder can judge sharp vs noisy.
+fn append_shadow_log(path: &Path, now: u64, s: &ShadowSuggestion) {
+    use std::io::Write;
+    let marker = if s.surfaced_early {
+        "  EARLY(affected-key bonus)"
+    } else {
+        ""
+    };
+    let line = format!(
+        "{now} would-suggest  {} -> {}  tier={}  evidence={:.1}  edit_dist={}  affected={:.2}  bar={:.1}/{:.1}{}\n",
+        s.typed,
+        s.target,
+        s.tier,
+        s.evidence,
+        s.edit_distance,
+        s.affectedness,
+        s.bar_used,
+        s.base_bar,
+        marker,
+    );
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                tracing::warn!("shadow log write failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("shadow log open failed: {e}"),
+    }
+}
+
+/// Append one **bold** convergence line to the shadow log: a non-word that
+/// converges on exactly one base-dictionary word (the dictionary-driven,
+/// first-sighting signal). Distinct `would-suggest(bold)` tag, and includes the
+/// candidate count, the non-word flag, and the motor-map affectedness of the
+/// edit's keys (even when ~0 today). Applies nothing. Best-effort, like
+/// [`append_shadow_log`].
+fn append_shadow_bold_log(path: &Path, now: u64, typed: &str, scan: &correction_engine::ConvergenceScan) {
+    use std::io::Write;
+    // `convergent` guarantees exactly one candidate.
+    let candidate = scan.candidates.first().map(String::as_str).unwrap_or("");
+    let line = format!(
+        "{now} would-suggest(bold)  {} -> {}  candidates={}  nonword={}  budget={}  affected={:.2}  first-sighting\n",
+        typed,
+        candidate,
+        scan.candidates.len(),
+        scan.typed_is_non_word,
+        scan.budget,
+        scan.affectedness,
+    );
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                tracing::warn!("shadow bold log write failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("shadow bold log open failed: {e}"),
+    }
+}
+
 /// Read-only (kill-switch OFF): classify every learned pattern and log a
 /// summary, so the M3 decision is observable against real accumulating data
-/// BEFORE anything is ever injected. Counts by readiness and lists the
-/// patterns that WOULD act (Tier-1) or suggest (Tier-2), with their reason and
-/// decayed weight. Emitted alongside the 60s funnel dump. No injection — this
-/// only surfaces what the classifier *would* decide. No-op on an empty store.
-fn dump_classifications(store: &WordPatternStore) {
+/// BEFORE anything is ever suggested. Counts by readiness and lists the patterns
+/// that WOULD surface a (confirm-to-accept) suggestion, with their evidence tier
+/// and decayed weight. Emitted alongside the 60s funnel dump. No injection —
+/// this only surfaces what the classifier *would* decide. No-op on an empty
+/// store. (There is no silent path: every correction is a suggestion.)
+fn dump_classifications(store: &WordPatternStore, motor_map: &MotorMap) {
     if store.is_empty() {
         return;
     }
     let lexicon = Lexicon::shared();
-    let (mut tier1, mut tier2, mut silent) = (0u32, 0u32, 0u32);
+    let (mut suggest, mut observe) = (0u32, 0u32);
     let mut actionable: Vec<String> = Vec::new();
     for snap in store.snapshots() {
-        match correction_engine::classify(&snap.typed, &snap.target, store, lexicon) {
-            PatternReadiness::Tier1Ready => {
-                tier1 += 1;
+        let ex = correction_engine::classify_explained(
+            &snap.typed,
+            &snap.target,
+            store,
+            lexicon,
+            motor_map,
+        );
+        match ex.readiness {
+            PatternReadiness::Suggest { tier } => {
+                suggest += 1;
+                let early = if ex.surfaced_early { " EARLY" } else { "" };
                 actionable.push(format!(
-                    "{}→{} TIER1 w={:.1}",
-                    snap.typed, snap.target, snap.weight
+                    "{}→{} SUGGEST({:?}) w={:.1} affected={:.2} bar={:.1}/{:.1}{}",
+                    snap.typed,
+                    snap.target,
+                    tier,
+                    snap.weight,
+                    ex.affectedness,
+                    ex.bar_used,
+                    ex.base_bar,
+                    early
                 ));
             }
-            PatternReadiness::Tier2Only { reason } => {
-                tier2 += 1;
-                actionable.push(format!(
-                    "{}→{} TIER2({:?}) w={:.1}",
-                    snap.typed, snap.target, reason, snap.weight
-                ));
-            }
-            PatternReadiness::Silent { .. } => silent += 1,
+            PatternReadiness::Observe { .. } => observe += 1,
         }
     }
     // debug!, not info!: `actionable` lists raw typed→target word pairs (privacy).
     // Counts live in FUNNEL_DUMP (text-free), which stays at info.
     tracing::debug!(
-        "KILL_SWITCH_DUMP patterns={} tier1={} tier2={} silent={} actionable={:?}",
+        "KILL_SWITCH_DUMP patterns={} suggest={} observe={} actionable={:?}",
         store.len(),
-        tier1,
-        tier2,
-        silent,
+        suggest,
+        observe,
         actionable
     );
 }
@@ -2509,6 +2952,12 @@ pub fn spawn<R: Runtime>(
         // decision ledger's lexicon Known-skip (the sealed→verdict cliff).
         // In-memory only, like the decision ledger.
         let mut motor_ledger = MotorLedger::new();
+        // Watch Dog Not Attack Dog (M3 autocorrect coexistence): behavioural
+        // sense of an active competing corrector. Global (decision ii), so no
+        // app identity is ever held. Fed by host-redundant footprints in
+        // `tick_resolver`; read by the fire gate; reset on focus change; decayed
+        // by the watchdog.
+        let mut competitor_sense = CompetitorSense::default();
         // Daily-snapshot bookkeeping (Principle #6): the calendar date whose
         // snapshot we've already handled this run, seeded from the newest dated
         // file on disk so the first event of a *new* calendar day is detected
@@ -2562,11 +3011,23 @@ pub fn spawn<R: Runtime>(
         // Capture-integrity funnel (Principle #7). Per-session boundary
         // counters; dumped on the Cmd+Shift+F chord and every 60s.
         let mut funnel = Funnel::new(now_ms());
-        // M3 correction Step 1: the last fix, retained so a single Escape
-        // within `UNDO_WINDOW_MS` reverts it (and teach-stops the pattern).
-        // Disarmed on revert, on any other keystroke (implicit accept), and on
+        // Build marker (Principle #7 observability): one line at engine startup so
+        // the dev Terminal proves WHICH build is running — the bubble suggest path
+        // (fire from the classifier, accept via ShiftTap), not a stale engine.
+        tracing::info!(
+            "ENGINE_BUILD feature=correction_bubble fire_lane=classifier \
+             suggest_event=corrections://suggested accept=shift_tap undo=revert_only"
+        );
+        // M3 correction bubble: the last APPLIED fix, retained so a single Escape
+        // within `UNDO_WINDOW_MS` reverts it (revert only — no teach-stop).
+        // Disarmed on revert, on any other keystroke (implicit commit), and on
         // window timeout (watchdog).
         let mut last_correction: Option<LastCorrection> = None;
+        // M3 correction bubble: the correction currently SUGGESTED (bubble up),
+        // armed at seal and accepted by an isolated Shift tap. Cleared by any
+        // keystroke past the word, a caret move, the ~5s timeout, or a newer
+        // suggestion — so an accept only ever injects against the live caret.
+        let mut pending_suggestion: Option<PendingSuggestion> = None;
         // Count of injected events (backspaces + replacement chars) we still
         // expect to see echoed back through the L1 tap. The tap re-captures our
         // own injection (`.cgSessionEventTap` sees posted events), so each
@@ -2727,6 +3188,14 @@ pub fn spawn<R: Runtime>(
                         continue;
                     };
 
+                    // FIRE_TIMING t0 — wall-clock instant the engine received this
+                    // keystroke line from the L1 sidecar. `now_ms()` is UNIX-epoch
+                    // ms, the SAME clock as the webview's `Date.now()`, so the t0..t4
+                    // stamps logged across Rust + JS are directly comparable. Used
+                    // only by the suggestion fire site below; harmless on other
+                    // events. (Measurement only — does not affect firing.)
+                    let t_recv = now_ms();
+
                     // Hard pause: drop keystrokes at the engine boundary.
                     // Lifecycle events (Ready/PermissionRequired/Shutdown)
                     // still flow — those aren't input, they're the sidecar
@@ -2749,6 +3218,15 @@ pub fn spawn<R: Runtime>(
                         pending_echo -= 1;
                         continue;
                     }
+
+                    // M3 bubble gating: a pending suggestion stays ACCEPTABLE while
+                    // the user types ON (anchored accept), but is dropped the moment
+                    // they do anything that isn't a clean forward keystroke. The
+                    // per-event keep/dismiss decision lives in the Key / Backspace
+                    // arms (which know forward-vs-edit-vs-nav); here we only handle
+                    // the simplest case — a Backspace is always an edit, so dismiss.
+                    // (Bias hard toward dismiss: a missed accept is fine, a
+                    // wrong-place edit is not.)
 
                     // Funnel L1 boundary: count every raw typing event from
                     // the sidecar BEFORE any filtering (pause / modifier /
@@ -2937,8 +3415,191 @@ pub fn spawn<R: Runtime>(
                                 &mut last_correction,
                                 trigger,
                             );
+                            // Watch Dog re-arm: an app/focus change means a
+                            // possibly different corrector regime, so hard-reset
+                            // the competitor sense and fire normally again (fail
+                            // toward firing). ONLY on focus — a mouse click or
+                            // up/down within the same app keeps the sense (the
+                            // same competitor is still active). Content-free.
+                            if trigger == "focus" {
+                                competitor_sense.reset();
+                            }
+                            // The caret moved off the boundary — a pending bubble
+                            // could no longer inject safely. Drop it and hide it.
+                            if pending_suggestion.take().is_some() {
+                                let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                            }
+                        }
+                        InputEvent::ShiftTap { .. } => {
+                            // M3 bubble ACCEPT — an isolated Shift tap applies the
+                            // pending suggestion. This is the ONLY path that
+                            // injects (seal no longer auto-applies). Valid only
+                            // while the suggestion is still armed (caret at the
+                            // word boundary), so the deferred delete+retype lands
+                            // in the right place. No suggestion → a bare Shift is a
+                            // harmless no-op.
+                            if let Some(ps) = pending_suggestion.take() {
+                                // `after_len` = chars from the word's end to the
+                                // caret now (the boundary + anything typed since).
+                                // 1 = immediate (caret still at the boundary);
+                                // >1 = the caret moved on → anchored replace.
+                                let after_len = caret.saturating_sub(ps.word_end);
+                                // Fail-safe accept gate. Garbling the user's text is
+                                // the one outcome we refuse, so Shift injects ONLY
+                                // when the edit can be placed exactly:
+                                //   * IMMEDIATE (after_len == 1) — caret still right
+                                //     after the word; the proven no-arrows delete+
+                                //     retype. Always allowed.
+                                //   * ANCHORED (caret typed past the word) — allowed
+                                //     only when ANCHORED_ACCEPT_ENABLED *and* the line
+                                //     model still holds the original word at the
+                                //     anchored position. Currently DISABLED (a drifted
+                                //     dead-reckoned caret doubled a word); see
+                                //     ANCHORED_ACCEPT_ENABLED / word_at_anchor.
+                                // Anything else dismisses — a missed accept is fine.
+                                let immediate = after_len == 1;
+                                let anchored_ok = ANCHORED_ACCEPT_ENABLED
+                                    && caret > ps.word_end
+                                    && after_len > 1
+                                    && after_len <= MAX_ANCHOR_CHARS
+                                    && word_at_anchor(
+                                        &line_buf,
+                                        ps.word_end,
+                                        ps.word_len,
+                                        &ps.typed,
+                                    );
+                                if !immediate && !anchored_ok {
+                                    // Stale / beyond-cap / anchored-disabled / model
+                                    // mismatch — NEVER inject. A wrong-place edit is
+                                    // the one outcome we refuse.
+                                    tracing::info!(
+                                        "CORRECTION_ACCEPT_DECLINED typed={:?} after_len={} word_end={} caret={} anchored_enabled={}",
+                                        ps.typed,
+                                        after_len,
+                                        ps.word_end,
+                                        caret,
+                                        ANCHORED_ACCEPT_ENABLED
+                                    );
+                                    let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                                } else {
+                                    // Capture the delete_count we actually emit so the
+                                    // CORRECTION_APPLIED line can show it (Principle #7:
+                                    // an over-delete must be VISIBLE in the funnel, never
+                                    // inferred). The immediate path's `+ 1` boundary char
+                                    // is the suspect in contenteditable hosts (Google Docs
+                                    // welded `and·perseverence` → `andperseverance`); the
+                                    // root cause is its own — see
+                                    // docs/qa-15-contenteditable-boundary-overdelete.md.
+                                    // Logging delete_count beside `typed` + `boundary`
+                                    // makes a leading/trailing boundary over-delete
+                                    // self-evident without re-deriving it by hand.
+                                    // Assigned unconditionally in both accept arms below
+                                    // before the CORRECTION_APPLIED read — no seed value.
+                                    let delete_count_emitted: u32;
+                                    let applied = if immediate {
+                                        // Immediate accept — caret at the boundary.
+                                        // Proven no-arrow path: delete word + boundary,
+                                        // retype target + boundary.
+                                        let delete_count = (ps.word_len + 1) as u32;
+                                        delete_count_emitted = delete_count;
+                                        let replacement = format!("{}{}", ps.target, ps.boundary);
+                                        let echo_len =
+                                            delete_count + replacement.chars().count() as u32;
+                                        if send_inject_correction(
+                                            &mut sidecar_child,
+                                            delete_count,
+                                            replacement,
+                                        ) {
+                                            pending_echo += echo_len;
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        // Anchored accept — the caret moved on. Reached
+                                        // only when anchored_ok verified the word is
+                                        // still at the anchored position. Positional
+                                        // replace: Left × after_len (to just after the
+                                        // word), Backspace × word_len, type target (no
+                                        // boundary), Right × after_len (restore caret).
+                                        let left = after_len as u32;
+                                        let delete_count = ps.word_len as u32;
+                                        delete_count_emitted = delete_count;
+                                        let right = after_len as u32;
+                                        let echo_len = left
+                                            + delete_count
+                                            + ps.target.chars().count() as u32
+                                            + right;
+                                        if send_inject_anchored(
+                                            &mut sidecar_child,
+                                            left,
+                                            delete_count,
+                                            ps.target.clone(),
+                                            right,
+                                        ) {
+                                            pending_echo += echo_len;
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    };
+                                    if applied {
+                                        funnel.corrections_applied += 1;
+                                        tracing::info!(
+                                            "CORRECTION_APPLIED typed={:?} target={:?} delete_count={} boundary={:?} after_len={}",
+                                            ps.typed,
+                                            ps.target,
+                                            delete_count_emitted,
+                                            ps.boundary,
+                                            after_len
+                                        );
+                                        let _ = app_handle.emit(
+                                            EVT_CORRECTION_APPLIED,
+                                            CorrectionAppliedEvent {
+                                                typed: ps.typed.clone(),
+                                                target: ps.target.clone(),
+                                                undo: false,
+                                            },
+                                        );
+                                        // Arm the 6s Esc-undo (revert only). Carry
+                                        // after_len so the revert mirrors the accept.
+                                        last_correction = Some(LastCorrection {
+                                            typed: ps.typed,
+                                            target: ps.target,
+                                            boundary: ps.boundary,
+                                            after_len,
+                                            fired_at_ms: now_ms(),
+                                        });
+                                        // The tap suppresses the injection echo, so the
+                                        // engine never sees the text change — reset the
+                                        // line to mirror the corrected state. The reset
+                                        // re-bases the coordinate system; the anchored
+                                        // accept uses RELATIVE distances (after_len), so
+                                        // future accepts stay correct from the new base.
+                                        tokenizer.reset_line();
+                                        line_buf.clear();
+                                        line_dwells.clear();
+                                        caret = 0;
+                                        anchors.clear();
+                                        let _ = app_handle.emit(EVT_LINE_RESET, ());
+                                        let snap = anchors.snapshot();
+                                        let _ = app_handle.emit(
+                                            EVT_ANCHOR_SNAPSHOT,
+                                            anchor_emit_payload(&snap, &line_buf),
+                                        );
+                                    }
+                                }
+                            }
                         }
                         InputEvent::Backspace { .. } => {
+                            // M3 bubble: a backspace is always an edit — drop any
+                            // pending suggestion and hide the bubble (bias toward
+                            // dismiss; we can't safely tell a source-word edit from
+                            // a forward fix-up, and a wrong-place accept is worse
+                            // than a missed one).
+                            if pending_suggestion.take().is_some() {
+                                let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                            }
                             // Funnel: a backspace passed the pause filter and
                             // enters the edit pipeline (not a modifier drop).
                             funnel.keystrokes_accepted += 1;
@@ -3016,6 +3677,7 @@ pub fn spawn<R: Runtime>(
                                 &mut guess_ledger,
                                 &mut funnel,
                                 &mut tally,
+                                &mut competitor_sense,
                             );
                             let snap = anchors.snapshot();
                             let _ = app_handle.emit(
@@ -3023,7 +3685,14 @@ pub fn spawn<R: Runtime>(
                                 anchor_emit_payload(&snap, &line_buf),
                             );
                         }
-                        InputEvent::Key { key, dwell_ms, modifiers, .. } => {
+                        InputEvent::Key { key, dwell_ms, modifiers, timestamp_ms, .. } => {
+                            // M3 bubble gating: a pending suggestion survives this
+                            // keystroke ONLY if it's a clean FORWARD character append
+                            // (typing on). Set true in that one branch below; the
+                            // end-of-arm check (also enforcing the distance cap)
+                            // dismisses otherwise — nav keys, mid-line edits, the
+                            // Escape that isn't an undo, shortcuts all drop it.
+                            let mut keep_pending = false;
                             // Diagnostic log of the raw incoming codepoint(s)
                             // and modifier flags, so we can verify what the
                             // sidecar is actually emitting. DEBUG level: this
@@ -3081,7 +3750,7 @@ pub fn spawn<R: Runtime>(
                             if modifiers.command && modifiers.shift {
                                 if matches!(single_char, Some('f') | Some('F')) {
                                     funnel.dump();
-                                    dump_classifications(&word_patterns);
+                                    dump_classifications(&word_patterns, &motor_map);
                                     funnel.reset(now_ms());
                                     continue;
                                 }
@@ -3107,27 +3776,61 @@ pub fn spawn<R: Runtime>(
                                     && !modifiers.command
                                     && !modifiers.control;
                                 if !expired && is_escape {
-                                    // Revert: delete the target + boundary we
-                                    // injected, retype the original word +
-                                    // boundary.
-                                    let delete_count = (lc.target.chars().count() + 1) as u32;
-                                    let replacement = format!("{}{}", lc.typed, lc.boundary);
-                                    let echo_len =
-                                        delete_count + replacement.chars().count() as u32;
-                                    if send_inject_correction(
-                                        &mut sidecar_child,
-                                        delete_count,
-                                        replacement,
-                                    ) {
-                                        // Skip the revert's own echo too.
-                                        pending_echo += echo_len;
+                                    // Revert, mirroring the accept. `last_correction`
+                                    // disarms on any non-Esc key, so the caret is
+                                    // exactly where the accept left it.
+                                    let target_len = lc.target.chars().count() as u32;
+                                    let reverted = if lc.after_len == 1 {
+                                        // Immediate accept → caret at the boundary:
+                                        // delete target + boundary, retype typed +
+                                        // boundary.
+                                        let delete_count = target_len + 1;
+                                        let replacement = format!("{}{}", lc.typed, lc.boundary);
+                                        let echo_len =
+                                            delete_count + replacement.chars().count() as u32;
+                                        if send_inject_correction(
+                                            &mut sidecar_child,
+                                            delete_count,
+                                            replacement,
+                                        ) {
+                                            pending_echo += echo_len;
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        // Anchored accept → caret moved on: anchored
+                                        // revert. Left × after_len, Backspace ×
+                                        // target_len, type typed (no boundary), Right
+                                        // × after_len.
+                                        let left = lc.after_len as u32;
+                                        let right = lc.after_len as u32;
+                                        let echo_len = left
+                                            + target_len
+                                            + lc.typed.chars().count() as u32
+                                            + right;
+                                        if send_inject_anchored(
+                                            &mut sidecar_child,
+                                            left,
+                                            target_len,
+                                            lc.typed.clone(),
+                                            right,
+                                        ) {
+                                            pending_echo += echo_len;
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    };
+                                    if reverted {
                                         funnel.corrections_undone += 1;
                                         tracing::info!(
-                                            "CORRECTION_UNDONE typed={:?} target={:?}",
+                                            "CORRECTION_UNDONE typed={:?} target={:?} after_len={}",
                                             lc.typed,
-                                            lc.target
+                                            lc.target,
+                                            lc.after_len
                                         );
-                                        // Cue shows the revert direction.
+                                        // The bubble shows the revert direction.
                                         let _ = app_handle.emit(
                                             EVT_CORRECTION_APPLIED,
                                             CorrectionAppliedEvent {
@@ -3137,20 +3840,10 @@ pub fn spawn<R: Runtime>(
                                             },
                                         );
                                     }
-                                    // Teach-stop: a wrong fix is a one-key fix
-                                    // that won't recur. Remove + persist + echo
-                                    // so the panel/tray reflect the removal.
-                                    if allow_list.disable(&lc.typed) {
-                                        tracing::info!(
-                                            "ALLOW_LIST_TEACH_STOP removed typed={:?}",
-                                            lc.typed
-                                        );
-                                        persist_and_emit_allow_list(
-                                            &app_handle,
-                                            &allow_list,
-                                            allow_list_path.as_deref(),
-                                        );
-                                    }
+                                    // Esc does ONE predictable thing: revert. It no
+                                    // longer teach-stops the pattern — backing off a
+                                    // pattern comes from the user IGNORING the
+                                    // suggestion (not accepting), not from undo.
                                     // The revert's echo is suppressed too; reset
                                     // the line to mirror the restored text.
                                     tokenizer.reset_line();
@@ -3317,13 +4010,17 @@ pub fn spawn<R: Runtime>(
                                             anchors.apply_insert(caret, c);
                                             caret = new_caret;
 
-                                            // M3 Step 1: set when a correction
-                                            // fired and reset the line, so the
-                                            // trailing resolver tick is skipped
-                                            // (mirrors the newline-reset path,
-                                            // which also doesn't tick after).
-                                            let mut corrected = false;
+                                            // Always false now: the bubble defers
+                                            // injection to the Shift-accept, so a
+                                            // seal never resets the line and the
+                                            // trailing resolver tick always runs.
+                                            let corrected = false;
                                             if was_end_of_line {
+                                                // Clean forward append (typing on) —
+                                                // a pending suggestion survives this
+                                                // keystroke, subject to the distance
+                                                // cap enforced at the end of the arm.
+                                                keep_pending = true;
                                                 if let Some(tok) = tokenizer.observe_char(c) {
                                                     // M3 correction Step 1: a word
                                                     // just completed at a boundary
@@ -3335,13 +4032,109 @@ pub fn spawn<R: Runtime>(
                                                     // Capture what injection needs
                                                     // BEFORE `tok` moves into
                                                     // emit_sealed_token.
-                                                    let fire = if matches!(tok.kind, TokenKind::Word) {
-                                                        allow_list.target_for(&tok.core).map(|t| {
-                                                            (tok.core.clone(), t.to_string(), tok.end - tok.start)
-                                                        })
-                                                    } else {
-                                                        None
-                                                    };
+                                                    // M3 bubble: the ENGINE decides what to suggest — the dictionary/bold
+                                                    // lane (a non-word converging on exactly one dictionary word, suggested
+                                                    // immediately) then the learned classifier. This is the SAME decision the
+                                                    // shadow log records below; the manual allow-list no longer gates a fire
+                                                    // (its per-pattern enable was retired, so it's always empty). The master
+                                                    // gate (`correction_enabled`) still arms the whole feature. Capture what
+                                                    // the bubble needs BEFORE `tok` moves into emit_sealed_token.
+                                                    let mut fire: Option<(String, String, usize, usize)> = None;
+                                                    // FIRE_TIMING t1 — set at the fire decision below; hoisted here
+                                                    // so it stays in scope for the t2 emit log (measurement only).
+                                                    let mut t1: u64 = 0;
+                                                    if matches!(tok.kind, TokenKind::Word) {
+                                                        let word_len = tok.end - tok.start;
+                                                        let word_end = tok.end;
+                                                        // Lever 2 — LEARNED lane first. `shadow_suggestion` is a
+                                                        // cheap lookup over the user's own confirmed `typed → target`
+                                                        // patterns; only when it has nothing do we run the dictionary
+                                                        // convergence scan (itself O(word) after Lever 1). Reordering
+                                                        // keeps the hot path minimal for repeat slips AND lets a
+                                                        // pattern the user has taught us win a tie over a generic
+                                                        // dictionary convergence. (Before, convergence won the tie;
+                                                        // for the same word both lanes almost always agree on the
+                                                        // target — where they differ, the learned pattern is the more
+                                                        // personal signal.) Raw suggestion: typed as the user typed it
+                                                        // (tok.core keeps their case), target lowercase.
+                                                        let raw: Option<(String, String)> = if let Some(sh) =
+                                                            shadow_suggestion(&tok.core, &word_patterns, lexicon, &motor_map)
+                                                        {
+                                                            if let Some(p) = shadow_log_path() {
+                                                                append_shadow_log(&p, now_ms(), &sh);
+                                                            }
+                                                            Some((tok.core.clone(), sh.target.clone()))
+                                                        } else {
+                                                            let scan = correction_engine::shadow_convergence_scan(
+                                                                &tok.core,
+                                                                lexicon,
+                                                                &motor_map,
+                                                            );
+                                                            if scan.convergent {
+                                                                if let Some(p) = shadow_log_path() {
+                                                                    append_shadow_bold_log(&p, now_ms(), &tok.core, &scan);
+                                                                }
+                                                                // convergent ⇒ exactly one candidate, the target.
+                                                                scan.candidates.first().map(|t| (tok.core.clone(), t.clone()))
+                                                            } else {
+                                                                None
+                                                            }
+                                                        };
+                                                        // Contraction filter: drop apostrophe-only /
+                                                        // possessive fixes — Auto-Correct's job, not
+                                                        // ours (we own motor garbles).
+                                                        let apostrophe_suppressed = raw
+                                                            .as_ref()
+                                                            .is_some_and(|(t, g)| is_apostrophe_fix(t, g));
+                                                        let suggestion = if apostrophe_suppressed { None } else { raw };
+                                                        // Watch Dog Not Attack Dog (M3 autocorrect
+                                                        // coexistence): when a competing corrector is
+                                                        // behaviourally sensed AND this is a
+                                                        // host-redundant (common) fix, STAND DOWN — let
+                                                        // the host make the fix rather than double-correct
+                                                        // it. Idiosyncratic fixes are never host-redundant,
+                                                        // so they fall straight through and fire (his core
+                                                        // value — never suppressed). No app/settings read
+                                                        // (Principle #8); the shadow intent log above still
+                                                        // recorded what he WOULD suggest.
+                                                        let competitor_deferred = competitor_sense
+                                                            .is_deferring(now_ms())
+                                                            && suggestion.as_ref().is_some_and(|(t, g)| {
+                                                                correction_engine::is_host_redundant(t, g, lexicon)
+                                                            });
+                                                        // FIRE_TIMING t1 — the fire decision is resolved (Some/None).
+                                                        t1 = now_ms();
+                                                        // The master gate turns a suggestion into a live bubble. Log the
+                                                        // decision so a no-fire is diagnosable from the dev Terminal.
+                                                        // `competitor_deferred` is a content-free verdict bool
+                                                        // (Principle #8): it never names the app or the reason's source.
+                                                        tracing::info!(
+                                                            "FIRE_DECISION word={:?} gate_on={} suggestion={:?} apostrophe_suppressed={} competitor_deferred={} t1={} t1_minus_t0_ms={}",
+                                                            tok.core,
+                                                            allow_list.correction_enabled,
+                                                            suggestion.as_ref().map(|(t, g)| format!("{t}->{g}")),
+                                                            apostrophe_suppressed,
+                                                            competitor_deferred,
+                                                            t1,
+                                                            t1.saturating_sub(t_recv),
+                                                        );
+                                                        if allow_list.correction_enabled {
+                                                            if competitor_deferred {
+                                                                // A live bubble withheld to avoid
+                                                                // double-correcting the host — a deliberate,
+                                                                // counted drop (Principle #7). `fire` stays
+                                                                // None.
+                                                                funnel.competitor_deferred += 1;
+                                                            } else {
+                                                                // Preserve the user's capitalisation in the
+                                                                // target — never change their casing.
+                                                                fire = suggestion.map(|(t, g)| {
+                                                                    let g = match_source_case(&t, &g);
+                                                                    (t, g, word_len, word_end)
+                                                                });
+                                                            }
+                                                        }
+                                                    }
                                                     emit_sealed_token(
                                                         &app_handle,
                                                         tok,
@@ -3354,78 +4147,57 @@ pub fn spawn<R: Runtime>(
                                                         &mut proposer,
                                                         &mut funnel,
                                                     );
-                                                    if let Some((typed, target, word_len)) = fire {
-                                                        // Delete the word + the
-                                                        // boundary char we just
-                                                        // typed, then retype the
-                                                        // target + the same
-                                                        // boundary. Caret is at the
-                                                        // end of the line here
-                                                        // (was_end_of_line), so a
-                                                        // plain backspace-count
-                                                        // delete is correct.
-                                                        let delete_count = (word_len + 1) as u32;
-                                                        let replacement = format!("{target}{c}");
-                                                        let echo_len = delete_count
-                                                            + replacement.chars().count() as u32;
-                                                        if send_inject_correction(
-                                                            &mut sidecar_child,
-                                                            delete_count,
-                                                            replacement,
-                                                        ) {
-                                                            // Skip this fix's echo
-                                                            // (backspaces + retyped
-                                                            // chars) when it streams
-                                                            // back through the tap.
-                                                            pending_echo += echo_len;
-                                                            funnel.corrections_applied += 1;
-                                                            tracing::info!(
-                                                                "CORRECTION_APPLIED typed={:?} target={:?} delete={}",
-                                                                typed,
-                                                                target,
-                                                                delete_count
-                                                            );
-                                                            let _ = app_handle.emit(
-                                                                EVT_CORRECTION_APPLIED,
-                                                                CorrectionAppliedEvent {
-                                                                    typed: typed.clone(),
-                                                                    target: target.clone(),
-                                                                    undo: false,
-                                                                },
-                                                            );
-                                                            last_correction = Some(LastCorrection {
-                                                                typed,
-                                                                target,
-                                                                boundary: c,
-                                                                fired_at_ms: now_ms(),
-                                                            });
-                                                            // The tap suppresses the
-                                                            // injection's echo, so
-                                                            // the engine won't see
-                                                            // the text change — reset
-                                                            // the line to mirror the
-                                                            // corrected state (same
-                                                            // precedent as the
-                                                            // newline reset). This
-                                                            // also drops the
-                                                            // just-sealed typed word's
-                                                            // Pending record (it
-                                                            // idle-abandons), so the
-                                                            // engine never learns from
-                                                            // its own fix.
-                                                            tokenizer.reset_line();
-                                                            line_buf.clear();
-                                                            line_dwells.clear();
-                                                            caret = 0;
-                                                            anchors.clear();
-                                                            let _ = app_handle.emit(EVT_LINE_RESET, ());
-                                                            let snap = anchors.snapshot();
-                                                            let _ = app_handle.emit(
-                                                                EVT_ANCHOR_SNAPSHOT,
-                                                                anchor_emit_payload(&snap, &line_buf),
-                                                            );
-                                                            corrected = true;
-                                                        }
+                                                    if let Some((typed, target, word_len, word_end)) = fire {
+                                                        // M3 bubble: do NOT inject at seal — SUGGEST. The bubble shows
+                                                        // `typed → target`; nothing changes on screen until the user
+                                                        // accepts with an isolated Shift tap. Armed against the current
+                                                        // caret (end of line here) and cleared by the next keystroke, a
+                                                        // caret move, or the ~5s timeout — so an accept only ever injects
+                                                        // while the caret is still at this word's boundary.
+                                                        // Indices are case-independent (positions are
+                                                        // the same whatever the casing) — compare the
+                                                        // lowercased forms so a leading capital doesn't
+                                                        // throw the alignment off.
+                                                        let highlight = correction_engine::corrected_target_indices(
+                                                            &typed.to_lowercase(),
+                                                            &target.to_lowercase(),
+                                                        );
+                                                        let _ = app_handle.emit(
+                                                            EVT_CORRECTION_SUGGESTED,
+                                                            CorrectionSuggestedEvent {
+                                                                typed: typed.clone(),
+                                                                target: target.clone(),
+                                                                highlight,
+                                                            },
+                                                        );
+                                                        // FIRE_TIMING t2 — EVT_CORRECTION_SUGGESTED handed to Tauri.
+                                                        // One self-contained line carries the engine-side breakdown:
+                                                        //   t0 = keystroke received from L1, t1 = fire decided,
+                                                        //   t2 = event emitted; dwell_ms = the boundary key's
+                                                        //   press→release hold (emitted on keyUp, so this hold is
+                                                        //   part of physical-press → t0). os_ts is the CGEvent clock
+                                                        //   (uptime-based, NOT comparable to t0..t2 — context only).
+                                                        let t2 = now_ms();
+                                                        tracing::info!(
+                                                            "FIRE_TIMING typed={:?} target={:?} word_len={} t0_recv={} t1_decision={} t2_emit={} d_t0_t2_ms={} dwell_ms={} os_ts={}",
+                                                            typed,
+                                                            target,
+                                                            word_len,
+                                                            t_recv,
+                                                            t1,
+                                                            t2,
+                                                            t2.saturating_sub(t_recv),
+                                                            dwell_ms,
+                                                            timestamp_ms,
+                                                        );
+                                                        pending_suggestion = Some(PendingSuggestion {
+                                                            typed,
+                                                            target,
+                                                            boundary: c,
+                                                            word_len,
+                                                            word_end,
+                                                            armed_at_ms: now_ms(),
+                                                        });
                                                     }
                                                 }
                                             } else {
@@ -3487,6 +4259,7 @@ pub fn spawn<R: Runtime>(
                                                     &mut guess_ledger,
                                                     &mut funnel,
                                                     &mut tally,
+                                                    &mut competitor_sense,
                                                 );
                                                 let snap = anchors.snapshot();
                                                 let _ = app_handle.emit(
@@ -3526,6 +4299,28 @@ pub fn spawn<R: Runtime>(
                             // (lexicon → candidates → score → decide)
                             // emitting per-stage panel events. The skeleton
                             // tge→the lookup is retired.
+
+                            // M3 bubble gating: keep the pending suggestion ONLY if
+                            // this was a clean forward keystroke (keep_pending) AND
+                            // the caret is still PAST the word and within the
+                            // distance cap; otherwise drop + hide it. Catches nav
+                            // keys, mid-line edits, a non-undo Escape, shortcuts,
+                            // and the over-the-cap case in one place. Bias toward
+                            // dismiss — a missed accept is fine, a wrong-place edit
+                            // is not.
+                            if let Some(ps) = &pending_suggestion {
+                                let dist = caret.saturating_sub(ps.word_end);
+                                // While the anchored accept is OFF, an accept is
+                                // possible ONLY at the immediate boundary (dist == 1),
+                                // so drop the bubble the moment the caret types past it
+                                // — a visible bubble must always mean Shift will work.
+                                // With anchored ON, keep it up to the distance cap.
+                                let cap = if ANCHORED_ACCEPT_ENABLED { MAX_ANCHOR_CHARS } else { 1 };
+                                if !keep_pending || caret <= ps.word_end || dist > cap {
+                                    pending_suggestion = None;
+                                    let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                                }
+                            }
                         }
                     }
                 }
@@ -3744,6 +4539,9 @@ pub fn spawn<R: Runtime>(
                             if allow_list.set_enabled(enabled) {
                                 if !enabled {
                                     last_correction = None;
+                                    if pending_suggestion.take().is_some() {
+                                        let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                                    }
                                 }
                                 tracing::info!("CORRECTION_GATE enabled={enabled}");
                                 persist_and_emit_allow_list(
@@ -3756,26 +4554,6 @@ pub fn spawn<R: Runtime>(
                                 // that diverged reconverges.
                                 let _ = app_handle.emit(EVT_CORRECTION_STATE, allow_list.clone());
                             }
-                        }
-                        EngineControl::SetPatternEnabled { typed, target, enabled } => {
-                            // M3 Step 1 — the panel's per-pattern toggle. Enable
-                            // adds (idempotent), disable removes; either way
-                            // persist + echo so the panel reflects the truth.
-                            let changed = if enabled {
-                                allow_list.enable(&typed, &target)
-                            } else {
-                                allow_list.disable(&typed)
-                            };
-                            if changed {
-                                tracing::info!(
-                                    "ALLOW_LIST_TOGGLE typed={typed:?} target={target:?} enabled={enabled}"
-                                );
-                            }
-                            persist_and_emit_allow_list(
-                                &app_handle,
-                                &allow_list,
-                                allow_list_path.as_deref(),
-                            );
                         }
                         EngineControl::RequestAllowList => {
                             // Panel/tray pull fresh state on open. Read-only.
@@ -3792,6 +4570,17 @@ pub fn spawn<R: Runtime>(
                     // reloads converge to truth without waiting for a
                     // transition.
                     watchdog_ticks = watchdog_ticks.wrapping_add(1);
+
+                    // M3 bubble: drop a suggestion the user neither accepted (Shift)
+                    // nor typed past within the timeout — the UI auto-fades on the
+                    // same ~5s budget. Backstop for the pure-pause case; an active
+                    // typist clears it eagerly on the next keystroke.
+                    if let Some(ps) = &pending_suggestion {
+                        if now_ms().saturating_sub(ps.armed_at_ms) > SUGGESTION_TIMEOUT_MS {
+                            pending_suggestion = None;
+                            let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                        }
+                    }
 
                     // C5a verdict state machine: Kept / Abandoned fire on
                     // elapsed idle, so the resolver must tick even when no
@@ -3816,7 +4605,16 @@ pub fn spawn<R: Runtime>(
                         &mut guess_ledger,
                         &mut funnel,
                         &mut tally,
+                        &mut competitor_sense,
                     );
+
+                    // Watch Dog re-arm: zero stale competitor evidence once a
+                    // full idle window has passed with no footprint (the host
+                    // corrector went quiet), so a fresh competitor must clear the
+                    // N-footprint threshold again. The 1s watchdog is the idle
+                    // driver — `is_deferring`'s own time guard already lapses
+                    // deferral at the window edge; this keeps the counter honest.
+                    competitor_sense.decay(now_ms());
 
                     // Idle line-buffer reset (desync recovery). tick_resolver
                     // above already fired any due Kept/Abandoned verdicts on
@@ -3909,7 +4707,7 @@ pub fn spawn<R: Runtime>(
                     if watchdog_ticks % 60 == 0 {
                         funnel.dump();
                         // Read-only kill-switch observability (no injection).
-                        dump_classifications(&word_patterns);
+                        dump_classifications(&word_patterns, &motor_map);
                         // Observe-only guesser accuracy readout (no injection).
                         dump_guess_accuracy(&guess_ledger);
                     }
@@ -4175,6 +4973,67 @@ pub fn spawn<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Watch Dog: competitor-sense state machine -----------------------
+
+    #[test]
+    fn competitor_sense_defers_after_threshold_and_rearms() {
+        let mut s = CompetitorSense::default();
+        // Armed (firing) until the threshold is cleared.
+        assert!(!s.is_deferring(1_000));
+        s.note_footprint(1_000);
+        assert!(!s.is_deferring(1_000), "one footprint is below N=2");
+        s.note_footprint(2_000);
+        assert!(s.is_deferring(2_000), "two footprints -> defer common lane");
+
+        // Stays deferring while footprints are recent.
+        assert!(s.is_deferring(2_000 + COMPETITOR_REARM_IDLE_MS - 1));
+        // The instant the idle window passes, deferral lapses (fire again).
+        assert!(!s.is_deferring(2_000 + COMPETITOR_REARM_IDLE_MS));
+
+        // Watchdog decay zeroes stale evidence, so re-arm needs N fresh
+        // footprints again (not just one riding on a stale count).
+        s.decay(2_000 + COMPETITOR_REARM_IDLE_MS);
+        s.note_footprint(100_000);
+        assert!(
+            !s.is_deferring(100_000),
+            "single fresh footprint must not re-defer"
+        );
+        s.note_footprint(101_000);
+        assert!(s.is_deferring(101_000));
+
+        // Focus/app change hard-resets immediately.
+        s.reset();
+        assert!(!s.is_deferring(101_000));
+    }
+
+    // ---- M3 bubble: casing preservation + contraction filter -------------
+
+    #[test]
+    fn match_source_case_preserves_user_casing() {
+        assert_eq!(match_source_case("teh", "the"), "the");
+        assert_eq!(match_source_case("Teh", "the"), "The");
+        assert_eq!(match_source_case("WAHT", "what"), "WHAT");
+        // Single leading capital, not all-caps.
+        assert_eq!(match_source_case("Recieve", "receive"), "Receive");
+        // A one-letter capital isn't "all caps" — leading-cap branch.
+        assert_eq!(match_source_case("I", "i"), "I");
+    }
+
+    #[test]
+    fn apostrophe_filter_suppresses_contractions_not_motor_garbles() {
+        // Pure apostrophe insertion (Auto-Correct's job) — suppressed.
+        assert!(is_apostrophe_fix("todays", "today's"));
+        assert!(is_apostrophe_fix("dont", "don't"));
+        // Possessive completion after a typed apostrophe — suppressed.
+        assert!(is_apostrophe_fix("key'", "key's"));
+        assert!(is_apostrophe_fix("One'", "one's"));
+        // Genuine MOTOR garble in an apostrophe word — NOT suppressed.
+        assert!(!is_apostrophe_fix("doens't", "doesn't"));
+        // No apostrophe in the target — never the filter's business.
+        assert!(!is_apostrophe_fix("teh", "the"));
+        assert!(!is_apostrophe_fix("haev", "have"));
+    }
 
     // ---- Component 5c snapshot date helpers ------------------------------
 

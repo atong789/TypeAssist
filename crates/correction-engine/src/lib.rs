@@ -48,8 +48,13 @@ pub use guess_ledger::{
 };
 pub use guesser::{build_model, guess, ErrorModel, Guess, TAU_BUCKETS};
 pub use kill_switch::{
-    classify, classify_pattern, PatternFacts, PatternReadiness, SilentReason, Tier2Reason,
-    COMMON_TARGET_MIN_FREQUENCY, KILL_SWITCH_VERSION, STALE_AFTER_MS,
+    classify, classify_explained, classify_explained_scaled, classify_pattern,
+    classify_pattern_explained, classify_pattern_explained_scaled, is_host_redundant,
+    shadow_convergence_scan, shadow_motor_budget_for_len, shadow_nonword_bar_for_len,
+    ClassifyExplain, ConvergenceScan, ObserveReason, PatternFacts, PatternReadiness, SuggestTier,
+    AFFECTED_BAR_FLOOR, COMMON_FREQ_THRESHOLD, KILL_SWITCH_VERSION, NONWORD_SOURCE_EVIDENCE_BAR,
+    REALWORD_SOURCE_EVIDENCE_BAR, SHADOW_BOLD_MOTOR_BUDGET, SHADOW_NONWORD_BAR_LONG,
+    SHADOW_NONWORD_BAR_MID, SHADOW_NONWORD_BAR_SHORT, STALE_AFTER_MS, STRONG_AFFECTEDNESS,
 };
 pub use lexicon::{Lexicon, LEXICON_VERSION};
 pub use lexicon_proposal::{
@@ -81,8 +86,8 @@ pub use score::{
     CONFIDENCE_HIGH_FLOOR, CONFIDENCE_LOW_FLOOR, CONFIDENCE_MEDIUM_FLOOR, SCORE_VERSION,
 };
 pub use slip_class::{
-    classify_slip, corrected_target_indices, involved_keys, transposition_keys, SlipClass,
-    SLIP_CLASS_VERSION,
+    classify_slip, corrected_target_indices, involved_keys, motor_edit_within_budget,
+    single_motor_edit, transposition_keys, MotorEdit, SlipClass, SLIP_CLASS_VERSION,
 };
 pub use tokenizer::{Token, TokenKind, Tokenizer, TOKENIZER_VERSION};
 pub use trigram::{target_is_recordable, TrigramModel};
@@ -90,7 +95,7 @@ pub use word_freq::{WordFreq, WORD_FREQ_VERSION};
 pub use word_pattern::{
     edit_distance, normalize_word, PatternObserveReport, PatternSnapshot, PatternStat,
     WordPatternStore, MAX_PATTERN_EDIT_DISTANCE, MAX_PATTERN_LENGTH_DIFF, PATTERN_PERSIST_EVERY,
-    TIER1_MIN_OBSERVATIONS, UNDO_BRAKE_STRIKES, WORD_PATTERN_VERSION,
+    UNDO_BRAKE_STRIKES, WORD_PATTERN_VERSION,
 };
 
 /// **Engine MODE.** Names how aggressive the user wants the engine to be.
