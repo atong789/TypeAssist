@@ -67,7 +67,7 @@ on stdin:
 The M3 correction overlay needs an on-screen rect for a character range in the
 focused field. There's a **content-blind** probe (role, `AXSelectedTextRange`,
 `AXNumberOfCharacters`, `AXBoundsForRange` — never `AXStringForRange`, never the
-typed text; Principle #9 holds) built into the sidecar, in
+typed text; Principle #8 holds) built into the sidecar, in
 `Accessibility.probeFocusedGeometry()`. Two ways to trigger it:
 
 - **Stdin command** — send `{"type":"ax_probe"}` on stdin; the result prints on

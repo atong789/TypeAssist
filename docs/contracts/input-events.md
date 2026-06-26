@@ -33,16 +33,42 @@ A character-producing key event. Emitted on key-up so `dwell_ms` is known.
 
 Broken out from `key` because self-corrections are signal, not noise. L4 records these as evidence of `SelfCorrected` outcomes.
 
+Emitted on **keyDown, including OS auto-repeat** — so a held backspace produces one event per deletion. (Text keys are emitted on keyUp to measure dwell, but backspace dwell is unused, so it rides keyDown to keep the engine's dead-reckoned line buffer in step with reality when the user holds it down.)
+
 ```json
 { "type": "backspace", "timestamp_ms": 1729000000123 }
 ```
 
+### `autorepeat_dropped`
+
+Emitted when the adapter **drops a non-backspace auto-repeat keyDown**. A held text key fires repeated OS keyDowns, but the adapter only emits that key once (on keyUp, for dwell), so the repeats are lost. This content-free marker lets the engine's capture funnel count that loss instead of hiding it (Principle #7), and reveals whether held *letter* keys drop in real use. Carries no key, no count, no timing. Backspace is exempt — it forwards every keyDown (above).
+
+```json
+{ "type": "autorepeat_dropped" }
+```
+
+### `shift_tap`
+
+An **isolated Shift tap** — Shift pressed and released with no other key in between (either Shift, reachable one-handed). The accept gesture for a pending correction suggestion (the M3 bubble). The adapter derives it from `.flagsChanged` transitions and cancels the in-progress tap on any real key / mouse-down, so a `Shift+key` chord never produces it. Content-free.
+
+```json
+{ "type": "shift_tap", "timestamp_ms": 1729000000123 }
+```
+
 ### `permission_required`
 
-Emitted at startup if the OS-level Accessibility permission is missing. The sidecar exits with status 2 immediately after.
+Emitted at startup if a required OS-level permission is missing (Accessibility OR Input Monitoring — capture needs both). The sidecar exits with status 2 immediately after. A `permission_status` (below) is emitted just *before* this, so a partial grant is observable even on a spawn that's about to exit.
 
 ```json
 { "type": "permission_required" }
+```
+
+### `permission_status`
+
+Reports the two **independent** macOS grants the capture pipeline needs — `accessibility` (the AX API: secure-field focus + correction injection) and `input_monitoring` (the CGEventTap that captures keystrokes). Both are read-only, no-prompt checks (`AXIsProcessTrusted` / `IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)`), safe to poll. Emitted **before** the startup permission gates (on every spawn) and again on each `heartbeat`. Unlike the aggregate capture-health `live` flag — which can only be observed once *both* grants are in effect, because the sidecar exits before its first heartbeat otherwise — this surfaces a partial grant, so first-run onboarding and the Reconnect panel can tick each permission row the moment its own grant lands.
+
+```json
+{ "type": "permission_status", "accessibility": true, "input_monitoring": false }
 ```
 
 ### `ready`

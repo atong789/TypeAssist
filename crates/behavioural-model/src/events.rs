@@ -18,6 +18,13 @@ pub enum InputEvent {
     },
     /// Backspace is broken out: self-corrections are signal, not noise.
     Backspace { timestamp_ms: u64 },
+    /// **Isolated Shift tap** — Shift pressed and released with no other key in
+    /// between (either Shift, reachable one-handed). The accept gesture for a
+    /// pending correction suggestion (the M3 bubble). The L1 adapter detects it
+    /// from `.flagsChanged` transitions and cancels the in-progress tap on any
+    /// real key or mouse-down, so this fires ONLY for a clean isolated tap — a
+    /// `Shift+key` chord never produces it. Carries no content (Principle #9).
+    ShiftTap { timestamp_ms: u64 },
     /// The adapter is up but lacks the OS permissions it needs to capture events.
     PermissionRequired,
     /// The adapter has finished initial setup and is now emitting key events.
@@ -33,6 +40,39 @@ pub enum InputEvent {
     /// hasn't yet re-armed it. The engine's watchdog uses this plus
     /// the heartbeat timestamp to drive the `capture-health` state.
     Heartbeat { timestamp_ms: u64, tap_enabled: bool },
+    /// **Per-grant permission snapshot.** Reports the two *independent* macOS
+    /// grants the capture pipeline needs: `accessibility` (the AX API — focus +
+    /// correction injection) and `input_monitoring` (the CGEventTap that captures
+    /// keystrokes). Both are read-only, no-prompt checks (`AXIsProcessTrusted`
+    /// and `IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)`), safe to poll.
+    ///
+    /// Distinct from the aggregate `Heartbeat.tap_enabled` / capture-health
+    /// `live` flag, which can only be observed once BOTH grants are in effect:
+    /// the adapter EXITS at its permission gates before its first heartbeat if
+    /// either grant is missing. This snapshot is emitted *before* those gates (on
+    /// every spawn) and on each heartbeat, so a PARTIAL grant (e.g. Accessibility
+    /// on, Input Monitoring still pending) is observable — first-run onboarding
+    /// uses it to tick each permission row the moment its own grant lands.
+    PermissionStatus { accessibility: bool, input_monitoring: bool },
+    /// **Caret may have moved somewhere the engine can't dead-reckon.**
+    /// Emitted by the L1 adapter on a mouse / trackpad click or a focus / app
+    /// change — gestures that reposition the caret with no key the engine can
+    /// follow. Content-free by construction (Principle #9): no coordinates, no
+    /// text, only an optional `reason` tag for logs (`"mouse"` / `"focus"`).
+    /// The engine treats it as an immediate line reset so a live correction
+    /// can't fire backspaces against a stale line model.
+    CaretMoved {
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// **An auto-repeated keystroke the L1 adapter did NOT forward.** Holding a
+    /// (non-backspace) key fires repeated OS keyDowns, but the adapter emits a
+    /// text key once, on keyUp, so the repeats are lost. The engine counts these
+    /// in its capture funnel so the drop is visible rather than silent (Principle
+    /// #7). Content-free by construction (Principle #9): no key, no count, no
+    /// timing. (Backspace is exempt — the adapter forwards every backspace
+    /// keyDown, so held-backspace deletions are not dropped.)
+    AutorepeatDropped,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -54,6 +94,18 @@ pub enum OutboundCommand {
     /// trailing word-boundary character (e.g. the space) so the adapter stays
     /// dumb — it does no word logic of its own.
     InjectCorrection { delete_count: u32, replacement: String },
+    /// **Anchored replace (M3 bubble, accept-after-typing-on).** Replace a word
+    /// the caret has already moved PAST: move the caret left `left` chars (to just
+    /// after the word), delete `delete_count` (the word), type `replacement` (the
+    /// target, no boundary), then move right `right` chars to restore the caret.
+    /// Positional, not caret-relative — so an accept after the user typed on lands
+    /// on the right word. Used only within a strict same-line/distance/time gate.
+    InjectAnchored {
+        left: u32,
+        delete_count: u32,
+        replacement: String,
+        right: u32,
+    },
     /// Shut down the adapter.
     Shutdown,
     /// **Soft capture restart.** Ask the adapter to tear down its
@@ -81,6 +133,19 @@ mod tests {
             dwell_ms: 80,
         };
         let json = serde_json::to_string(&e).unwrap();
+        let back: InputEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn shift_tap_round_trips() {
+        // The Swift sidecar emits this on an isolated Shift tap (the accept
+        // gesture). snake_case tag + field name must match the Swift bridge.
+        let e = InputEvent::ShiftTap {
+            timestamp_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(json, r#"{"type":"shift_tap","timestamp_ms":1700000000000}"#);
         let back: InputEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
     }
@@ -120,6 +185,69 @@ mod tests {
         };
         let json = serde_json::to_string(&down).unwrap();
         assert!(json.contains("\"tap_enabled\":false"));
+    }
+
+    #[test]
+    fn permission_status_event_round_trips() {
+        // The sidecar emits this on every spawn (before its permission gates) and
+        // on each heartbeat. Both grants are independent booleans; the snake_case
+        // tag + field names must match what the Swift bridge writes.
+        let e = InputEvent::PermissionStatus {
+            accessibility: true,
+            input_monitoring: false,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"permission_status","accessibility":true,"input_monitoring":false}"#
+        );
+        let back: InputEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn caret_moved_event_round_trips() {
+        // The L1 adapter emits this on a click / focus change. `reason` is a
+        // content-free log tag; it must survive the round-trip, and the
+        // variant must also parse when `reason` is absent.
+        let e = InputEvent::CaretMoved {
+            reason: Some("mouse".into()),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""type":"caret_moved""#));
+        let back: InputEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+
+        let bare: InputEvent = serde_json::from_str(r#"{"type":"caret_moved"}"#).unwrap();
+        assert_eq!(bare, InputEvent::CaretMoved { reason: None });
+    }
+
+    #[test]
+    fn autorepeat_dropped_event_round_trips() {
+        // The Swift sidecar emits this (content-free) when it drops a
+        // non-backspace auto-repeat keyDown. snake_case tag, no fields.
+        let e = InputEvent::AutorepeatDropped;
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(json, r#"{"type":"autorepeat_dropped"}"#);
+        let back: InputEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn inject_anchored_command_round_trips() {
+        let c = OutboundCommand::InjectAnchored {
+            left: 6,
+            delete_count: 3,
+            replacement: "the".into(),
+            right: 6,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"inject_anchored","left":6,"delete_count":3,"replacement":"the","right":6}"#
+        );
+        let back: OutboundCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, back);
     }
 
     #[test]

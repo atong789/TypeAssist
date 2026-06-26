@@ -19,6 +19,11 @@
 
   /* Warning (amber) — for visible slips in measured surfaces. Never red. */
   --warning: color-mix(in srgb, #e0a82e 70%, canvastext);
+
+  /* Clickable text / links — the accent nudged toward the foreground so it
+     clears WCAG AA as body text in BOTH light and dark (the bare focus-ring
+     blue is too light on white). Use for in-app navigation links. */
+  --link: color-mix(in srgb, var(--focus-ring) 78%, canvastext);
 }
 
 /* Keyboard focus is load-bearing for users navigating without a mouse:

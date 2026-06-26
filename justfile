@@ -44,6 +44,22 @@ sign-dev:
 dev: build-sidecar
     cd apps/tauri && npm run tauri dev
 
+# Dev run against a THROWAWAY data store — for previewing onboarding (or anything
+# that captures typing) WITHOUT touching real learned data. Every engine write
+# (motor map, word patterns, snapshots, allow-list, progress, guesser) is
+# redirected to ~/.typeassist-sandbox via the TYPEASSIST_DATA_DIR valve, so your
+# real ~/.typeassist is never read or written. Throwaway — delete it any time with
+# `just sandbox-clean`.
+dev-sandbox: build-sidecar
+    mkdir -p "$HOME/.typeassist-sandbox"
+    @echo "▶ sandbox data store: $HOME/.typeassist-sandbox (real ~/.typeassist is untouched)"
+    cd apps/tauri && TYPEASSIST_DATA_DIR="$HOME/.typeassist-sandbox" npm run tauri dev
+
+# Delete the throwaway sandbox data store (never touches real ~/.typeassist)
+sandbox-clean:
+    rm -rf "$HOME/.typeassist-sandbox"
+    @echo "✓ removed ~/.typeassist-sandbox"
+
 # Regenerate the L3 JSON Schema artifact from serde types
 schema:
     cargo run -p volatility-map --bin emit_schema

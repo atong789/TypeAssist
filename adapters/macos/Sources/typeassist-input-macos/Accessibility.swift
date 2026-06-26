@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
+import IOKit.hid
 
 enum Accessibility {
     /// Returns true if this process has been granted Accessibility permission.
@@ -13,6 +14,16 @@ enum Accessibility {
     static func isTrusted(prompt: Bool = false) -> Bool {
         let opts: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as NSString: prompt]
         return AXIsProcessTrustedWithOptions(opts as CFDictionary)
+    }
+
+    /// Read-only, no-prompt check of the Input Monitoring ("Listen Events")
+    /// grant — a SEPARATE TCC permission from Accessibility (see main.swift for
+    /// why the two are split and revoked independently). `IOHIDCheckAccess`
+    /// only reports the current state; unlike `IOHIDRequestAccess` it never
+    /// shows a dialog, so it is safe to poll on the heartbeat. This is the
+    /// per-grant signal the onboarding / Reconnect permission rows read.
+    static func inputMonitoringGranted() -> Bool {
+        return IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
     }
 
     /// Replace the just-typed word in the focused field: synthesize
@@ -34,7 +45,25 @@ enum Accessibility {
         }
     }
 
-    /// Post a key-down/key-up pair for a hardware key code.
+    /// **Anchored replace** (M3 bubble accept-after-typing-on): Left × `left` (to
+    /// just after the word), Backspace × `deleteCount` (the word), type
+    /// `replacement` (the target, no boundary), then Right × `right` to restore
+    /// the caret. Same layout-independent typing as `injectCorrection`. The whole
+    /// burst (arrows + backspaces + chars) echoes back through the tap and is
+    /// dropped engine-side by count (`pending_echo`).
+    static func injectAnchored(left: Int, deleteCount: Int, replacement: String, right: Int) {
+        guard let source = CGEventSource(stateID: .combinedSessionState) else { return }
+        let leftArrow: CGKeyCode = 123
+        let rightArrow: CGKeyCode = 124
+        let backspace: CGKeyCode = 51
+        for _ in 0..<max(0, left) { tapKey(leftArrow, source: source) }
+        for _ in 0..<max(0, deleteCount) { tapKey(backspace, source: source) }
+        for character in replacement { typeCharacter(character, source: source) }
+        for _ in 0..<max(0, right) { tapKey(rightArrow, source: source) }
+    }
+
+    /// Post a key-down/key-up pair for a hardware key code. The echo is dropped
+    /// engine-side by count (see `pending_echo` in engine.rs).
     private static func tapKey(_ keyCode: CGKeyCode, source: CGEventSource) {
         CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true)?
             .post(tap: .cgSessionEventTap)

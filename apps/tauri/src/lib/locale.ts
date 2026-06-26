@@ -4,7 +4,7 @@
 // words whose spelling differs by locale so Practice matches the user's macOS
 // language/region — or an explicit override they set in Settings.
 //
-// Privacy (Principle #9): reading the locale is a local, in-memory read, and the
+// Privacy (Principle #8): reading the locale is a local, in-memory read, and the
 // override is a stored *preference* (not user activity / recovery data). Both
 // stay on-device — nothing leaves.
 

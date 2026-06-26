@@ -84,13 +84,6 @@ pub const WORD_PATTERN_VERSION: u32 = 1;
 /// edit-gated `CorrectedToOther`, not every kept character). **Tunable.**
 pub const PATTERN_PERSIST_EVERY: u64 = 20;
 
-/// **EASILY-FLIPPED CONSTANT.** Decayed occurrence weight a pattern must reach
-/// before it is even *eligible* to be Tier-1-ready (the classifier applies the
-/// remaining lexicon gates on top). The brief says "≈10–15 recent
-/// decay-adjusted observations"; 12 is the conservative midpoint. Tune from
-/// real data once the test suite is green.
-pub const TIER1_MIN_OBSERVATIONS: f32 = 12.0;
-
 /// Consecutive user-undos of the same pattern that trip the safety brake
 /// (CLAUDE.md → M3: demote Tier-1 → Tier-2 until it rebuilds). Reset by
 /// [`WordPatternStore::note_accept`].
@@ -111,7 +104,7 @@ pub const MAX_PATTERN_LENGTH_DIFF: usize = 1;
 const PRUNE_EPSILON: f32 = 1.0e-4;
 
 /// What a single [`WordPatternStore::observe_correction`] recorded, so the
-/// host can log it and (later) reconcile a capture counter (Principle #8). A
+/// host can log it and (later) reconcile a capture counter (Principle #7). A
 /// skipped correction (rewrite / no-op / empty) returns `recorded: false`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PatternObserveReport {
@@ -295,7 +288,8 @@ impl WordPatternStore {
         let distance = edit_distance(&typed, &target);
         let length_diff = typed.chars().count().abs_diff(target.chars().count());
         if distance > MAX_PATTERN_EDIT_DISTANCE || length_diff > MAX_PATTERN_LENGTH_DIFF {
-            tracing::info!(
+            // debug!, not info!: prints raw typed + target words (privacy).
+            tracing::debug!(
                 target: "word_pattern",
                 "WORD_PATTERN_SKIP_REWRITE typed={:?} target={:?} distance={} length_diff={}",
                 typed, target, distance, length_diff
@@ -309,7 +303,8 @@ impl WordPatternStore {
 
         self.total_observations += 1;
         self.obs_since_persist += 1;
-        tracing::info!(
+        // debug!, not info!: prints raw typed + target words (privacy).
+        tracing::debug!(
             target: "word_pattern",
             "WORD_PATTERN_OBSERVE typed={:?} target={:?} weight={:.2}",
             typed, target, weight
@@ -335,7 +330,8 @@ impl WordPatternStore {
             Some(stat) => {
                 stat.consecutive_undos = stat.consecutive_undos.saturating_add(1);
                 let n = stat.consecutive_undos;
-                tracing::info!(
+                // debug!, not info!: prints raw typed + target words (privacy).
+                tracing::debug!(
                     target: "word_pattern",
                     "WORD_PATTERN_UNDO typed={:?} target={:?} consecutive={}",
                     typed, target, n
@@ -461,26 +457,29 @@ impl WordPatternStore {
     }
 
     fn write_json(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
+        // Durable atomic write (temp → fsync → rename → fsync dir) so a crash
+        // can't leave a zero-length or torn pattern store.
         let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
+        crate::persist::durable_write(path, json.as_bytes())
     }
 
     /// Load a store from `path`. A freshly loaded store starts "clean"
-    /// (persist counter zero). A future version bump can migrate here.
+    /// (persist counter zero). A **corrupt** file is quarantined aside (never
+    /// wiped) and the store comes up empty rather than erroring (Principle #6);
+    /// a missing file still propagates `NotFound` for the caller's
+    /// `path.exists()` guard.
     pub fn load_from(path: &Path) -> io::Result<Self> {
         let bytes = fs::read(path)?;
-        let mut store: WordPatternStore =
-            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-        store.obs_since_persist = 0;
-        Ok(store)
+        match serde_json::from_slice::<WordPatternStore>(&bytes) {
+            Ok(mut store) => {
+                store.obs_since_persist = 0;
+                Ok(store)
+            }
+            Err(e) => {
+                crate::persist::quarantine_corrupt(path, e);
+                Ok(Self::new())
+            }
+        }
     }
 }
 
@@ -488,7 +487,12 @@ impl WordPatternStore {
 
 /// Lowercase + keep only observable characters (printable ASCII). Matches the
 /// motor map's normalization so `Teh→The` and `teh→the` fold into one pattern.
-fn normalize_word(s: &str) -> String {
+///
+/// `pub` so the observe-only guesser scoreboard ([`crate::guess_ledger`]) keys
+/// its per-pattern accuracy by the *same* normalized form this store uses —
+/// otherwise `Teh` and `teh` would split into two scoreboard rows but one
+/// pattern row. Read-only helper; does not touch store state or semantics.
+pub fn normalize_word(s: &str) -> String {
     s.chars()
         .filter_map(|c| {
             let c = c.to_ascii_lowercase();
@@ -497,8 +501,11 @@ fn normalize_word(s: &str) -> String {
         .collect()
 }
 
-/// Levenshtein distance (unit costs) between two normalized words.
-fn edit_distance(a: &str, b: &str) -> usize {
+/// Levenshtein distance (unit costs) between two normalized words. `pub` so the
+/// observe-only guesser scoreboard ([`crate::guess_ledger`]) can tag whether a
+/// scored `typed → target` pair falls within the typo-fix guard, using the same
+/// metric this store's capture guard uses.
+pub fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let n = a.len();
@@ -656,14 +663,15 @@ mod tests {
     }
 
     #[test]
-    fn crossing_tier1_min_observations() {
+    fn crossing_realword_evidence_bar() {
+        use crate::kill_switch::REALWORD_SOURCE_EVIDENCE_BAR;
         let mut store = WordPatternStore::new();
-        // Just under the bar.
+        // Just under the high (real-word-source) bar.
         observe_n(&mut store, "teh", "the", 11, T0);
-        assert!(store.snapshot("teh", "the").unwrap().weight < TIER1_MIN_OBSERVATIONS);
+        assert!(store.snapshot("teh", "the").unwrap().weight < REALWORD_SOURCE_EVIDENCE_BAR);
         // One more clears it (12 ≥ 12).
         store.observe_correction(Outcome::CorrectedToOther, "teh", "the", T0);
-        assert!(store.snapshot("teh", "the").unwrap().weight >= TIER1_MIN_OBSERVATIONS);
+        assert!(store.snapshot("teh", "the").unwrap().weight >= REALWORD_SOURCE_EVIDENCE_BAR);
     }
 
     // ---- 3-strike brake -------------------------------------------------

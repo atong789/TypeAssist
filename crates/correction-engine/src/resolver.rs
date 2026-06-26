@@ -384,7 +384,7 @@ fn compute_post_edit_text(
         }
         // Content drifted on a Tracking anchor — try a successor first.
         if let Some(succ) = find_successor(original.id, original.start, anchors, line_buf) {
-            return PostEdit::Resolved(succ);
+            return resolved_unless_straddles(succ);
         }
         // No successor. Distinguish mid-edit truncation (the user has
         // shrunk the word via inside-deletes and may still type more)
@@ -393,15 +393,45 @@ fn compute_post_edit_text(
         if is_proper_prefix(&content, &orig_chars) {
             return PostEdit::Incomplete(content);
         }
-        return PostEdit::Resolved(content);
+        return resolved_unless_straddles(content);
     }
 
     // Void path: anchor.start is frozen at the void position. An
     // immediate retype seals a new token at this position. No incomplete
     // state for Void anchors — deletion is unambiguous.
-    PostEdit::Resolved(
+    resolved_unless_straddles(
         find_successor(original.id, original.start, anchors, line_buf).unwrap_or_default(),
     )
+}
+
+/// **Fix-B caret-desync straddle guard (source fix).** The engine dead-reckons
+/// `line_buf` from keystrokes; a caret move it can't observe (the `edndd` /
+/// caret-desync class) can leave a `Tracking` anchor's `[start, end)` span
+/// stretched **across a word boundary**, so [`compute_post_edit_text`] slices a
+/// fragment of the *next* token onto this one — the cross-token merge
+/// (`have if` recovered as `have if` / `havif`) that was poisoning capture.
+///
+/// A correctly-tracked word's core never contains a boundary character: the
+/// tokenizer seals on whitespace, so any whitespace in a recovered post-edit is
+/// proof the span straddled a boundary and the line model is stale. Such a read
+/// is **not** a resolvable correction — return [`PostEdit::Incomplete`] so the
+/// merged text never reaches a verdict or [`post_edit_text`] (which then yields
+/// `None`, skipping capture in the store, the motor map, and the scoreboard
+/// alike). Better to skip one correction than to learn a phantom merged word.
+fn resolved_unless_straddles(content: Vec<char>) -> PostEdit {
+    if content.iter().any(|&c| is_line_boundary_char(c)) {
+        PostEdit::Incomplete(content)
+    } else {
+        PostEdit::Resolved(content)
+    }
+}
+
+/// A character the tokenizer treats as a hard word boundary — whitespace. A
+/// recovered single-word post-edit must never contain one (see
+/// [`resolved_unless_straddles`]). Apostrophe / hyphen are deliberately NOT here:
+/// they are legitimate intra-word characters (`don't`, `well-known`).
+fn is_line_boundary_char(c: char) -> bool {
+    c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
 /// The post-edit text the resolver would classify for `record`, as a
@@ -436,21 +466,63 @@ fn is_proper_prefix(content: &[char], original: &[char]) -> bool {
 }
 
 /// Find the largest-end `Tracking` anchor whose `start == pos`,
-/// excluding `exclude_id`. Returns the anchor's content slice from
+/// excluding `exclude_id`. Returns the anchor and its content slice from
 /// `line_buf`, or `None` if no candidate exists.
-fn find_successor(
+fn find_successor_anchor<'a>(
     exclude_id: u32,
     pos: usize,
-    anchors: &[SpanAnchor],
+    anchors: &'a [SpanAnchor],
     line_buf: &[char],
-) -> Option<Vec<char>> {
+) -> Option<(&'a SpanAnchor, Vec<char>)> {
     anchors
         .iter()
         .filter(|a| matches!(a.state, AnchorState::Tracking))
         .filter(|a| a.id != exclude_id)
         .filter(|a| a.start == pos)
         .max_by_key(|a| a.end)
-        .map(|a| slice_chars(line_buf, a.start, a.end))
+        .map(|a| (a, slice_chars(line_buf, a.start, a.end)))
+}
+
+/// Content-only convenience over [`find_successor_anchor`] — the
+/// post-edit-text path doesn't need the anchor, just the resolved word.
+fn find_successor(
+    exclude_id: u32,
+    pos: usize,
+    anchors: &[SpanAnchor],
+    line_buf: &[char],
+) -> Option<Vec<char>> {
+    find_successor_anchor(exclude_id, pos, anchors, line_buf).map(|(_, content)| content)
+}
+
+/// True iff `succ` is `orig` with one or more characters *inserted* and
+/// nothing deleted or substituted — every character of `orig` survives,
+/// in order, as a shared prefix + shared suffix, with `succ` longer in the
+/// middle. This is the shape of a word still being **typed** (each
+/// keystroke grows it), not a correction to a different word.
+///
+/// It is the fingerprint of the desync cascade: when the line buffer
+/// holds a stale tail to the RIGHT of the caret (e.g. a residual
+/// `"edndd"`), every keystroke re-seals a one-char-longer prefix at the
+/// same `start` — `oedndd → obedndd → obsedndd → …` — and each pair is a
+/// pure insertion (the shared `"edndd"` suffix + a growing prefix).
+fn is_forward_growth(orig: &str, succ: &[char]) -> bool {
+    let o: Vec<char> = orig.chars().collect();
+    if o.len() >= succ.len() {
+        return false; // a successor that didn't grow can't be forward growth
+    }
+    // Longest common prefix.
+    let mut p = 0;
+    while p < o.len() && o[p] == succ[p] {
+        p += 1;
+    }
+    // Longest common suffix, not overlapping the matched prefix in `orig`.
+    let mut s = 0;
+    while s < o.len() - p && o[o.len() - 1 - s] == succ[succ.len() - 1 - s] {
+        s += 1;
+    }
+    // All of `orig` is accounted for by the shared prefix + suffix ⇒ the
+    // only difference is inserted chars in the middle ⇒ forward growth.
+    p + s == o.len()
 }
 
 /// Defensive char-slice: an [`AnchorTracker`] keeps positions inside
@@ -517,8 +589,24 @@ fn decide_verdict(
     // 1. Definitive: a replacement token has sealed at X's start with
     //    non-empty content. A seal is unambiguous — fire immediately,
     //    no idle wait. (Identical content ⇒ reseal ⇒ Kept.)
-    if let Some(succ) = find_successor(original.id, original.start, anchors, line_buf) {
+    if let Some((succ_anchor, succ)) =
+        find_successor_anchor(original.id, original.start, anchors, line_buf)
+    {
         if !succ.is_empty() {
+            // Forward-growth hold: the "successor" is the same word still
+            // being typed (a pure insertion that preserves all of
+            // `original_text`) AND the caret is still inside it. That is
+            // mid-edit growth, not a correction — hold, per the resolver's
+            // core "never fire mid-edit" rule. Without this, a desynced
+            // line buffer that leaves a stale tail to the right of the
+            // caret makes every keystroke re-seal a one-char-longer prefix,
+            // manufacturing a `CorrectedToOther` cascade (the `o→ob→obs…`
+            // "edndd"-tail artifacts). Once the caret leaves the word
+            // (a real boundary committed it), this releases and a genuine
+            // insertion slip — `wrd → word` — still fires and is learned.
+            if is_forward_growth(original_text, &succ) && caret_in_region(caret, succ_anchor) {
+                return None;
+            }
             return Some(classify_resolved(&succ, original_text, top_candidate));
         }
     }
@@ -704,6 +792,110 @@ mod tests {
 
         let changes = r_tick(&mut resolver(), 0, &anchors, &line, FAR, &ledger);
         assert_eq!(changes, vec![(rid, Outcome::CorrectedToOther)]);
+    }
+
+    // ---- Forward-growth hold — the "edndd" desync cascade ---------------
+
+    #[test]
+    fn edndd_forward_growth_cascade_is_held_while_typing() {
+        // REPRODUCTION of the stale-tail artifact cascade. A desynced line
+        // buffer holds a residual 5-char tail ("edndd") to the RIGHT of the
+        // caret. As the user types "obstacles", every keystroke re-seals a
+        // one-char-longer prefix token at start 0:
+        //   oedndd, obedndd, obsedndd, … , obstaclesedndd
+        // Each prefix is a Pending record; the longest is the live successor
+        // at [0, 14). The caret sits at the typing edge (index 9, just before
+        // the residual "edndd"), so it is INSIDE the successor span.
+        //
+        // Pre-fix: decide_verdict step 1 paired each prefix with the longest
+        // successor and fired CorrectedToOther for every one — the junk
+        // `typed → target` pairs. Post-fix: each pair is a pure forward
+        // growth under the caret, so the resolver HOLDS and fires nothing.
+        let line: Vec<char> = "obstaclesedndd".chars().collect(); // 14 chars
+        let typing_edge = 9; // caret just after "obstacles", before "edndd"
+
+        let prefixes = [
+            "o",
+            "ob",
+            "obs",
+            "obst",
+            "obsta",
+            "obstac",
+            "obstacl",
+            "obstacle",
+            "obstacles",
+        ];
+        let mut anchors = AnchorTracker::new();
+        let mut ledger = DecisionLedger::new();
+        let mut rids = Vec::new();
+        for (i, p) in prefixes.iter().enumerate() {
+            let core = format!("{p}edndd");
+            let end = p.chars().count() + 5; // prefix + "edndd"
+            let aid = anchors.try_register(0, end, &core).unwrap();
+            // The longest prefix is the live word the user is on — no Pending
+            // verdict is owed for it; the owed verdicts are the shorter ones.
+            if i + 1 < prefixes.len() {
+                rids.push(log_with_candidate(
+                    &mut ledger,
+                    leave_alone(&core, LeaveAloneReason::BelowActiveTier),
+                    aid,
+                    None,
+                    None,
+                ));
+            }
+        }
+
+        // One tick with the caret at the typing edge: NOTHING resolves.
+        let changes = r_tick(&mut resolver(), 0, &anchors, &line, typing_edge, &ledger);
+        assert!(
+            changes.is_empty(),
+            "forward-growth cascade must be held while the caret is inside the \
+             growing word; got {changes:?}"
+        );
+        assert_eq!(rids.len(), 8, "test premise: 8 owed prefix verdicts");
+    }
+
+    #[test]
+    fn genuine_insertion_slip_still_fires_once_committed() {
+        // The complement: a REAL insertion slip the user finished and moved
+        // past. "wrd" sealed, then they inserted "o" → "word" and the caret
+        // left the word (parked at FAR). Even though "word" is a forward
+        // growth of "wrd", the caret is NOT in its region — so it commits as
+        // CorrectedToOther and is still learned. The hold only suppresses
+        // growth happening UNDER the caret.
+        let line: Vec<char> = "word".chars().collect();
+        let mut anchors = AnchorTracker::new();
+        let aid = anchors.try_register(0, 3, "wrd").unwrap();
+        let mut ledger = DecisionLedger::new();
+        let rid = log_with_candidate(
+            &mut ledger,
+            leave_alone("wrd", LeaveAloneReason::BelowActiveTier),
+            aid,
+            None,
+            None,
+        );
+        anchors.try_register(0, 4, "word").unwrap();
+
+        let changes = r_tick(&mut resolver(), 0, &anchors, &line, FAR, &ledger);
+        assert_eq!(changes, vec![(rid, Outcome::CorrectedToOther)]);
+    }
+
+    #[test]
+    fn is_forward_growth_distinguishes_growth_from_correction() {
+        let cs: Vec<char> = "obedndd".chars().collect();
+        assert!(is_forward_growth("oedndd", &cs)); // grew by one, shared tail
+        let cs: Vec<char> = "word".chars().collect();
+        assert!(is_forward_growth("wrd", &cs)); // inserted 'o'
+                                                // Transposition (teh→the) is NOT growth — equal length, real fix.
+        let cs: Vec<char> = "the".chars().collect();
+        assert!(!is_forward_growth("teh", &cs));
+        // Substitution (cat→cot) is NOT growth.
+        let cs: Vec<char> = "cot".chars().collect();
+        assert!(!is_forward_growth("cat", &cs));
+        // Different word of greater length but with a deletion is NOT a pure
+        // insertion: "hello" from "bullon" — no shared prefix+suffix cover.
+        let cs: Vec<char> = "hello".chars().collect();
+        assert!(!is_forward_growth("bullon", &cs));
     }
 
     // ---- Kept — idle-gated, caret-region-guarded ------------------------
@@ -1408,5 +1600,65 @@ mod tests {
         // Longer than original (e.g. mid-line insert grew the anchor) —
         // can't be a prefix of original.
         assert!(!is_proper_prefix(&chars("bullion"), &chars("bullon")));
+    }
+
+    // ---- Fix-B caret-desync straddle guard (no cross-token merge) --------
+
+    #[test]
+    fn caret_jump_straddle_does_not_capture_a_merge() {
+        // Reproduces the caret-desync class. The user typed "have if". A caret
+        // move the engine couldn't observe left the "have" anchor's span
+        // stretched across the boundary into the next word, so its tracked span
+        // is now [0,7) over the whole "have if" — the exact desync that made
+        // `compute_post_edit_text` recover a cross-token merge and poison
+        // capture (`have → havif`).
+        let line: Vec<char> = "have if".chars().collect();
+        let mut anchors = AnchorTracker::new();
+        // end = 7 (not 4): the stale span straddles the space.
+        let aid = anchors.try_register(0, 7, "have").unwrap();
+        let mut ledger = DecisionLedger::new();
+        log_with_candidate(
+            &mut ledger,
+            leave_alone("have", LeaveAloneReason::BelowActiveTier),
+            aid,
+            None,
+            None,
+        );
+        let rec = ledger.iter().next().unwrap();
+
+        // The straddle guard must refuse to recover a boundary-crossing span:
+        // no merged text enters capture (post_edit_text → None), so the
+        // CorrectedToOther arm in the engine skips the store, the motor map,
+        // AND the scoreboard together.
+        let recovered = post_edit_text(rec, anchors.anchors(), &line);
+        assert_eq!(
+            recovered, None,
+            "a span straddling a word boundary must not capture a merge, got {recovered:?}"
+        );
+    }
+
+    #[test]
+    fn in_place_correction_without_boundary_still_resolves() {
+        // Regression guard: a normal in-place edit (no boundary char in the
+        // recovered span) must STILL be captured — the straddle guard only
+        // rejects boundary-crossing reads, never legitimate single-word fixes.
+        let line: Vec<char> = "havs".chars().collect(); // "have" edited in place
+        let mut anchors = AnchorTracker::new();
+        let aid = anchors.try_register(0, 4, "have").unwrap();
+        let mut ledger = DecisionLedger::new();
+        log_with_candidate(
+            &mut ledger,
+            leave_alone("have", LeaveAloneReason::BelowActiveTier),
+            aid,
+            None,
+            None,
+        );
+        let rec = ledger.iter().next().unwrap();
+
+        assert_eq!(
+            post_edit_text(rec, anchors.anchors(), &line).as_deref(),
+            Some("havs"),
+            "a boundary-free in-place edit must still resolve for capture"
+        );
     }
 }

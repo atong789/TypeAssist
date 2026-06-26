@@ -18,6 +18,9 @@ struct Modifiers: Codable {
 enum InputEvent {
     case key(key: String, timestampMs: UInt64, modifiers: Modifiers, dwellMs: UInt32)
     case backspace(timestampMs: UInt64)
+    /// Isolated Shift tap — the accept gesture for a correction suggestion.
+    /// Content-free. See `InputEvent::ShiftTap` in `events.rs`.
+    case shiftTap(timestampMs: UInt64)
     case permissionRequired
     case ready
     case shutdown
@@ -26,10 +29,29 @@ enum InputEvent {
     /// user is currently typing. `tapEnabled` is our own view of the
     /// CGEvent tap state.
     case heartbeat(timestampMs: UInt64, tapEnabled: Bool)
+    /// Per-grant permission snapshot — the two independent TCC grants capture
+    /// needs (Accessibility for the AX API, Input Monitoring for the tap). Both
+    /// are read-only no-prompt checks. Emitted BEFORE the startup permission
+    /// gates (so a pending grant is visible even though the process is about to
+    /// exit) and on each heartbeat. See `InputEvent::PermissionStatus` in
+    /// `crates/behavioural-model/src/events.rs`.
+    case permissionStatus(accessibility: Bool, inputMonitoring: Bool)
+    /// The caret may have moved somewhere the engine can't dead-reckon — a
+    /// mouse/trackpad click (from the tap) or a focus/app change (from the
+    /// secure-field AX observer). Content-free: `reason` is only a log tag.
+    case caretMoved(reason: String)
+    /// **An auto-repeated keystroke the adapter did NOT forward.** Holding a
+    /// (non-backspace) key fires repeated keyDowns but the adapter only emits
+    /// that key once, on keyUp — so the repeats are lost. This content-free
+    /// marker lets the engine's funnel count that loss (Principle #7: capture
+    /// must see its own drop). Carries nothing — no key, no count, no timing.
+    case autorepeatDropped
 }
 
 enum OutboundCommand {
     case injectCorrection(deleteCount: Int, replacement: String)
+    /// Anchored replace — see `InputEvent::InjectAnchored` in `events.rs`.
+    case injectAnchored(left: Int, deleteCount: Int, replacement: String, right: Int)
     case shutdown
     /// Tear down the current event tap and create a fresh one. Soft
     /// recovery path for the case where auto-re-enable hasn't worked
@@ -98,6 +120,8 @@ final class Bridge {
             ]
         case let .backspace(ts):
             payload = ["type": "backspace", "timestamp_ms": ts]
+        case let .shiftTap(ts):
+            payload = ["type": "shift_tap", "timestamp_ms": ts]
         case .permissionRequired:
             payload = ["type": "permission_required"]
         case .ready:
@@ -110,6 +134,16 @@ final class Bridge {
                 "timestamp_ms": ts,
                 "tap_enabled": tapEnabled,
             ]
+        case let .permissionStatus(accessibility, inputMonitoring):
+            payload = [
+                "type": "permission_status",
+                "accessibility": accessibility,
+                "input_monitoring": inputMonitoring,
+            ]
+        case let .caretMoved(reason):
+            payload = ["type": "caret_moved", "reason": reason]
+        case .autorepeatDropped:
+            payload = ["type": "autorepeat_dropped"]
         }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
               let s = String(data: data, encoding: .utf8) else {
@@ -126,6 +160,13 @@ final class Bridge {
             guard let deleteCount = obj["delete_count"] as? Int,
                   let replacement = obj["replacement"] as? String else { return nil }
             return .injectCorrection(deleteCount: deleteCount, replacement: replacement)
+        case "inject_anchored":
+            guard let left = obj["left"] as? Int,
+                  let deleteCount = obj["delete_count"] as? Int,
+                  let replacement = obj["replacement"] as? String,
+                  let right = obj["right"] as? Int else { return nil }
+            return .injectAnchored(
+                left: left, deleteCount: deleteCount, replacement: replacement, right: right)
         case "shutdown":
             return .shutdown
         case "restart_tap":

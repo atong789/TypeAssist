@@ -35,14 +35,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::path::{Path, PathBuf};
 
-use behavioural_model::{BehaviouralModel, InputEvent};
+use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
 use correction_engine::{
-    classify_slip, decide, has_motor_evidence, measure_token_motor, ranked_known_candidates,
-    score_candidates, should_log, AnchorTracker, Confidence, ConfidenceTier, DecisionLedger,
-    DecisionOutcome, Lexicon, LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome,
-    OutcomeResolver, PatternReadiness, ScoredCandidate, SlipClass, StabilityReport, Token,
-    TokenKind, Tokenizer, WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION,
-    LEXICON_VERSION, SCORE_VERSION,
+    classify_slip, decide, has_motor_evidence, measure_token_motor, normalize_word,
+    ranked_known_candidates, score_candidates, should_log, target_is_recordable, AnchorTracker,
+    Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome, GuessLedger, Lexicon,
+    LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver,
+    PatternReadiness, ScoredCandidate, SlipClass, StabilityReport, Token, TokenKind, Tokenizer,
+    WordFreq, WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
+    MAX_PATTERN_EDIT_DISTANCE, MAX_PATTERN_LENGTH_DIFF, SCORE_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime};
@@ -165,6 +166,51 @@ pub const EVT_PRACTICE_TREND: &str = "engine://practice-trend";
 /// menu-bar surface will subscribe to the same event without a panel
 /// rewrite. Payload is [`CaptureHealthEvent`].
 pub const EVT_CAPTURE_HEALTH: &str = "engine://capture-health";
+/// **Per-grant permission status for the permission rows.** Forwards the
+/// sidecar's [`InputEvent::PermissionStatus`] verbatim — the two independent
+/// macOS grants capture needs (Accessibility + Input Monitoring), each a
+/// read-only no-prompt probe. Emitted on EVERY receipt (not transition-gated
+/// like capture-health), so a freshly-opened onboarding or Reconnect window
+/// converges to current truth within a poll cycle. Crucially this surfaces a
+/// PARTIAL grant — which `EVT_CAPTURE_HEALTH`'s `live` can never show, because
+/// the sidecar exits before its first heartbeat if either grant is missing —
+/// so the UI can tick each permission row independently. `live` (both grants +
+/// tap armed) stays the gate for "capture is actually running". Payload is
+/// [`PermissionStatusEvent`].
+pub const EVT_PERMISSION_STATUS: &str = "engine://permission-status";
+/// **Debounced capture-active signal for the menu-bar UI.** `EVT_CAPTURE_HEALTH`
+/// flips on every raw transition (a 2s tap-timeout blip flicks it to Unhealthy
+/// and straight back), which would make the tray icon and status line strobe.
+/// This event is the *settled* view: `active` only goes false once capture has
+/// stayed non-`Live` continuously past the self-heal window (the sidecar
+/// re-arms a disabled tap in ~2s; the watchdog auto-respawns a dead sidecar at
+/// 15s) — see [`NOT_ACTIVE_DEBOUNCE_MS`]. Recovery to `Live` flips `active` back
+/// true immediately (good news isn't debounced). `permission_revoked` tells the
+/// menu which recovery action to surface: false → "Restart capture" (re-arm in
+/// place), true → "Reconnect…" (the sidecar reported Accessibility missing, so
+/// only re-granting recovers). Payload is [`CaptureUiEvent`].
+pub const EVT_CAPTURE_UI: &str = "engine://capture-ui";
+/// **M3 correction Step 1.** The current correction allow-list + master gate,
+/// emitted whenever the engine mutates it (toggle from the panel/tray, or an
+/// Escape teach-stop) and on an explicit `RequestAllowList`. The allow-list
+/// panel and the tray master toggle render from this so the UI always reflects
+/// the engine's authoritative state. Payload is [`crate::allow_list::AllowList`].
+pub const EVT_CORRECTION_STATE: &str = "corrections://state";
+/// **M3 correction bubble.** A confident correction is being SUGGESTED for the
+/// just-sealed word — the bubble HUD shows it; *nothing changes on screen*. The
+/// fix is applied only if the user taps Shift (accept). Payload is
+/// [`CorrectionSuggestedEvent`]. (Principle #9: never a silent auto-apply.)
+pub const EVT_CORRECTION_SUGGESTED: &str = "corrections://suggested";
+/// **M3 correction bubble.** A correction was just APPLIED (the user accepted
+/// with Shift) or reverted (Esc) — fired so the bubble can show the post-accept
+/// "Fixed — Esc to undo" cue (and so every correction stays observable,
+/// Principle #7). Payload is [`CorrectionAppliedEvent`] (`undo` flags a revert).
+pub const EVT_CORRECTION_APPLIED: &str = "corrections://applied";
+/// **M3 correction bubble.** A pending suggestion was dropped WITHOUT being
+/// accepted — the user edited the word / typed on / moved the caret, the gate
+/// went off, or it timed out. Tells the bubble to hide immediately, so a visible
+/// bubble always means Shift will work (no "dead bubble"). No payload.
+pub const EVT_CORRECTION_DISMISSED: &str = "corrections://dismissed";
 
 /// Engine-derived view of the sidecar's capture state. Transitions
 /// are observation-only this phase — driven by the Heartbeat
@@ -199,6 +245,25 @@ pub enum CaptureHealth {
 #[derive(Debug, Clone, Copy, Serialize)]
 struct CaptureHealthEvent {
     state: CaptureHealth,
+}
+
+/// Payload for [`EVT_PERMISSION_STATUS`] — the two independent grants, each
+/// reported by the sidecar's read-only probes. The UI shows a per-permission
+/// row for each so a user mid-recovery (or mid-onboarding) sees exactly which
+/// grant is still pending, not just an aggregate "capture is off".
+#[derive(Debug, Clone, Copy, Serialize)]
+struct PermissionStatusEvent {
+    accessibility: bool,
+    input_monitoring: bool,
+}
+
+/// Payload for [`EVT_CAPTURE_UI`] — the debounced, menu-bar-facing view of
+/// capture. `active` is the settled state (see the event's doc); when it's
+/// false, `permission_revoked` chooses the recovery action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct CaptureUiEvent {
+    active: bool,
+    permission_revoked: bool,
 }
 
 /// Control commands the engine task accepts from Tauri commands. Sent
@@ -265,6 +330,21 @@ pub enum EngineControl {
     /// keys the round leaned into. Read-only: reads on-disk history, changes
     /// nothing.
     RequestPracticeTrend { keys: Vec<char> },
+    /// **C5e word-freq gate.** Mark whether a warm-up / Practice round is on
+    /// screen. While active, the typed text is **app-generated** (prompted
+    /// sentences), so the [`WordFreq`] vocabulary tally must skip it or the
+    /// personal word-frequency picture is skewed by our own prompts. The
+    /// **motor map still observes** it — practising weak keys is exactly its
+    /// purpose; only the vocabulary count is suppressed. Posted `true` when the
+    /// Practice panel is shown, `false` when it hides (see `lib.rs`).
+    SetPromptedCaptureActive(bool),
+    /// **M3 correction Step 1 — master gate.** Flip `correction_enabled` on the
+    /// allow-list. The instant global on/off the tray toggle posts. The engine
+    /// persists and echoes the new state on [`EVT_CORRECTION_STATE`].
+    SetCorrectionEnabled(bool),
+    /// **M3 correction Step 1.** Ask the engine to emit the current allow-list
+    /// on [`EVT_CORRECTION_STATE`] — the panel/tray pull fresh state on open.
+    RequestAllowList,
 }
 
 /// Tauri-managed handle for sending [`EngineControl`] messages to
@@ -291,22 +371,22 @@ const CANDIDATES_TOP_N: usize = 3;
 // are mapped to caret moves.
 const KEY_C0_LEFT: char = '\u{001C}';
 const KEY_C0_RIGHT: char = '\u{001D}';
-// Up/Down kept here for documentation and tests — they're filtered out
-// (via `is_non_text_key`) but deliberately not mapped to caret moves in
-// the single-line model. Marked dead_code so the binary build doesn't
-// warn; the test module references them.
-#[allow(dead_code)]
+// Up/Down are filtered out of text (via `is_non_text_key`) and NOT mapped to
+// caret moves in the single-line model. Instead `is_vertical_nav` routes them
+// to a Fix-B line reset: they move the caret to another line the model can't
+// follow, so leaving the caret put (the old behaviour) silently desynced.
 const KEY_C0_UP: char = '\u{001E}';
-#[allow(dead_code)]
 const KEY_C0_DOWN: char = '\u{001F}';
 const KEY_NS_LEFT: char = '\u{F702}';
 const KEY_NS_RIGHT: char = '\u{F703}';
-#[allow(dead_code)]
 const KEY_NS_UP: char = '\u{F700}';
-#[allow(dead_code)]
 const KEY_NS_DOWN: char = '\u{F701}';
 const KEY_NS_HOME: char = '\u{F729}';
 const KEY_NS_END: char = '\u{F72B}';
+// PageUp / PageDown (AppKit NSPageUp/DownFunctionKey). Like Up/Down they jump
+// the caret off the tracked line → Fix-B reset, not a caret nudge.
+const KEY_NS_PAGEUP: char = '\u{F72C}';
+const KEY_NS_PAGEDOWN: char = '\u{F72D}';
 
 /// True if `c` is a non-text key signal — a control character or an
 /// AppKit private-use function-key code. These codepoints exist only to
@@ -365,6 +445,55 @@ fn nav_action(c: char, caret: usize, line_len: usize, command: bool) -> Option<u
     }
 }
 
+/// True for the vertical / paging navigation keys (Up, Down, PageUp, PageDown).
+/// `nav_action` returns `None` for these — in the single-line model there's no
+/// caret position to move to — so the old behaviour left the caret put, which
+/// silently desynced the model from the real (now multi-line) cursor. Fix-B
+/// routes them to a full line reset instead. Plain Left/Right/Home/End are NOT
+/// here: they move the model caret correctly (and off the line end, which
+/// already disables firing), so they stay as-is.
+fn is_vertical_nav(c: char) -> bool {
+    matches!(
+        c,
+        KEY_C0_UP | KEY_C0_DOWN | KEY_NS_UP | KEY_NS_DOWN | KEY_NS_PAGEUP | KEY_NS_PAGEDOWN
+    )
+}
+
+/// **Fix-B — caret-move line reset.** The engine dead-reckons `line_buf` /
+/// `caret` / anchors from keystrokes alone, so any caret move it can't observe
+/// (mouse / trackpad click, Up / Down / PageUp / PageDown, focus or app switch)
+/// leaves that model stale. With live correction on, a stale model can fire
+/// backspaces at the wrong position (the `edndd` desync). Resetting to a clean
+/// line only costs a skipped correction on the *next* word — the safe
+/// direction — whereas NOT resetting is what deletes the wrong thing, so every
+/// unobservable caret move funnels through here.
+///
+/// Mirrors the newline reset (clears the line buffers + caret + anchors, resets
+/// the tokenizer line, emits `EVT_LINE_RESET` + the anchor snapshot) and also
+/// disarms any pending Escape-undo, whose revert would otherwise inject at the
+/// now-stale caret. `trigger` is a log tag only (`mouse` / `focus` / `updown`).
+fn reset_line_for_caret_move<R: Runtime>(
+    app: &AppHandle<R>,
+    tokenizer: &mut Tokenizer,
+    line_buf: &mut Vec<char>,
+    line_dwells: &mut Vec<u32>,
+    caret: &mut usize,
+    anchors: &mut AnchorTracker,
+    last_correction: &mut Option<LastCorrection>,
+    trigger: &str,
+) {
+    tracing::info!("LINE_RESET trigger={trigger}");
+    tokenizer.reset_line();
+    line_buf.clear();
+    line_dwells.clear();
+    *caret = 0;
+    anchors.clear();
+    *last_correction = None;
+    let _ = app.emit(EVT_LINE_RESET, ());
+    let snap = anchors.snapshot();
+    let _ = app.emit(EVT_ANCHOR_SNAPSHOT, anchor_emit_payload(&snap, line_buf));
+}
+
 /// THE single entry point that puts a character into `line_buf`. Anything
 /// that would write to the buffer goes through here so the non-text guard
 /// is impossible to bypass. Returns the new caret position, or `None` if
@@ -395,6 +524,123 @@ struct KeystrokePayload {
     ingest_latency_ms: f64,
 }
 
+/// Payload for [`EVT_CORRECTION_APPLIED`] — what the bubble shows after an accept
+/// or revert. Carries the before/after words and whether this event is a fix or
+/// its undo (`teh → the` on apply, `the → teh` reverting on undo).
+#[derive(Serialize, Clone)]
+struct CorrectionAppliedEvent {
+    typed: String,
+    target: String,
+    /// `false` for an applied fix, `true` for an Escape revert.
+    undo: bool,
+}
+
+/// Payload for [`EVT_CORRECTION_SUGGESTED`] — the bubble's before→after, with the
+/// changed target letters (`highlight`) marked soft-blue. Nothing is injected
+/// until the user accepts with Shift.
+#[derive(Serialize, Clone)]
+struct CorrectionSuggestedEvent {
+    typed: String,
+    target: String,
+    highlight: Vec<usize>,
+}
+
+/// A correction the engine is currently SUGGESTING (the bubble is up), retained
+/// until the user accepts it with an isolated Shift tap. Stays ACCEPTABLE for a
+/// generous window even after the user types ON, via an ANCHORED replace keyed
+/// off `word_end` (the word's end position in the line). Dropped the moment the
+/// user edits the source word / navigates / the caret moves, exceeds the
+/// distance cap, or the window expires — bias hard toward dismiss (a missed
+/// accept is fine; a wrong-place edit is not). `word_len`/`boundary` reproduce
+/// the immediate (no-typing-since) delete+retype; `word_end` anchors the
+/// positional replace once the caret has moved on.
+#[derive(Debug, Clone)]
+struct PendingSuggestion {
+    typed: String,
+    target: String,
+    boundary: char,
+    word_len: usize,
+    /// The word's end position in the line buffer at seal (= `tok.end`). Fixed
+    /// while pending (it dismisses if anything edits at/before it), so the accept
+    /// can compute how far the caret has moved on.
+    word_end: usize,
+    armed_at_ms: u64,
+}
+
+/// How long a suggestion stays up if the user neither accepts (Shift) nor types —
+/// the generous "window." Sized for the target user, who types slowly: long
+/// enough to notice + accept, short enough that an ignored one doesn't overstay.
+/// (The bubble's own SUGGEST_MS backstop sits above this.) **Tunable.**
+const SUGGESTION_TIMEOUT_MS: u64 = 5_000;
+
+/// Distance cap for the anchored accept: how many chars the caret may have moved
+/// PAST the word and still let Shift land it (≈ 1–2 words). Beyond this the
+/// dead-reckoning drift risk is too high → dismiss. Deliberately tight (the
+/// target user types slowly — they won't be far ahead). **Tunable.**
+const MAX_ANCHOR_CHARS: usize = 20;
+
+/// Master switch for the ANCHORED accept (Shift *after* the caret has typed past
+/// the word). **OFF.** A wrong-place anchored replace doubled a word in the live
+/// field — `settgings` + ~3 words + Shift produced `Settingsettings` — because
+/// the engine dead-reckons the caret from keystrokes and that model had drifted
+/// from the real field (autocap / untracked edits the tap never observes). For
+/// this audience, garbling text is the one failure we cannot ship, so until the
+/// anchored path is *provably* safe Shift accepts ONLY on the immediate
+/// no-arrows path (`after_len == 1`). Re-enabling requires L1 to confirm the word
+/// at the position from the AX field (ground truth) — the dead-reckoned model
+/// alone cannot make this safe. A missed accept is fine; a wrong-place edit is
+/// not. See [`word_at_anchor`].
+const ANCHORED_ACCEPT_ENABLED: bool = false;
+
+/// Fail-safe check for the anchored accept: before an anchored replace
+/// deletes/types, verify the engine's own line model still holds the ORIGINAL
+/// word (`typed`) at the anchored position (`line_buf[word_end - word_len ..
+/// word_end]`). A mismatch means the model has drifted — inject nothing.
+///
+/// This catches model-INTERNAL desync (retokenisation / miscounted positions).
+/// It cannot catch divergence the model never observed (autocap rewriting the
+/// field), because `line_buf` is itself the dead-reckoned model — which is why
+/// anchored stays gated by [`ANCHORED_ACCEPT_ENABLED`] until L1 supplies the
+/// field's ground truth. Necessary, not sufficient.
+fn word_at_anchor(line_buf: &[char], word_end: usize, word_len: usize, typed: &str) -> bool {
+    let Some(start) = word_end.checked_sub(word_len) else {
+        return false;
+    };
+    match line_buf.get(start..word_end) {
+        Some(slice) => slice.iter().copied().eq(typed.chars()),
+        None => false,
+    }
+}
+
+/// The just-fired correction, retained so a single Escape can revert it within
+/// [`UNDO_WINDOW_MS`]. `typed`/`target` are normalized (allow-list form);
+/// `boundary` is the terminator char that sealed the word (re-typed verbatim on
+/// both inject and revert). `fired_at_ms` arms the window.
+#[derive(Debug, Clone)]
+struct LastCorrection {
+    typed: String,
+    target: String,
+    boundary: char,
+    /// `after_len` from the accept: 1 = immediate (caret at the boundary), >1 =
+    /// the caret had moved on (anchored accept). The revert mirrors the accept —
+    /// caret-relative for the immediate case, anchored (arrow-keyed) otherwise.
+    /// Safe because `last_correction` disarms on ANY non-Esc keystroke, so an Esc
+    /// undo only ever fires with the caret exactly where the accept left it.
+    after_len: usize,
+    fired_at_ms: u64,
+}
+
+/// How long after a correction an Escape still reverts it. Sized for slow /
+/// stroke-survivor reaction time — generous, but the window also closes the
+/// moment the user types any other character (an implicit accept), so a long
+/// timeout doesn't keep Escape hijacked. **Tunable.**
+const UNDO_WINDOW_MS: u64 = 6_000;
+
+/// Escape's codepoint (U+001B). The engine sees it as a `Key` event (the L1 tap
+/// streams every keystroke); within an armed undo window it reverts the last
+/// correction instead of being a caret-only no-op.
+const KEY_ESCAPE: char = '\u{001B}';
+
 /// Per-Word-token decision (Component 3c-2). Observe-only — `would-correct`
 /// is a *proposal*, not an injection. `outcome` is the full
 /// [`DecisionOutcome`] tagged enum (`would_correct` / `leave_alone` with
@@ -407,6 +653,52 @@ struct DecisionPayload {
     active_tier: ConfidenceTier,
     decide_time_ms: f64,
     decision_version: u32,
+}
+
+/// Re-apply the user's capitalisation pattern to a (lowercase) correction
+/// target, so a fix never changes their casing: `Teh → The`, `WAHT → WHAT`,
+/// `teh → the`. All-caps (2+ letters) → upper; leading capital → capitalise the
+/// first letter; otherwise verbatim. Case is read from the RAW typed word.
+fn match_source_case(typed_raw: &str, target_lower: &str) -> String {
+    let letters: Vec<char> = typed_raw.chars().filter(|c| c.is_alphabetic()).collect();
+    let all_caps = letters.len() >= 2 && letters.iter().all(|c| c.is_uppercase());
+    if all_caps {
+        return target_lower.to_uppercase();
+    }
+    let leading_cap = typed_raw.chars().next().is_some_and(|c| c.is_uppercase());
+    if leading_cap {
+        let mut out = String::new();
+        let mut chars = target_lower.chars();
+        if let Some(f) = chars.next() {
+            out.extend(f.to_uppercase());
+        }
+        out.push_str(chars.as_str());
+        return out;
+    }
+    target_lower.to_string()
+}
+
+/// The "contraction filter" (locked principle): TypeAssist owns idiosyncratic
+/// MOTOR garbles, not missing apostrophes / contractions / possessives — that's
+/// Auto-Correct's job. Returns true for an apostrophe-only fix so the engine
+/// suppresses it: the target has an apostrophe AND, with apostrophes removed and
+/// case-folded, it equals the typed form (a pure apostrophe insert, `dont → don't`,
+/// `todays → today's`) or the typed form + `s` (possessive completion, `key' →
+/// key's`). A genuine motor garble in an apostrophe word (`doens't → doesn't`,
+/// the letters differ by a transposition) is NOT suppressed.
+fn is_apostrophe_fix(typed: &str, target: &str) -> bool {
+    if !target.contains('\'') {
+        return false;
+    }
+    let strip = |s: &str| -> String {
+        s.chars()
+            .filter(|&c| c != '\'')
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    };
+    let st = strip(typed);
+    let sg = strip(target);
+    st == sg || sg == format!("{st}s")
 }
 
 /// Emission wrapper for an anchor snapshot. The pure
@@ -441,7 +733,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// **Capture-integrity funnel** (CLAUDE.md Principle #8 — capture integrity
+/// **Capture-integrity funnel** (CLAUDE.md Principle #7 — capture integrity
 /// is observable, not assumed). Cumulative per-session counters at each
 /// pipeline boundary so the conversion ratio between adjacent stages is
 /// auditable: `received → accepted → sealed → verdict → observe → save`.
@@ -451,6 +743,14 @@ fn now_ms() -> u64 {
 struct Funnel {
     /// L1: raw Key/Backspace events received from the sidecar.
     keystrokes_received: u64,
+    /// **L1 capture loss made visible (Principle #7).** Non-backspace
+    /// auto-repeat keyDowns the adapter dropped (it emits a text key once, on
+    /// keyUp, so held-key repeats are lost). This is NOT part of `received` —
+    /// these never reached the pipeline. A healthy run keeps this ~0; a climbing
+    /// count means held *letter* keys are dropping in real use (held backspace
+    /// is already forwarded, so it never lands here). It exists so the drop is
+    /// counted, not silent.
+    autorepeat_dropped: u64,
     /// After filtering (modifier/Cmd-Ctrl drops, non-text nav, pause).
     keystrokes_accepted: u64,
     /// Fresh Word/Acronym seals (a new anchor registered). Replay re-seals
@@ -460,7 +760,7 @@ struct Funnel {
     /// Admitted to the C5c **motor ledger** — every fresh, motor-evidenced
     /// sealed word (known included). The stage between sealing and the
     /// motor verdict; the gate is just motor evidence (no lexicon Known-skip),
-    /// so `admitted ≈ sealed` minus paste / zero-dwell. (Principle #8: the
+    /// so `admitted ≈ sealed` minus paste / zero-dwell. (Principle #7: the
     /// new boundary is observable.)
     records_admitted: u64,
     /// 5a verdicts emitted (from the MOTOR ledger), by outcome (revisable: a
@@ -478,12 +778,25 @@ struct Funnel {
     /// 5d word-pattern store: of the `CorrectedToOther` verdicts the store
     /// sees, how many were recorded as a `typed→target` pattern vs skipped
     /// (semantic rewrite / no-op / no recoverable post-edit text). The two
-    /// reconcile against `v_corr_oth` (Principle #8: this stage drops data —
+    /// reconcile against `v_corr_oth` (Principle #7: this stage drops data —
     /// the rewrite filter — so the drop is counted, not silent).
     word_patterns_observed: u64,
     word_pattern_skipped: u64,
     /// Successful `word_patterns.json` flushes.
     word_pattern_saves: u64,
+    /// M3 correction Step 1 (Principle #7: a live correction is an action on
+    /// the user's text — it must never be silent). `applied` counts injections
+    /// fired from the manual allow-list; `undone` counts Escape teach-stops
+    /// that reverted one. A healthy run reconciles `undone ≤ applied`.
+    corrections_applied: u64,
+    corrections_undone: u64,
+    /// **M3 autocorrect coexistence — "Watch Dog Not Attack Dog" (Principle
+    /// #7).** Times Jordan stood down on a host-redundant (common) suggestion
+    /// because he behaviourally sensed an active competing corrector
+    /// ([`CompetitorSense`]). A deliberate, visible drop — a suggestion the
+    /// engine WOULD have surfaced but withheld so it doesn't double-correct the
+    /// host. Idiosyncratic fixes are never counted here (they always fire).
+    competitor_deferred: u64,
     /// Session start (ms since epoch), stamped at task spawn.
     session_started_ms: u64,
 }
@@ -500,12 +813,15 @@ impl Funnel {
     /// callers (the Cmd+Shift+F chord and the 60s auto-dump).
     fn dump(&self) {
         tracing::info!(
-            "FUNNEL_DUMP {{ c_keystrokes_received: {}, c_keystrokes_accepted: {}, \
+            "FUNNEL_DUMP {{ c_keystrokes_received: {}, c_autorepeat_dropped: {}, \
+             c_keystrokes_accepted: {}, \
              c_tokens_sealed: {}, c_records_admitted: {}, c_verdicts_resolved: {{kept: {}, \
              corr_sug: {}, corr_oth: {}, abandoned: {}}}, c_motor_observations: {{kept: {}, \
              slip: {}}}, c_motor_saves: {}, c_word_patterns: {{observed: {}, skipped: {}}}, \
-             c_word_pattern_saves: {}, session_started_at: {} }}",
+             c_word_pattern_saves: {}, c_corrections: {{applied: {}, undone: {}}}, \
+             c_competitor_deferred: {}, session_started_at: {} }}",
             self.keystrokes_received,
+            self.autorepeat_dropped,
             self.keystrokes_accepted,
             self.tokens_sealed,
             self.records_admitted,
@@ -519,18 +835,102 @@ impl Funnel {
             self.word_patterns_observed,
             self.word_pattern_skipped,
             self.word_pattern_saves,
+            self.corrections_applied,
+            self.corrections_undone,
+            self.competitor_deferred,
             self.session_started_ms,
         );
     }
 
     /// Zero every counter and restamp the run start — closes a measurement
-    /// run and opens a fresh one (Principle #8: counters reconciled **per
+    /// run and opens a fresh one (Principle #7: counters reconciled **per
     /// run**, never conflated across runs). Logs a `FUNNEL_RESET` marker so
     /// run boundaries are visible when reconstructing from the log. Called
     /// by the explicit dump chord (after the dump) and the reset chord.
     fn reset(&mut self, now: u64) {
         *self = Funnel::new(now);
         tracing::info!("FUNNEL_RESET — counters zeroed, new run from {}", now);
+    }
+}
+
+/// **EASILY-FLIPPED CONSTANT — placeholder (decision iii).** Host-redundant
+/// footprints required before Jordan stands down on the common lane. N=2 so a
+/// single stray correction (a one-off self-fix) never trips deferral; small
+/// enough to engage quickly when a host corrector is genuinely active.
+const COMPETITOR_EVIDENCE_THRESHOLD: u32 = 2;
+
+/// **EASILY-FLIPPED CONSTANT — placeholder (decision iii).** Idle gap with no
+/// fresh footprint after which the competitor is treated as gone: Jordan
+/// re-arms and fires common fixes again. ~45s — long enough to span the pauses
+/// of a slow-typing user mid-paragraph, short enough that toggling the host
+/// corrector off is felt within a sentence or two.
+const COMPETITOR_REARM_IDLE_MS: u64 = 45_000;
+
+/// **Watch Dog Not Attack Dog (M3 autocorrect coexistence).** Jordan's purely
+/// *behavioural* sense of whether another corrector (a host app's autocorrect)
+/// is actively fixing words right now. He never reads the app's or system's
+/// autocorrect switch (content-blind, Principle #8); he senses a competitor by
+/// **footprint** — a `CorrectedToOther` in the host-redundant lane that he did
+/// **not** cause (an external agent made a common fix). His own accepts can't be
+/// footprints: their injected echo is dropped before the pipeline
+/// (`pending_echo`), so they never resolve `CorrectedToOther`.
+///
+/// After [`COMPETITOR_EVIDENCE_THRESHOLD`] footprints he *defers* on
+/// host-redundant (common) suggestions **only**; idiosyncratic fixes always
+/// fire (his core value — never suppressed). He re-arms when the competitor goes
+/// quiet ([`Self::decay`], ~45s idle) or on app/focus change ([`Self::reset`]).
+///
+/// **Global, not per-app** (decision ii): a single counter reset on focus
+/// change, so **no app identity is ever held or persisted** — the strongest
+/// Principle #8 posture. Cost: returning to an autocorrect app re-fires up to
+/// N common bubbles before re-deferring (fail-toward-firing, accepted).
+///
+/// **Output-only:** this gates whether Jordan *suggests*, never what he
+/// *learns* — the motor ledger / word-patterns learn from all ambient
+/// resolution regardless (`tick_resolver`, the motor pass).
+#[derive(Debug, Default)]
+struct CompetitorSense {
+    /// Footprints sensed in the current armed window. Saturates; zeroed by
+    /// [`Self::decay`] (idle re-arm) or [`Self::reset`] (focus change).
+    evidence: u32,
+    /// Wall-clock (ms) of the most recent footprint; drives idle re-arm.
+    last_footprint_ms: u64,
+}
+
+impl CompetitorSense {
+    /// A competing corrector just made a host-redundant fix Jordan didn't
+    /// cause. Bumps evidence and stamps the time.
+    fn note_footprint(&mut self, now: u64) {
+        self.evidence = self.evidence.saturating_add(1);
+        self.last_footprint_ms = now;
+    }
+
+    /// True when a competitor is currently sensed: enough footprints AND the
+    /// last one within the re-arm window. Pure read (always fresh) — the time
+    /// guard means deferral lapses the instant the window passes, even before
+    /// [`Self::decay`] zeroes the counter.
+    fn is_deferring(&self, now: u64) -> bool {
+        self.evidence >= COMPETITOR_EVIDENCE_THRESHOLD
+            && now.saturating_sub(self.last_footprint_ms) < COMPETITOR_REARM_IDLE_MS
+    }
+
+    /// Re-arm if the competitor has gone quiet: once a full idle window passes
+    /// with no footprint, zero the evidence so a fresh competitor must clear
+    /// the threshold again (preserves the N-footprint hysteresis across quiet
+    /// gaps). Called from the 1s watchdog. Idempotent.
+    fn decay(&mut self, now: u64) {
+        if self.evidence > 0
+            && now.saturating_sub(self.last_footprint_ms) >= COMPETITOR_REARM_IDLE_MS
+        {
+            self.evidence = 0;
+        }
+    }
+
+    /// Hard reset on app/focus change — a new app may have a different
+    /// corrector regime, so re-arm immediately (fail toward firing).
+    fn reset(&mut self) {
+        self.evidence = 0;
+        self.last_footprint_ms = 0;
     }
 }
 
@@ -568,9 +968,51 @@ fn word_patterns_path() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("word_patterns.json"))
 }
 
+/// `~/.typeassist/guess_accuracy.json` — the observe-only guesser accuracy
+/// scoreboard (M3 accuracy-gated suggestion work, Phase 1). Its OWN file beside
+/// the word-pattern store; measurement only, never read back into correction.
+fn guess_accuracy_path() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("guess_accuracy.json"))
+}
+
 /// `~/.typeassist/snapshots` — the daily dated archive directory.
 fn snapshots_dir() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("snapshots"))
+}
+
+/// `~/.typeassist/word_freq.json` — the local vocabulary tally (C5e),
+/// observe-only, privacy-gated to `is_known` words. Its OWN file beside the
+/// motor map (counts only — no order, no context).
+fn word_freq_path() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("word_freq.json"))
+}
+
+/// `~/.typeassist/word_freq_snapshots` — the word-tally's daily dated archive.
+/// Deliberately its OWN directory, NOT under `snapshots/`: the Practice-trend
+/// reader loads every file in `snapshots/` as a `MotorMap`, so a differently-
+/// shaped file there would break it (same rule as `word_patterns_path`).
+fn word_freq_snapshots_dir() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("word_freq_snapshots"))
+}
+
+/// `~/.typeassist/allow_list.json` — the manual correction allow-list + master
+/// gate (M3 correction Step 1). The engine task is its sole writer; the UI
+/// reads it read-only. Its own file beside the learning stores — it is config,
+/// not learned data. `None` when HOME is unset (corrections then run from an
+/// in-memory default that ships dark, so nothing fires).
+fn allow_list_path() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("allow_list.json"))
+}
+
+/// `~/.typeassist/shadow_suggestions.log` — the **live dry-run** shadow log
+/// (M3 observe-only). Whenever the classifier WOULD surface a suggestion for a
+/// just-sealed word, one line is appended here; **nothing is applied to the
+/// user's text.** A tail-able diagnostic so the builder can type and watch what
+/// the engine *would* have suggested in real time. Honors `TYPEASSIST_DATA_DIR`.
+/// `None` when HOME is unset. (No new privacy surface: the same `typed → target`
+/// pairs already live in `word_patterns.json`.)
+fn shadow_log_path() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join("shadow_suggestions.log"))
 }
 
 /// Minimum interval between live motor-map flushes when there are unsaved
@@ -578,6 +1020,22 @@ fn snapshots_dir() -> Option<PathBuf> {
 /// bounds force-quit data loss to ~this window while keeping disk writes
 /// modest during continuous typing. See [`flush_motor_map`].
 const MOTOR_FLUSH_INTERVAL_MS: u64 = 2_000;
+
+/// Idle gap after which the watchdog drops the live line buffer (+ caret +
+/// anchors) and starts the next keystroke on a clean line.
+///
+/// The line buffer is a dead-reckoned mirror of the focused field, updated
+/// only from keystrokes. An unobserved caret/content change — a mouse-click
+/// reposition, Up/Down in a multi-line field, an app/field switch — can
+/// desync it and leave a stale tail to the RIGHT of the caret, which turns
+/// every later keystroke into a mid-line replay (the source of the
+/// "edndd"-tail artifact cascade). We can't read the field to resync, but a
+/// real pause is a safe moment to discard the stale buffer. Set well above
+/// the resolver's Kept/Abandoned idle thresholds so pending verdicts resolve
+/// first; the buffer is transient, so nothing persisted is lost (Principle
+/// #8). This is the conservative half of the desync fix — the durable
+/// focus-change/echo-robustness signals are the tracked Fix-B follow-up.
+const LINE_IDLE_RESET_MS: u64 = 30_000;
 
 /// Watchdog ticks between periodic `EVT_MOTOR_STABILITY` emits. The report
 /// changes slowly, so 30 s keeps a passive consumer (debug panel) current
@@ -743,9 +1201,15 @@ impl DailyTally {
 /// (a missing file is the honest "no data yet" state, never an error).
 fn read_progress_days(path: &Path) -> Vec<DailyEntry> {
     match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice::<ProgressSnapshots>(&bytes)
-            .map(|s| s.days)
-            .unwrap_or_default(),
+        Ok(bytes) => match serde_json::from_slice::<ProgressSnapshots>(&bytes) {
+            Ok(s) => s.days,
+            Err(e) => {
+                // Corrupt file: move it aside (never wipe accumulated history)
+                // and start empty, rather than silently dropping it.
+                correction_engine::persist::quarantine_corrupt(path, e);
+                Vec::new()
+            }
+        },
         Err(_) => Vec::new(),
     }
 }
@@ -786,12 +1250,9 @@ fn write_progress(path: &Path, tally: &DailyTally) -> std::io::Result<()> {
         days,
     };
     let json = serde_json::to_vec_pretty(&snap).map_err(std::io::Error::other)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, path)
+    // Durable atomic write (temp → fsync → rename → fsync dir) so a crash can't
+    // leave a zero-length or torn progress history.
+    correction_engine::persist::durable_write(path, &json)
 }
 
 /// Watchdog-driven progress persistence + day rollover. On a calendar-day
@@ -859,34 +1320,103 @@ const TREND_LOOKUP_N: usize = 64;
 /// recovering hand with a 20–40% slip on a slow finger lights it clearly.
 const PRACTICE_DOT_SLIP_THRESHOLD: f32 = 0.05;
 
-/// Reflect "weak keys worth practicing" in the menu-bar icon by swapping
-/// between the plain and badge-dot **template** images. The signal is the
-/// dot's SHAPE, not colour (a template icon is monochrome), so it reads for
-/// colour-blind users too. Only touches the OS when the state actually
-/// changes, tracked via `last`.
-fn update_tray_dot<R: Runtime>(
-    app: &AppHandle<R>,
-    last: &mut Option<bool>,
-    report: &StabilityReport,
-) {
-    // `weakest` is sorted worst-first, so the head is the highest slip rate.
-    // Light the dot only when that clears the "worth practicing" bar.
-    let want_dot = report
+/// Whether there's a weak key "worth practicing" — drives the menu-bar badge
+/// dot. `weakest` is sorted worst-first, so the head is the highest slip rate;
+/// light the dot only when that clears the bar.
+fn wants_practice_dot(report: &StabilityReport) -> bool {
+    report
         .weakest
         .first()
-        .is_some_and(|(_, slip_rate)| *slip_rate >= PRACTICE_DOT_SLIP_THRESHOLD);
-    if *last == Some(want_dot) {
+        .is_some_and(|(_, slip_rate)| *slip_rate >= PRACTICE_DOT_SLIP_THRESHOLD)
+}
+
+/// The menu-bar "capture stopped" icon: a hollow version of the keyboard glyph
+/// (rounded-square outline, no filled centre) with a diagonal slash through it —
+/// the universal "off" look (like wifi-off). Built in memory as a **template**
+/// (alpha-only; macOS recolours it for the light/dark bar), so the alarm reads
+/// by SHAPE, never colour — NEVER red (a11y + the no-deficit-framing rule).
+/// 44×44 to match `tray-icon.png`, so swapping it in doesn't resize the icon.
+fn capture_off_icon() -> tauri::image::Image<'static> {
+    const N: i32 = 44;
+    let n = N as f32;
+    // Rounded-square outline, matching the base glyph's bounding box + radius.
+    let margin = 8.0;
+    let half = (n - 2.0 * margin) / 2.0; // half side of the square
+    let cx = n / 2.0;
+    let cy = n / 2.0;
+    let corner = 8.0;
+    let ring = 4.0; // outline stroke width
+                    // Diagonal slash, top-right → bottom-left (the "no/off" diagonal).
+    let inset = margin - 1.0;
+    let (ax, ay) = (n - inset, inset); // top-right
+    let (bx, by) = (inset, n - inset); // bottom-left
+    let slash = 4.5; // slash stroke width
+
+    // Signed distance to a rounded rectangle centred at (cx,cy).
+    let rrect_sdf = |px: f32, py: f32| -> f32 {
+        let qx = (px - cx).abs() - (half - corner);
+        let qy = (py - cy).abs() - (half - corner);
+        let ax = qx.max(0.0);
+        let ay = qy.max(0.0);
+        (ax * ax + ay * ay).sqrt() + qx.max(qy).min(0.0) - corner
+    };
+    // Distance from a point to the slash segment A→B.
+    let seg_dist = |px: f32, py: f32| -> f32 {
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 0.0 {
+            (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (qx, qy) = (ax + t * dx, ay + t * dy);
+        ((px - qx).powi(2) + (py - qy).powi(2)).sqrt()
+    };
+
+    let mut rgba = vec![0u8; (N * N * 4) as usize];
+    for y in 0..N {
+        for x in 0..N {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            // Outline coverage: within half a stroke of the rounded-rect edge.
+            let ring_cov = (1.0 - (rrect_sdf(px, py).abs() - ring / 2.0)).clamp(0.0, 1.0);
+            // Slash coverage: within half a stroke of the segment.
+            let slash_cov = (1.0 - (seg_dist(px, py) - slash / 2.0)).clamp(0.0, 1.0);
+            let cov = ring_cov.max(slash_cov);
+            let i = ((y * N + x) * 4) as usize;
+            // Template: opaque black, alpha carries the shape.
+            rgba[i + 3] = (cov * 255.0) as u8;
+        }
+    }
+    tauri::image::Image::new_owned(rgba, N as u32, N as u32)
+}
+
+/// Set the menu-bar icon from the two orthogonal signals, only touching the OS
+/// when the rendered state changes (tracked via `last`). The capture-stopped
+/// alarm WINS over the practice badge — a dead capture is the more urgent thing
+/// to show, and stacking both would muddy the glyph. All three are **template**
+/// images (monochrome, OS-recoloured) so the signal is shape, never colour.
+fn apply_tray_icon<R: Runtime>(
+    app: &AppHandle<R>,
+    not_active: bool,
+    practice_dot: bool,
+    last: &mut Option<(bool, bool)>,
+) {
+    let key = (not_active, practice_dot);
+    if *last == Some(key) {
         return;
     }
     if let Some(tray) = app.tray_by_id("main-tray") {
-        let icon = if want_dot {
+        let icon = if not_active {
+            capture_off_icon()
+        } else if practice_dot {
             tauri::include_image!("icons/tray-icon-dot.png")
         } else {
             tauri::include_image!("icons/tray-icon.png")
         };
         let _ = tray.set_icon(Some(icon));
         let _ = tray.set_icon_as_template(true);
-        *last = Some(want_dot);
+        *last = Some(key);
     }
 }
 
@@ -1040,7 +1570,7 @@ struct MotorKeystrokeEvent {
 ///     motor-evidenced word (known included), candidate-agnostic. Each
 ///     `Kept` / `CorrectedToOther` is folded into `motor_map` (the funnel's
 ///     verdict + observation counters live here, since this is the capture
-///     pipeline Principle #8 reconciles). A `MotorRecord` never carries a
+///     pipeline Principle #7 reconciles). A `MotorRecord` never carries a
 ///     candidate, so every correction reads as a `CorrectedToOther` slip.
 ///
 /// Each uses its own resolver instance (independent stability caches). Both
@@ -1058,9 +1588,13 @@ fn tick_resolver<R: Runtime>(
     motor_ledger: &mut MotorLedger,
     proposer: &mut LexiconProposer,
     motor_map: &mut MotorMap,
+    word_freq: &mut WordFreq,
+    prompted_capture_active: bool,
     word_patterns: &mut WordPatternStore,
+    guess_ledger: &mut GuessLedger,
     funnel: &mut Funnel,
     tally: &mut DailyTally,
+    competitor_sense: &mut CompetitorSense,
 ) {
     let now = now_ms();
 
@@ -1091,7 +1625,7 @@ fn tick_resolver<R: Runtime>(
     for (record_id, outcome) in mchanges {
         tracing::info!("RESOLVE_OUTCOME rid={} -> {:?}", record_id, outcome);
         if motor_ledger.resolve_outcome(record_id, outcome) {
-            // Funnel (Principle #8): a verdict was assigned in the capture
+            // Funnel (Principle #7): a verdict was assigned in the capture
             // pipeline. Counts transitions, so revisions can tally > once.
             // Same-day stats (Statistics tab): a resolved word is one typed
             // word. Both Kept (clean) and CorrectedToOther (slipped) count
@@ -1116,6 +1650,19 @@ fn tick_resolver<R: Runtime>(
                 // only; the kill-switch stays off).
                 let report = match outcome {
                     Outcome::Kept => {
+                        // C5e local vocabulary tally (observe-only, privacy-
+                        // gated): a Kept word is clean, left-in vocabulary, so
+                        // tally it for the future personal-frequency scorer.
+                        // `observe_kept` itself enforces the is_known gate, so a
+                        // name/password/junk token is never written to disk.
+                        // Only Kept feeds this — corrected/abandoned words are a
+                        // slip, not vocabulary. SKIP while a warm-up / Practice
+                        // round is on screen: that text is our own prompts, not
+                        // the user's vocabulary (the motor map below still
+                        // observes it — practising weak keys is its purpose).
+                        if !prompted_capture_active {
+                            word_freq.observe_kept(&rec.original_text, Lexicon::shared(), now);
+                        }
                         motor_map.observe_outcome(outcome, &rec.original_text, None, now)
                     }
                     Outcome::CorrectedToOther => {
@@ -1124,11 +1671,117 @@ fn tick_resolver<R: Runtime>(
                             anchors.anchors(),
                             line_buf,
                         );
+                        // Watch Dog Not Attack Dog (M3 autocorrect coexistence):
+                        // a word was just corrected toward a COMMON target that
+                        // Jordan didn't cause (his own accepts are echo-skipped
+                        // before this pipeline, so they never reach here). That's
+                        // a competing-corrector footprint — sense it so the fire
+                        // gate can defer on the redundant lane. OUTPUT-path only:
+                        // this reads the resolved pair and bumps the behavioural
+                        // sense; the learning writes below are untouched. Skip
+                        // during Practice/warm-up — that text is our own prompts,
+                        // not ambient host activity. (The self-correction case is
+                        // made moot by scope: deferral only ever applies to the
+                        // host-redundant common lane; idiosyncratic always fires.)
+                        if !prompted_capture_active {
+                            if let Some(c) = corrected.as_deref() {
+                                if correction_engine::is_host_redundant(
+                                    &rec.original_text,
+                                    c,
+                                    Lexicon::shared(),
+                                ) {
+                                    competitor_sense.note_footprint(now);
+                                }
+                            }
+                        }
                         // C5d word-pattern store: learn the typed→target pair
                         // (observe-only; kill-switch off). Counts observed vs
                         // skipped so the rewrite-filter drop is auditable.
                         match corrected.as_deref() {
                             Some(c) => {
+                                // Guard 1 (soft): only record a pair whose
+                                // intended `target` is a real word — is_known
+                                // (bundled dict OR the user's learned set) OR
+                                // letter-trigram plausible. Rejects the
+                                // "edndd"-tail re-tokenization artifacts (each
+                                // carries a dictionary-absent trigram) without
+                                // blocking genuine vocabulary. Gates BOTH the
+                                // scoreboard and the word-pattern store below so
+                                // the two populations stay consistent.
+                                let target_recordable =
+                                    target_is_recordable(&normalize_word(c), Lexicon::shared());
+                                // --- Guesser accuracy scoreboard (M3 Phase 1,
+                                // observe-only) — PREDICT, then learn. Ask the
+                                // guesser for its top guess of `typed` using the
+                                // word-pattern model AS IT STANDS NOW, BEFORE
+                                // this correction is folded in below, so the
+                                // score is genuinely out-of-sample. Measurement
+                                // only: nothing fires, the master gate is
+                                // untouched, the existing stores are unchanged.
+                                // Runs only on a resolved CorrectedToOther (rare,
+                                // human-paced) — never on the typing hot path.
+                                {
+                                    let typed_n = normalize_word(&rec.original_text);
+                                    let target_n = normalize_word(c);
+                                    // Skip no-ops (typed == target after
+                                    // normalization) so a pair that isn't a real
+                                    // slip never enters the scoreboard — the same
+                                    // guard the word-pattern store applies, so the
+                                    // two stay consistent. (A no-op forces the
+                                    // guesser to pick a *different* word, which it
+                                    // then "misses", dragging the hit-rate down.)
+                                    if !typed_n.is_empty()
+                                        && !target_n.is_empty()
+                                        && typed_n != target_n
+                                        && target_recordable
+                                    {
+                                        let snaps = word_patterns.snapshots();
+                                        let model = correction_engine::guesser::build_model(
+                                            snaps.iter().map(|s| {
+                                                (
+                                                    s.target.as_str(),
+                                                    s.typed.as_str(),
+                                                    s.weight as f64,
+                                                )
+                                            }),
+                                        );
+                                        let g = correction_engine::guesser::guess(
+                                            &model,
+                                            &typed_n,
+                                            Lexicon::shared(),
+                                        );
+                                        // Within-guard = the ≤2-edit typo-fix
+                                        // population the store learns / the
+                                        // offline benchmark runs on; tagged so
+                                        // both populations are readable.
+                                        let len_diff = typed_n
+                                            .chars()
+                                            .count()
+                                            .abs_diff(target_n.chars().count());
+                                        let within_guard =
+                                            correction_engine::edit_distance(&typed_n, &target_n)
+                                                <= MAX_PATTERN_EDIT_DISTANCE
+                                                && len_diff <= MAX_PATTERN_LENGTH_DIFF;
+                                        guess_ledger.record(
+                                            &typed_n,
+                                            g.as_ref(),
+                                            &target_n,
+                                            within_guard,
+                                            now,
+                                        );
+                                        // debug!, not info!: prints raw typed +
+                                        // guess + target words (privacy).
+                                        tracing::debug!(
+                                            "GUESS_SCORED typed={:?} guess={:?} conf={:.2} target={:?} hit={} within_guard={}",
+                                            typed_n,
+                                            g.as_ref().map(|g| g.word.as_str()),
+                                            g.as_ref().map(|g| g.confidence).unwrap_or(0.0),
+                                            target_n,
+                                            g.as_ref().map(|g| g.word == target_n).unwrap_or(false),
+                                            within_guard,
+                                        );
+                                    }
+                                }
                                 // Same-day slip rate (Statistics): a motor typo
                                 // (not a semantic rewrite) is a slip, split
                                 // coordination vs precision. Derived from the
@@ -1136,23 +1789,26 @@ fn tick_resolver<R: Runtime>(
                                 if let Some(class) = classify_slip(&rec.original_text, c) {
                                     tally.add_slip(class);
                                 }
-                                if word_patterns
-                                    .observe_correction(outcome, &rec.original_text, c, now)
-                                    .recorded
+                                if target_recordable
+                                    && word_patterns
+                                        .observe_correction(outcome, &rec.original_text, c, now)
+                                        .recorded
                                 {
                                     funnel.word_patterns_observed += 1;
                                     // Read-only (kill-switch OFF): log what this
                                     // just-updated pattern WOULD be classified as,
                                     // so the M3 decision is observable as evidence
-                                    // accrues (e.g. the flip to Tier1Ready when
-                                    // weight crosses the threshold). No injection.
+                                    // accrues (e.g. the flip to Suggest when weight
+                                    // crosses the risk-tiered bar). No injection.
                                     let readiness = correction_engine::classify(
                                         &rec.original_text,
                                         c,
                                         word_patterns,
                                         Lexicon::shared(),
+                                        motor_map,
                                     );
-                                    tracing::info!(
+                                    // debug!, not info!: prints raw typed + target words (privacy).
+                                    tracing::debug!(
                                         "KILL_SWITCH_CLASSIFY typed={:?} target={:?} -> {:?}",
                                         rec.original_text,
                                         c,
@@ -1263,44 +1919,411 @@ fn flush_word_patterns(
     }
 }
 
+/// Flush the live word-frequency tally (C5e) on the same time cadence as
+/// [`flush_motor_map`] — its own file, its own last-save clock. Observe-only;
+/// no pruning (it does not decay). Returns whether a write succeeded.
+fn flush_word_freq(
+    word_freq: &mut WordFreq,
+    path: Option<&Path>,
+    now: u64,
+    last_save_ms: &mut u64,
+) -> bool {
+    if !word_freq.has_unsaved() {
+        return false;
+    }
+    if now.saturating_sub(*last_save_ms) < MOTOR_FLUSH_INTERVAL_MS {
+        return false;
+    }
+    let Some(path) = path else {
+        return false; // no HOME — in-memory only this session
+    };
+    match word_freq.save_to(path) {
+        Ok(()) => {
+            *last_save_ms = now;
+            tracing::info!(
+                "WORD_FREQ_SAVED (flush) words={} tokens={:.0} path={:?}",
+                word_freq.len(),
+                word_freq.total_count(),
+                path
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!("word-freq tally flush save failed: {e}");
+            false
+        }
+    }
+}
+
+/// Flush the guesser accuracy scoreboard to its own file on the same time
+/// cadence as the other live stores. Observe-only measurement — no pruning (an
+/// accuracy row is history, not a decayed learner). Returns whether a write
+/// succeeded this call.
+fn flush_guess_ledger(
+    ledger: &mut GuessLedger,
+    path: Option<&Path>,
+    now: u64,
+    last_save_ms: &mut u64,
+) -> bool {
+    if !ledger.has_unsaved() {
+        return false;
+    }
+    if now.saturating_sub(*last_save_ms) < MOTOR_FLUSH_INTERVAL_MS {
+        return false;
+    }
+    let Some(path) = path else {
+        return false; // no HOME — in-memory only this session
+    };
+    match ledger.save_to(path) {
+        Ok(()) => {
+            *last_save_ms = now;
+            tracing::info!(
+                "GUESS_LEDGER_SAVED (flush) patterns={} tries={} hits={} path={:?}",
+                ledger.len(),
+                ledger.overall().tries,
+                ledger.overall().hits,
+                path
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!("guess-accuracy ledger flush save failed: {e}");
+            false
+        }
+    }
+}
+
+/// Observe-only accuracy readout (M3 Phase 1). Counts-only at `info!` (text-free
+/// — safe at the default level): overall and within-guard hit-rate plus the
+/// τ-sweep. The per-pattern `typed → guess` rows carry raw words, so they go at
+/// `debug!` only (privacy — mirrors the word-pattern dumps). No-op when empty.
+/// Emitted alongside the 60s funnel dump.
+fn dump_guess_accuracy(ledger: &GuessLedger) {
+    let o = ledger.overall();
+    if o.tries == 0 {
+        return;
+    }
+    let rate = |hits: u64, tries: u64| {
+        if tries == 0 {
+            0.0
+        } else {
+            100.0 * hits as f64 / tries as f64
+        }
+    };
+    let by_tau: Vec<String> = o
+        .by_tau
+        .iter()
+        .map(|b| {
+            format!(
+                "{:.1}:{:.0}%({}/{})",
+                b.tau,
+                rate(b.hits, b.fired),
+                b.hits,
+                b.fired
+            )
+        })
+        .collect();
+    tracing::info!(
+        "GUESS_ACCURACY_DUMP tries={} hits={} rate={:.0}% within_guard={{tries: {}, hits: {}, rate: {:.0}%}} by_tau=[{}]",
+        o.tries,
+        o.hits,
+        rate(o.hits, o.tries),
+        o.within_guard_tries,
+        o.within_guard_hits,
+        rate(o.within_guard_hits, o.within_guard_tries),
+        by_tau.join(" "),
+    );
+    // debug!, not info!: per-pattern rows print raw typed + guess words.
+    for (typed, acc) in ledger.rows() {
+        tracing::debug!(
+            "GUESS_ACCURACY_ROW typed={:?} tries={} hits={} last_guess={:?} last_conf={:.2} last_target={:?}",
+            typed,
+            acc.tries,
+            acc.hits,
+            acc.last_guess.as_deref(),
+            acc.last_confidence,
+            acc.last_target,
+        );
+    }
+}
+
+/// Persist the allow-list (the engine is its sole writer) and broadcast the new
+/// state on [`EVT_CORRECTION_STATE`] so the panel + tray master toggle reflect
+/// the engine's authoritative state. A save failure is logged but not fatal —
+/// the in-memory state stays correct for this session, and the next mutation
+/// retries the write.
+fn persist_and_emit_allow_list<R: Runtime>(
+    app: &AppHandle<R>,
+    allow_list: &crate::allow_list::AllowList,
+    path: Option<&Path>,
+) {
+    if let Some(path) = path {
+        if let Err(e) = allow_list.save_to(path) {
+            tracing::warn!("allow-list save failed: {e}");
+        }
+    }
+    let _ = app.emit(EVT_CORRECTION_STATE, allow_list.clone());
+}
+
+/// Write an `InjectCorrection` to the sidecar's stdin: delete the last
+/// `delete_count` characters back from the caret, then type `replacement`
+/// (which already carries the trailing boundary char). The sidecar tags the
+/// synthesized CGEvents (`eventSourceUserData`) so the tap drops their echo —
+/// the engine never sees its own injection, so it can't re-learn or re-correct
+/// it. Returns whether the command was written (a dead stdin returns false).
+fn send_inject_correction(
+    child: &mut tauri_plugin_shell::process::CommandChild,
+    delete_count: u32,
+    replacement: String,
+) -> bool {
+    let cmd = OutboundCommand::InjectCorrection {
+        delete_count,
+        replacement,
+    };
+    let mut line = match serde_json::to_string(&cmd) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("failed to serialize InjectCorrection: {e}");
+            return false;
+        }
+    };
+    line.push('\n');
+    match child.write(line.as_bytes()) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("InjectCorrection write to sidecar failed: {e}");
+            false
+        }
+    }
+}
+
+/// Anchored replace (M3 bubble accept-after-typing-on): Left × `left`,
+/// Backspace × `delete_count`, type `replacement`, Right × `right`. The whole
+/// burst echoes back through the tap; the caller adds `left + delete_count +
+/// replacement.chars() + right` to `pending_echo` to drop it.
+fn send_inject_anchored(
+    child: &mut tauri_plugin_shell::process::CommandChild,
+    left: u32,
+    delete_count: u32,
+    replacement: String,
+    right: u32,
+) -> bool {
+    let cmd = OutboundCommand::InjectAnchored {
+        left,
+        delete_count,
+        replacement,
+        right,
+    };
+    let mut line = match serde_json::to_string(&cmd) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("failed to serialize InjectAnchored: {e}");
+            return false;
+        }
+    };
+    line.push('\n');
+    match child.write(line.as_bytes()) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("InjectAnchored write to sidecar failed: {e}");
+            false
+        }
+    }
+}
+
+/// One line of the live shadow dry-run: the strongest learned pattern for a
+/// just-typed word that the classifier WOULD surface as a suggestion. Read-only.
+struct ShadowSuggestion {
+    typed: String,
+    target: String,
+    tier: &'static str,
+    /// Decayed evidence weight the classifier saw (the "N obs" count).
+    evidence: f32,
+    /// How far off the slip was — Levenshtein edit distance typed→target.
+    edit_distance: usize,
+    /// Most-affected involved key's slip rate, `[0,1]` (the Motor-Map signal).
+    affectedness: f32,
+    /// The evidence bar actually applied (eased by affectedness).
+    bar_used: f32,
+    /// The un-eased tier base bar — what would apply with no motor evidence.
+    base_bar: f32,
+    /// This suggestion surfaced ONLY because the affected-key bonus eased the
+    /// bar (weight is below the base bar). The signal to watch for sharp-vs-noisy.
+    surfaced_early: bool,
+}
+
+/// Observe-only dry run: for a just-sealed `typed` word, return the strongest
+/// learned `typed → target` pattern the risk-tiered, Motor-Map-aware classifier
+/// WOULD surface as a suggestion, or `None`. Applies nothing — pure read over the
+/// store + lexicon + motor map. `snapshots()` is strongest-first, so the first
+/// matching `Suggest` is the best.
+///
+/// Uses the **length-scaled shadow curve** (`classify_explained_scaled`): a
+/// length-scaled non-word evidence bar (2–3 → 4, 4–6 → 3, 7+ → 1; real-word
+/// source unchanged at the high bar) and a length-scaled motor-edit budget (2–3 →
+/// 1, 4+ → up to 2). Every other gate is unchanged, and nothing is ever applied
+/// (`correction_enabled` stays off) — this only changes what the dry-run log says
+/// it WOULD suggest. The live Impact ledger and KILL_SWITCH_CLASSIFY line keep the
+/// flat 4/12 + budget-1 classifier.
+fn shadow_suggestion(
+    typed: &str,
+    store: &WordPatternStore,
+    lexicon: &Lexicon,
+    motor_map: &MotorMap,
+) -> Option<ShadowSuggestion> {
+    let typed_n = normalize_word(typed);
+    if typed_n.is_empty() {
+        return None;
+    }
+    for s in store.snapshots() {
+        if s.typed != typed_n {
+            continue;
+        }
+        let ex = correction_engine::classify_explained_scaled(
+            &s.typed, &s.target, store, lexicon, motor_map,
+        );
+        if let PatternReadiness::Suggest { tier } = ex.readiness {
+            let tier = match tier {
+                correction_engine::SuggestTier::NonWordSource => "non_word_source",
+                correction_engine::SuggestTier::RealWordSource => "real_word_source",
+            };
+            let edit_distance = correction_engine::edit_distance(&s.typed, &s.target);
+            return Some(ShadowSuggestion {
+                typed: s.typed,
+                target: s.target,
+                tier,
+                evidence: s.weight,
+                edit_distance,
+                affectedness: ex.affectedness,
+                bar_used: ex.bar_used,
+                base_bar: ex.base_bar,
+                surfaced_early: ex.surfaced_early,
+            });
+        }
+    }
+    None
+}
+
+/// Append one shadow-suggestion line to the tail-able dry-run log. Best-effort:
+/// a write failure is logged and dropped (the dry run must never disturb the
+/// pipeline). The line is human-readable and `tail -f`-friendly. An `EARLY`
+/// marker flags suggestions that surfaced only via the affected-key bonus, with
+/// the affectedness score and the bar used, so the builder can judge sharp vs noisy.
+fn append_shadow_log(path: &Path, now: u64, s: &ShadowSuggestion) {
+    use std::io::Write;
+    let marker = if s.surfaced_early {
+        "  EARLY(affected-key bonus)"
+    } else {
+        ""
+    };
+    let line = format!(
+        "{now} would-suggest  {} -> {}  tier={}  evidence={:.1}  edit_dist={}  affected={:.2}  bar={:.1}/{:.1}{}\n",
+        s.typed,
+        s.target,
+        s.tier,
+        s.evidence,
+        s.edit_distance,
+        s.affectedness,
+        s.bar_used,
+        s.base_bar,
+        marker,
+    );
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                tracing::warn!("shadow log write failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("shadow log open failed: {e}"),
+    }
+}
+
+/// Append one **bold** convergence line to the shadow log: a non-word that
+/// converges on exactly one base-dictionary word (the dictionary-driven,
+/// first-sighting signal). Distinct `would-suggest(bold)` tag, and includes the
+/// candidate count, the non-word flag, and the motor-map affectedness of the
+/// edit's keys (even when ~0 today). Applies nothing. Best-effort, like
+/// [`append_shadow_log`].
+fn append_shadow_bold_log(path: &Path, now: u64, typed: &str, scan: &correction_engine::ConvergenceScan) {
+    use std::io::Write;
+    // The fire target — the lone candidate, or the frequency-dominant one when
+    // several were reachable (so NOT necessarily `candidates.first()`).
+    let candidate = scan.target.as_deref().unwrap_or("");
+    let line = format!(
+        "{now} would-suggest(bold)  {} -> {}  candidates={}  nonword={}  budget={}  affected={:.2}  first-sighting\n",
+        typed,
+        candidate,
+        scan.candidates.len(),
+        scan.typed_is_non_word,
+        scan.budget,
+        scan.affectedness,
+    );
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                tracing::warn!("shadow bold log write failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("shadow bold log open failed: {e}"),
+    }
+}
+
 /// Read-only (kill-switch OFF): classify every learned pattern and log a
 /// summary, so the M3 decision is observable against real accumulating data
-/// BEFORE anything is ever injected. Counts by readiness and lists the
-/// patterns that WOULD act (Tier-1) or suggest (Tier-2), with their reason and
-/// decayed weight. Emitted alongside the 60s funnel dump. No injection — this
-/// only surfaces what the classifier *would* decide. No-op on an empty store.
-fn dump_classifications(store: &WordPatternStore) {
+/// BEFORE anything is ever suggested. Counts by readiness and lists the patterns
+/// that WOULD surface a (confirm-to-accept) suggestion, with their evidence tier
+/// and decayed weight. Emitted alongside the 60s funnel dump. No injection —
+/// this only surfaces what the classifier *would* decide. No-op on an empty
+/// store. (There is no silent path: every correction is a suggestion.)
+fn dump_classifications(store: &WordPatternStore, motor_map: &MotorMap) {
     if store.is_empty() {
         return;
     }
     let lexicon = Lexicon::shared();
-    let (mut tier1, mut tier2, mut silent) = (0u32, 0u32, 0u32);
+    let (mut suggest, mut observe) = (0u32, 0u32);
     let mut actionable: Vec<String> = Vec::new();
     for snap in store.snapshots() {
-        match correction_engine::classify(&snap.typed, &snap.target, store, lexicon) {
-            PatternReadiness::Tier1Ready => {
-                tier1 += 1;
+        let ex = correction_engine::classify_explained(
+            &snap.typed,
+            &snap.target,
+            store,
+            lexicon,
+            motor_map,
+        );
+        match ex.readiness {
+            PatternReadiness::Suggest { tier } => {
+                suggest += 1;
+                let early = if ex.surfaced_early { " EARLY" } else { "" };
                 actionable.push(format!(
-                    "{}→{} TIER1 w={:.1}",
-                    snap.typed, snap.target, snap.weight
+                    "{}→{} SUGGEST({:?}) w={:.1} affected={:.2} bar={:.1}/{:.1}{}",
+                    snap.typed,
+                    snap.target,
+                    tier,
+                    snap.weight,
+                    ex.affectedness,
+                    ex.bar_used,
+                    ex.base_bar,
+                    early
                 ));
             }
-            PatternReadiness::Tier2Only { reason } => {
-                tier2 += 1;
-                actionable.push(format!(
-                    "{}→{} TIER2({:?}) w={:.1}",
-                    snap.typed, snap.target, reason, snap.weight
-                ));
-            }
-            PatternReadiness::Silent { .. } => silent += 1,
+            PatternReadiness::Observe { .. } => observe += 1,
         }
     }
-    tracing::info!(
-        "KILL_SWITCH_DUMP patterns={} tier1={} tier2={} silent={} actionable={:?}",
+    // debug!, not info!: `actionable` lists raw typed→target word pairs (privacy).
+    // Counts live in FUNNEL_DUMP (text-free), which stays at info.
+    tracing::debug!(
+        "KILL_SWITCH_DUMP patterns={} suggest={} observe={} actionable={:?}",
         store.len(),
-        tier1,
-        tier2,
-        silent,
+        suggest,
+        observe,
         actionable
     );
 }
@@ -1390,12 +2413,13 @@ fn emit_sealed_token<R: Runtime>(
         // bursts on every backspace, with the same N anchor ids
         // repeating across three back-to-back backspace replays.
         let Some(anchor_id) = anchors.try_register(tok.start, tok.end, &tok.core) else {
-            tracing::info!("REPLAY-SKIP-EMIT tok_core={:?}", tok.core);
+            // debug!, not info!: tok.core is the raw typed word (privacy).
+            tracing::debug!("REPLAY-SKIP-EMIT tok_core={:?}", tok.core);
             let _ = app.emit(EVT_TOKEN, tok);
             return;
         };
 
-        // Funnel (Principle #8): a fresh Word/Acronym seal. Counted here —
+        // Funnel (Principle #7): a fresh Word/Acronym seal. Counted here —
         // the single fresh-seal chokepoint — so replays don't inflate it.
         funnel.tokens_sealed += 1;
 
@@ -1456,7 +2480,8 @@ fn emit_sealed_token<R: Runtime>(
         // DECISION fires for every Word token (known included — its reason
         // is `known`). The FEED needs one row per word so the builder can
         // see why each token did or didn't fire.
-        tracing::info!("EMIT_DECISION tok_core={:?}", tok.core);
+        // debug!, not info!: tok.core is the raw typed word (privacy).
+        tracing::debug!("EMIT_DECISION tok_core={:?}", tok.core);
         let _ = app.emit(
             EVT_DECISION,
             DecisionPayload {
@@ -1500,7 +2525,8 @@ fn emit_sealed_token<R: Runtime>(
                 &[][..]
             };
             let token_motor = Some(measure_token_motor(span_dwells));
-            tracing::info!("LEDGER_APPEND anchor_id={} core={:?}", anchor_id, tok.core);
+            // debug!, not info!: tok.core is the raw typed word (privacy).
+            tracing::debug!("LEDGER_APPEND anchor_id={} core={:?}", anchor_id, tok.core);
             let new_id = ledger.append(
                 ts,
                 outcome,
@@ -1599,6 +2625,15 @@ const HEARTBEAT_STOPPED_MS: u128 = 15_000;
 /// when nothing has changed — so a panel that just mounted converges
 /// to truth without waiting for a transition.
 const HEALTH_REPEAT_TICKS: u64 = 5;
+/// How long capture must stay continuously non-`Live` before the menu-bar UI
+/// declares it not-active (drives [`EVT_CAPTURE_UI`]). Measured from the moment
+/// health *left* `Live`. Sized to clear the whole self-heal window: a disabled
+/// tap re-arms in the sidecar within ~2s, and a dead sidecar is auto-respawned
+/// at [`HEARTBEAT_STOPPED_MS`] (15s) with its first fresh heartbeat ~2s later —
+/// so 16s gives that one automatic respawn time to land before we alarm. A
+/// transient blip recovers to `Live` (clearing the timer) long before this, so
+/// the icon never strobes; only a genuine, persistent stop trips it.
+const NOT_ACTIVE_DEBOUNCE_MS: u128 = 16_000;
 
 /// Spawn (or respawn) the Swift sidecar — `app.shell().sidecar()` plus
 /// the `TYPEASSIST_AX_PROMPT=1` env that opts into the macOS
@@ -1799,6 +2834,39 @@ pub fn spawn<R: Runtime>(
             },
             _ => MotorMap::new(),
         };
+        // C5e local vocabulary tally — counts is_known words the user types
+        // correctly and leaves in place, for a FUTURE personal-frequency
+        // candidate-ranking experiment (observe-only; nothing reads it back
+        // into correction yet). Its own file beside the motor map; load-fail
+        // keeps going in memory rather than clobbering a recoverable file.
+        // Privacy-gated to is_known words, so the file can never hold a name,
+        // password, ID, or any out-of-dictionary string.
+        let word_freq_path = word_freq_path();
+        let word_freq_snapshots_dir = word_freq_snapshots_dir();
+        let mut word_freq = match word_freq_path.as_deref() {
+            Some(path) if path.exists() => match WordFreq::load_from(path) {
+                Ok(wf) => {
+                    tracing::info!(
+                        "WORD_FREQ_LOADED words={} tokens={:.0} path={:?}",
+                        wf.len(),
+                        wf.total_count(),
+                        path
+                    );
+                    wf
+                }
+                Err(e) => {
+                    tracing::warn!("word-freq tally load failed ({e}); starting fresh in memory");
+                    WordFreq::new()
+                }
+            },
+            _ => WordFreq::new(),
+        };
+        let mut last_word_freq_save_ms: u64 = 0;
+        // C5e: while a warm-up / Practice round is on screen, typed text is
+        // app-generated, so the word-freq tally skips it (the motor map still
+        // observes — that's the point of practice). Flipped by
+        // `EngineControl::SetPromptedCaptureActive` from the panel's show/hide.
+        let mut prompted_capture_active = false;
         // C5d word-pattern store — learns typed→target word corrections,
         // observe-only (kill-switch OFF). Its own file beside the motor map;
         // load-fail keeps going in memory rather than clobbering a recoverable
@@ -1826,12 +2894,71 @@ pub fn spawn<R: Runtime>(
             _ => WordPatternStore::new(),
         };
         let mut last_word_patterns_save_ms: u64 = 0;
+        // Guesser accuracy scoreboard (M3 Phase 1, observe-only) — measures how
+        // often the guesser's top guess matches the user's actual fix. Its own
+        // file beside the word-pattern store; load-fail keeps going in memory
+        // rather than clobbering a recoverable file. Never read back into
+        // correction — measurement only.
+        let guess_accuracy_path = guess_accuracy_path();
+        let mut guess_ledger = match guess_accuracy_path.as_deref() {
+            Some(path) if path.exists() => match GuessLedger::load_from(path) {
+                Ok(ledger) => {
+                    tracing::info!(
+                        "GUESS_LEDGER_LOADED patterns={} tries={} hits={} path={:?}",
+                        ledger.len(),
+                        ledger.overall().tries,
+                        ledger.overall().hits,
+                        path
+                    );
+                    ledger
+                }
+                Err(e) => {
+                    tracing::warn!("guess-accuracy ledger load failed ({e}); starting fresh");
+                    GuessLedger::new()
+                }
+            },
+            _ => GuessLedger::new(),
+        };
+        let mut last_guess_ledger_save_ms: u64 = 0;
+        // M3 correction Step 1 — the manual correction allow-list + master
+        // gate. The engine task is its sole writer; loaded once here, mutated
+        // in-memory on EngineControl + Escape-undo, flushed atomically. A
+        // load failure keeps going with the shipped-dark default (gate off, no
+        // patterns) rather than clobbering the user's curated file — but, since
+        // the default would silently disable corrections, it is logged loud.
+        let allow_list_path = allow_list_path();
+        let mut allow_list = match allow_list_path.as_deref() {
+            Some(path) => match crate::allow_list::AllowList::load_from(path) {
+                Ok(al) => {
+                    tracing::info!(
+                        "ALLOW_LIST_LOADED enabled={} patterns={} path={:?}",
+                        al.correction_enabled,
+                        al.patterns.len(),
+                        path
+                    );
+                    al
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "allow-list load failed ({e}); corrections OFF this session (shipped-dark default)"
+                    );
+                    crate::allow_list::AllowList::new()
+                }
+            },
+            None => crate::allow_list::AllowList::new(),
+        };
         // C5c motor ledger — the motor map's own record stream: EVERY
         // motor-evidenced sealed word (known included), lean records the
         // shared resolver verdicts. Decouples the motor map from the
         // decision ledger's lexicon Known-skip (the sealed→verdict cliff).
         // In-memory only, like the decision ledger.
         let mut motor_ledger = MotorLedger::new();
+        // Watch Dog Not Attack Dog (M3 autocorrect coexistence): behavioural
+        // sense of an active competing corrector. Global (decision ii), so no
+        // app identity is ever held. Fed by host-redundant footprints in
+        // `tick_resolver`; read by the fire gate; reset on focus change; decayed
+        // by the watchdog.
+        let mut competitor_sense = CompetitorSense::default();
         // Daily-snapshot bookkeeping (Principle #6): the calendar date whose
         // snapshot we've already handled this run, seeded from the newest dated
         // file on disk so the first event of a *new* calendar day is detected
@@ -1859,13 +2986,60 @@ pub fn spawn<R: Runtime>(
             // the watchdog only acts when the calendar day rolls over.
             last_snapshot_date = Some(ymd_from_epoch_ms(now));
         }
+        // C5e word-tally daily snapshot bookkeeping (Principle #6) — its own
+        // directory + date guard, mirroring the motor map. Startup snapshot
+        // preserves the as-loaded tally before the loop mutates it.
+        let mut last_word_freq_snapshot_date: Option<(i64, u32, u32)> = word_freq_snapshots_dir
+            .as_deref()
+            .and_then(most_recent_snapshot_ms)
+            .map(ymd_from_epoch_ms);
+        if let Some(dir) = word_freq_snapshots_dir.as_deref() {
+            let now = now_ms();
+            let today = dir.join(format!("{}.json", snapshot_date(now)));
+            if !today.exists() {
+                let _ = std::fs::create_dir_all(dir);
+                match word_freq.write_snapshot(&today) {
+                    Ok(()) => tracing::info!("WORD_FREQ_SNAPSHOT_STARTUP path={today:?}"),
+                    Err(e) => tracing::warn!("startup word-freq snapshot failed: {e}"),
+                }
+            }
+            last_word_freq_snapshot_date = Some(ymd_from_epoch_ms(now));
+        }
         // Last time the live motor map was flushed to disk. Drives the
         // periodic flush (see `flush_motor_map`); 0 means "never this
         // session" so the first dirty watchdog tick flushes promptly.
         let mut last_motor_save_ms: u64 = 0;
-        // Capture-integrity funnel (Principle #8). Per-session boundary
+        // Capture-integrity funnel (Principle #7). Per-session boundary
         // counters; dumped on the Cmd+Shift+F chord and every 60s.
         let mut funnel = Funnel::new(now_ms());
+        // Build marker (Principle #7 observability): one line at engine startup so
+        // the dev Terminal proves WHICH build is running — the bubble suggest path
+        // (fire from the classifier, accept via ShiftTap), not a stale engine.
+        tracing::info!(
+            "ENGINE_BUILD feature=correction_bubble fire_lane=classifier \
+             suggest_event=corrections://suggested accept=shift_tap undo=revert_only"
+        );
+        // M3 correction bubble: the last APPLIED fix, retained so a single Escape
+        // within `UNDO_WINDOW_MS` reverts it (revert only — no teach-stop).
+        // Disarmed on revert, on any other keystroke (implicit commit), and on
+        // window timeout (watchdog).
+        let mut last_correction: Option<LastCorrection> = None;
+        // M3 correction bubble: the correction currently SUGGESTED (bubble up),
+        // armed at seal and accepted by an isolated Shift tap. Cleared by any
+        // keystroke past the word, a caret move, the ~5s timeout, or a newer
+        // suggestion — so an accept only ever injects against the live caret.
+        let mut pending_suggestion: Option<PendingSuggestion> = None;
+        // Count of injected events (backspaces + replacement chars) we still
+        // expect to see echoed back through the L1 tap. The tap re-captures our
+        // own injection (`.cgSessionEventTap` sees posted events), so each
+        // correction's keystrokes stream back in; we skip exactly this many so
+        // they never reach the pipeline (no re-learn, no buffer desync, and —
+        // critically — they don't disarm the undo before the user's Escape).
+        // Counting-based on purpose: an `eventSourceUserData` tag did NOT
+        // survive the post→tap round-trip in practice. The echo arrives
+        // back-to-back (~1 ms apart), far faster than a human, so it always
+        // drains before the next real key.
+        let mut pending_echo: u32 = 0;
         // Progress Statistics: the current day's live word/slip tally, seeded
         // from disk so a mid-day restart resumes today's counts rather than
         // resetting them. The watchdog upserts + rolls it (see `tick_progress`).
@@ -1915,6 +3089,9 @@ pub fn spawn<R: Runtime>(
         let mut last_heartbeat_at: Option<Instant> = None;
         let mut current_capture_health: CaptureHealth = CaptureHealth::Unknown;
         let mut respawn_attempts: Vec<Instant> = Vec::new();
+        // Last time a keystroke (Key/Backspace) arrived — drives the idle
+        // line-buffer reset (desync recovery). See [`LINE_IDLE_RESET_MS`].
+        let mut last_text_input_at: Instant = Instant::now();
 
         // **Capture-health watchdog** — ticks every 1s, reads
         // `last_heartbeat_at` to derive freshness, and drives
@@ -1927,9 +3104,26 @@ pub fn spawn<R: Runtime>(
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut watchdog_ticks: u64 = 0;
 
-        // Last menu-bar dot state (Some(true) = dot shown). `None` until the
-        // first stability emit, so the icon is set once we know the state.
-        let mut last_tray_dot: Option<bool> = None;
+        // Menu-bar icon state, reconciled from two signals (capture-stopped +
+        // practice-dot). `last_tray_icon` is the last `(not_active, practice_dot)`
+        // actually pushed to the OS (`None` until the first set). `current_practice_dot`
+        // persists the latest badge decision between stability emits so a
+        // health-driven icon refresh keeps the badge correct.
+        let mut last_tray_icon: Option<(bool, bool)> = None;
+        let mut current_practice_dot = false;
+
+        // Debounced menu-bar "capture active?" state (drives EVT_CAPTURE_UI).
+        // `non_live_since` = when health last LEFT Live (None while Live), so the
+        // debounce is measured from the start of the outage; `ui_not_active` is
+        // the settled flag the UI renders. `permission_ok` tracks the sidecar's
+        // Accessibility grant — flipped false on a `PermissionRequired`, true on
+        // any heartbeat (a heartbeat means the sidecar built a tap → grant in
+        // effect) — and chooses the recovery action. `last_ui_emit` dedupes the
+        // EVT_CAPTURE_UI emit.
+        let mut non_live_since: Option<Instant> = None;
+        let mut ui_not_active = false;
+        let mut permission_ok = true;
+        let mut last_ui_emit: Option<CaptureUiEvent> = None;
 
         // The receive loop selects between the sidecar event stream,
         // the control channel, and the capture-health watchdog so:
@@ -1995,12 +3189,46 @@ pub fn spawn<R: Runtime>(
                         continue;
                     };
 
+                    // FIRE_TIMING t0 — wall-clock instant the engine received this
+                    // keystroke line from the L1 sidecar. `now_ms()` is UNIX-epoch
+                    // ms, the SAME clock as the webview's `Date.now()`, so the t0..t4
+                    // stamps logged across Rust + JS are directly comparable. Used
+                    // only by the suggestion fire site below; harmless on other
+                    // events. (Measurement only — does not affect firing.)
+                    let t_recv = now_ms();
+
                     // Hard pause: drop keystrokes at the engine boundary.
                     // Lifecycle events (Ready/PermissionRequired/Shutdown)
                     // still flow — those aren't input, they're the sidecar
                     // telling us what state it's in. Continues the outer
                     // 'engine_loop so the next sidecar event (or control
                     // command) is awaited.
+                    // M3 correction Step 1 — drop our own injection echo. The
+                    // tap re-captures the keystrokes we posted to apply a
+                    // correction (or its undo); skip exactly the number we
+                    // injected so they never enter the pipeline. Echo is NOT
+                    // user input, so this is BEFORE the funnel counts it — and
+                    // before the undo block, so the echo can't disarm a pending
+                    // Escape undo. See `pending_echo`.
+                    if pending_echo > 0
+                        && matches!(
+                            parsed,
+                            InputEvent::Key { .. } | InputEvent::Backspace { .. }
+                        )
+                    {
+                        pending_echo -= 1;
+                        continue;
+                    }
+
+                    // M3 bubble gating: a pending suggestion stays ACCEPTABLE while
+                    // the user types ON (anchored accept), but is dropped the moment
+                    // they do anything that isn't a clean forward keystroke. The
+                    // per-event keep/dismiss decision lives in the Key / Backspace
+                    // arms (which know forward-vs-edit-vs-nav); here we only handle
+                    // the simplest case — a Backspace is always an edit, so dismiss.
+                    // (Bias hard toward dismiss: a missed accept is fine, a
+                    // wrong-place edit is not.)
+
                     // Funnel L1 boundary: count every raw typing event from
                     // the sidecar BEFORE any filtering (pause / modifier /
                     // non-text), so `received` is the true denominator.
@@ -2009,6 +3237,10 @@ pub fn spawn<R: Runtime>(
                         InputEvent::Key { .. } | InputEvent::Backspace { .. }
                     ) {
                         funnel.keystrokes_received += 1;
+                        // Mark activity for the idle line-buffer reset: any
+                        // keystroke means the user is present, so the buffer
+                        // is not stale yet.
+                        last_text_input_at = Instant::now();
                     }
 
                     if input_paused
@@ -2096,11 +3328,26 @@ pub fn spawn<R: Runtime>(
                         InputEvent::Ready => {
                             tracing::info!("sidecar ready — engine listening");
                         }
+                        InputEvent::AutorepeatDropped => {
+                            // L1 dropped a non-backspace auto-repeat keystroke.
+                            // Count it so capture loss is visible (Principle #7);
+                            // it carries no content and feeds no pipeline stage.
+                            funnel.autorepeat_dropped += 1;
+                        }
                         InputEvent::PermissionRequired => {
                             tracing::warn!(
-                                "sidecar reports Accessibility permission missing — \
-                                 grant in System Settings › Privacy & Security › Accessibility"
+                                "sidecar reports a capture permission missing — grant in \
+                                 System Settings › Privacy & Security › Accessibility AND \
+                                 Input Monitoring (capture needs both; an update can revoke \
+                                 either independently)"
                             );
+                            // A required grant is gone (Accessibility OR Input
+                            // Monitoring — the tap needs Input Monitoring, the AX
+                            // API needs Accessibility), revoked or never granted.
+                            // Remember it so the not-active menu surfaces
+                            // "Reconnect…" rather than "Restart capture" — only
+                            // re-granting can recover.
+                            permission_ok = false;
                         }
                         InputEvent::Heartbeat { tap_enabled, .. } => {
                             // Capture-health proof-of-life. Stamp the
@@ -2112,6 +3359,12 @@ pub fn spawn<R: Runtime>(
                             // last_heartbeat_at to drive staleness
                             // transitions when this arm isn't firing.
                             last_heartbeat_at = Some(Instant::now());
+                            // A heartbeat means the sidecar is alive and built a
+                            // CGEventTap — which requires BOTH the Accessibility
+                            // and Input Monitoring grants — so permissions are in
+                            // effect again (clears a prior revoke once the
+                            // re-grant(s) take hold).
+                            permission_ok = true;
                             let new_health = if tap_enabled {
                                 CaptureHealth::Live
                             } else {
@@ -2123,8 +3376,231 @@ pub fn spawn<R: Runtime>(
                                 new_health,
                             );
                         }
+                        InputEvent::PermissionStatus {
+                            accessibility,
+                            input_monitoring,
+                        } => {
+                            // Per-grant snapshot from the sidecar (read-only AX +
+                            // IOHID checks). Forward it verbatim to the UI so the
+                            // onboarding / Reconnect permission rows can tick each
+                            // grant the moment ITS own permission lands. Emitted on
+                            // every receipt (not transition-gated) so a window that
+                            // opens mid-flow converges to truth within a poll cycle.
+                            // Independent of capture-health: `live` (both grants +
+                            // tap armed) remains the gate for "capture is running".
+                            // Not a keystroke — nothing to count in the funnel.
+                            let _ = app_handle.emit(
+                                EVT_PERMISSION_STATUS,
+                                PermissionStatusEvent {
+                                    accessibility,
+                                    input_monitoring,
+                                },
+                            );
+                        }
                         InputEvent::Shutdown => break 'engine_loop,
+                        InputEvent::CaretMoved { reason } => {
+                            // Fix-B: the L1 adapter saw a gesture that can move
+                            // the caret somewhere we can't dead-reckon — a
+                            // mouse/trackpad click or a focus/app change. Reset
+                            // the line model so a live correction can't fire
+                            // against a stale buffer. Content-free event: nothing
+                            // to ingest, nothing to count in the funnel.
+                            let trigger = reason.as_deref().unwrap_or("caret");
+                            reset_line_for_caret_move(
+                                &app_handle,
+                                &mut tokenizer,
+                                &mut line_buf,
+                                &mut line_dwells,
+                                &mut caret,
+                                &mut anchors,
+                                &mut last_correction,
+                                trigger,
+                            );
+                            // Watch Dog re-arm: an app/focus change means a
+                            // possibly different corrector regime, so hard-reset
+                            // the competitor sense and fire normally again (fail
+                            // toward firing). ONLY on focus — a mouse click or
+                            // up/down within the same app keeps the sense (the
+                            // same competitor is still active). Content-free.
+                            if trigger == "focus" {
+                                competitor_sense.reset();
+                            }
+                            // The caret moved off the boundary — a pending bubble
+                            // could no longer inject safely. Drop it and hide it.
+                            if pending_suggestion.take().is_some() {
+                                let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                            }
+                        }
+                        InputEvent::ShiftTap { .. } => {
+                            // M3 bubble ACCEPT — an isolated Shift tap applies the
+                            // pending suggestion. This is the ONLY path that
+                            // injects (seal no longer auto-applies). Valid only
+                            // while the suggestion is still armed (caret at the
+                            // word boundary), so the deferred delete+retype lands
+                            // in the right place. No suggestion → a bare Shift is a
+                            // harmless no-op.
+                            if let Some(ps) = pending_suggestion.take() {
+                                // `after_len` = chars from the word's end to the
+                                // caret now (the boundary + anything typed since).
+                                // 1 = immediate (caret still at the boundary);
+                                // >1 = the caret moved on → anchored replace.
+                                let after_len = caret.saturating_sub(ps.word_end);
+                                // Fail-safe accept gate. Garbling the user's text is
+                                // the one outcome we refuse, so Shift injects ONLY
+                                // when the edit can be placed exactly:
+                                //   * IMMEDIATE (after_len == 1) — caret still right
+                                //     after the word; the proven no-arrows delete+
+                                //     retype. Always allowed.
+                                //   * ANCHORED (caret typed past the word) — allowed
+                                //     only when ANCHORED_ACCEPT_ENABLED *and* the line
+                                //     model still holds the original word at the
+                                //     anchored position. Currently DISABLED (a drifted
+                                //     dead-reckoned caret doubled a word); see
+                                //     ANCHORED_ACCEPT_ENABLED / word_at_anchor.
+                                // Anything else dismisses — a missed accept is fine.
+                                let immediate = after_len == 1;
+                                let anchored_ok = ANCHORED_ACCEPT_ENABLED
+                                    && caret > ps.word_end
+                                    && after_len > 1
+                                    && after_len <= MAX_ANCHOR_CHARS
+                                    && word_at_anchor(
+                                        &line_buf,
+                                        ps.word_end,
+                                        ps.word_len,
+                                        &ps.typed,
+                                    );
+                                if !immediate && !anchored_ok {
+                                    // Stale / beyond-cap / anchored-disabled / model
+                                    // mismatch — NEVER inject. A wrong-place edit is
+                                    // the one outcome we refuse.
+                                    tracing::info!(
+                                        "CORRECTION_ACCEPT_DECLINED typed={:?} after_len={} word_end={} caret={} anchored_enabled={}",
+                                        ps.typed,
+                                        after_len,
+                                        ps.word_end,
+                                        caret,
+                                        ANCHORED_ACCEPT_ENABLED
+                                    );
+                                    let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                                } else {
+                                    // Capture the delete_count we actually emit so the
+                                    // CORRECTION_APPLIED line can show it (Principle #7:
+                                    // an over-delete must be VISIBLE in the funnel, never
+                                    // inferred). The immediate path's `+ 1` boundary char
+                                    // is the suspect in contenteditable hosts (Google Docs
+                                    // welded `and·perseverence` → `andperseverance`); the
+                                    // root cause is its own — see
+                                    // docs/qa-15-contenteditable-boundary-overdelete.md.
+                                    // Logging delete_count beside `typed` + `boundary`
+                                    // makes a leading/trailing boundary over-delete
+                                    // self-evident without re-deriving it by hand.
+                                    // Assigned unconditionally in both accept arms below
+                                    // before the CORRECTION_APPLIED read — no seed value.
+                                    let delete_count_emitted: u32;
+                                    let applied = if immediate {
+                                        // Immediate accept — caret at the boundary.
+                                        // Proven no-arrow path: delete word + boundary,
+                                        // retype target + boundary.
+                                        let delete_count = (ps.word_len + 1) as u32;
+                                        delete_count_emitted = delete_count;
+                                        let replacement = format!("{}{}", ps.target, ps.boundary);
+                                        let echo_len =
+                                            delete_count + replacement.chars().count() as u32;
+                                        if send_inject_correction(
+                                            &mut sidecar_child,
+                                            delete_count,
+                                            replacement,
+                                        ) {
+                                            pending_echo += echo_len;
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        // Anchored accept — the caret moved on. Reached
+                                        // only when anchored_ok verified the word is
+                                        // still at the anchored position. Positional
+                                        // replace: Left × after_len (to just after the
+                                        // word), Backspace × word_len, type target (no
+                                        // boundary), Right × after_len (restore caret).
+                                        let left = after_len as u32;
+                                        let delete_count = ps.word_len as u32;
+                                        delete_count_emitted = delete_count;
+                                        let right = after_len as u32;
+                                        let echo_len = left
+                                            + delete_count
+                                            + ps.target.chars().count() as u32
+                                            + right;
+                                        if send_inject_anchored(
+                                            &mut sidecar_child,
+                                            left,
+                                            delete_count,
+                                            ps.target.clone(),
+                                            right,
+                                        ) {
+                                            pending_echo += echo_len;
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    };
+                                    if applied {
+                                        funnel.corrections_applied += 1;
+                                        tracing::info!(
+                                            "CORRECTION_APPLIED typed={:?} target={:?} delete_count={} boundary={:?} after_len={}",
+                                            ps.typed,
+                                            ps.target,
+                                            delete_count_emitted,
+                                            ps.boundary,
+                                            after_len
+                                        );
+                                        let _ = app_handle.emit(
+                                            EVT_CORRECTION_APPLIED,
+                                            CorrectionAppliedEvent {
+                                                typed: ps.typed.clone(),
+                                                target: ps.target.clone(),
+                                                undo: false,
+                                            },
+                                        );
+                                        // Arm the 6s Esc-undo (revert only). Carry
+                                        // after_len so the revert mirrors the accept.
+                                        last_correction = Some(LastCorrection {
+                                            typed: ps.typed,
+                                            target: ps.target,
+                                            boundary: ps.boundary,
+                                            after_len,
+                                            fired_at_ms: now_ms(),
+                                        });
+                                        // The tap suppresses the injection echo, so the
+                                        // engine never sees the text change — reset the
+                                        // line to mirror the corrected state. The reset
+                                        // re-bases the coordinate system; the anchored
+                                        // accept uses RELATIVE distances (after_len), so
+                                        // future accepts stay correct from the new base.
+                                        tokenizer.reset_line();
+                                        line_buf.clear();
+                                        line_dwells.clear();
+                                        caret = 0;
+                                        anchors.clear();
+                                        let _ = app_handle.emit(EVT_LINE_RESET, ());
+                                        let snap = anchors.snapshot();
+                                        let _ = app_handle.emit(
+                                            EVT_ANCHOR_SNAPSHOT,
+                                            anchor_emit_payload(&snap, &line_buf),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         InputEvent::Backspace { .. } => {
+                            // M3 bubble: a backspace is always an edit — drop any
+                            // pending suggestion and hide the bubble (bias toward
+                            // dismiss; we can't safely tell a source-word edit from
+                            // a forward fix-up, and a wrong-place accept is worse
+                            // than a missed one).
+                            if pending_suggestion.take().is_some() {
+                                let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                            }
                             // Funnel: a backspace passed the pause filter and
                             // enters the edit pipeline (not a modifier drop).
                             funnel.keystrokes_accepted += 1;
@@ -2196,9 +3672,13 @@ pub fn spawn<R: Runtime>(
                                 &mut motor_ledger,
                                 &mut proposer,
                                 &mut motor_map,
+                                &mut word_freq,
+                                prompted_capture_active,
                                 &mut word_patterns,
+                                &mut guess_ledger,
                                 &mut funnel,
                                 &mut tally,
+                                &mut competitor_sense,
                             );
                             let snap = anchors.snapshot();
                             let _ = app_handle.emit(
@@ -2206,13 +3686,21 @@ pub fn spawn<R: Runtime>(
                                 anchor_emit_payload(&snap, &line_buf),
                             );
                         }
-                        InputEvent::Key { key, dwell_ms, modifiers, .. } => {
+                        InputEvent::Key { key, dwell_ms, modifiers, timestamp_ms, .. } => {
+                            // M3 bubble gating: a pending suggestion survives this
+                            // keystroke ONLY if it's a clean FORWARD character append
+                            // (typing on). Set true in that one branch below; the
+                            // end-of-arm check (also enforcing the distance cap)
+                            // dismisses otherwise — nav keys, mid-line edits, the
+                            // Escape that isn't an undo, shortcuts all drop it.
+                            let mut keep_pending = false;
                             // Diagnostic log of the raw incoming codepoint(s)
                             // and modifier flags, so we can verify what the
-                            // sidecar is actually emitting. INFO level on
-                            // purpose — load-bearing while the nav-key story
-                            // settles; demote once stable.
-                            tracing::info!(
+                            // sidecar is actually emitting. DEBUG level: this
+                            // prints the raw keystroke, so it must stay below the
+                            // default log level — never on the console in normal
+                            // operation, only under RUST_LOG=debug (privacy).
+                            tracing::debug!(
                                 "key in: {:?} chars=[{}] fn={} shift={} ctrl={} opt={} cmd={}",
                                 key,
                                 key.chars()
@@ -2255,7 +3743,7 @@ pub fn spawn<R: Runtime>(
                                 Some(c) if is_non_text_key(c)
                             );
 
-                            // Diagnostic chords (Principle #8) — consumed here,
+                            // Diagnostic chords (Principle #7) — consumed here,
                             // never reach the tokenizer / line buffer:
                             //   Cmd+Shift+F → dump the funnel, then auto-reset
                             //                 (closes this run, opens a fresh one).
@@ -2263,7 +3751,7 @@ pub fn spawn<R: Runtime>(
                             if modifiers.command && modifiers.shift {
                                 if matches!(single_char, Some('f') | Some('F')) {
                                     funnel.dump();
-                                    dump_classifications(&word_patterns);
+                                    dump_classifications(&word_patterns, &motor_map);
                                     funnel.reset(now_ms());
                                     continue;
                                 }
@@ -2271,6 +3759,110 @@ pub fn spawn<R: Runtime>(
                                     funnel.reset(now_ms());
                                     continue;
                                 }
+                            }
+
+                            // M3 correction Step 1 — Escape-windowed undo +
+                            // teach-stop. While a correction is armed, the FIRST
+                            // real user keystroke decides its fate (the tap
+                            // suppresses our own injection echo, so the next key
+                            // we see is genuinely the user's): a bare Escape
+                            // within the window reverts the fix and removes the
+                            // pattern from the allow-list so it won't recur;
+                            // anything else is an implicit accept and just
+                            // disarms. `take()` disarms in every branch.
+                            if let Some(lc) = last_correction.take() {
+                                let expired =
+                                    now_ms().saturating_sub(lc.fired_at_ms) > UNDO_WINDOW_MS;
+                                let is_escape = matches!(single_char, Some(KEY_ESCAPE))
+                                    && !modifiers.command
+                                    && !modifiers.control;
+                                if !expired && is_escape {
+                                    // Revert, mirroring the accept. `last_correction`
+                                    // disarms on any non-Esc key, so the caret is
+                                    // exactly where the accept left it.
+                                    let target_len = lc.target.chars().count() as u32;
+                                    let reverted = if lc.after_len == 1 {
+                                        // Immediate accept → caret at the boundary:
+                                        // delete target + boundary, retype typed +
+                                        // boundary.
+                                        let delete_count = target_len + 1;
+                                        let replacement = format!("{}{}", lc.typed, lc.boundary);
+                                        let echo_len =
+                                            delete_count + replacement.chars().count() as u32;
+                                        if send_inject_correction(
+                                            &mut sidecar_child,
+                                            delete_count,
+                                            replacement,
+                                        ) {
+                                            pending_echo += echo_len;
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        // Anchored accept → caret moved on: anchored
+                                        // revert. Left × after_len, Backspace ×
+                                        // target_len, type typed (no boundary), Right
+                                        // × after_len.
+                                        let left = lc.after_len as u32;
+                                        let right = lc.after_len as u32;
+                                        let echo_len = left
+                                            + target_len
+                                            + lc.typed.chars().count() as u32
+                                            + right;
+                                        if send_inject_anchored(
+                                            &mut sidecar_child,
+                                            left,
+                                            target_len,
+                                            lc.typed.clone(),
+                                            right,
+                                        ) {
+                                            pending_echo += echo_len;
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    };
+                                    if reverted {
+                                        funnel.corrections_undone += 1;
+                                        tracing::info!(
+                                            "CORRECTION_UNDONE typed={:?} target={:?} after_len={}",
+                                            lc.typed,
+                                            lc.target,
+                                            lc.after_len
+                                        );
+                                        // The bubble shows the revert direction.
+                                        let _ = app_handle.emit(
+                                            EVT_CORRECTION_APPLIED,
+                                            CorrectionAppliedEvent {
+                                                typed: lc.target.clone(),
+                                                target: lc.typed.clone(),
+                                                undo: true,
+                                            },
+                                        );
+                                    }
+                                    // Esc does ONE predictable thing: revert. It no
+                                    // longer teach-stops the pattern — backing off a
+                                    // pattern comes from the user IGNORING the
+                                    // suggestion (not accepting), not from undo.
+                                    // The revert's echo is suppressed too; reset
+                                    // the line to mirror the restored text.
+                                    tokenizer.reset_line();
+                                    line_buf.clear();
+                                    line_dwells.clear();
+                                    caret = 0;
+                                    anchors.clear();
+                                    let _ = app_handle.emit(EVT_LINE_RESET, ());
+                                    let snap = anchors.snapshot();
+                                    let _ = app_handle.emit(
+                                        EVT_ANCHOR_SNAPSHOT,
+                                        anchor_emit_payload(&snap, &line_buf),
+                                    );
+                                    continue;
+                                }
+                                // Not an undo — implicit accept. `lc` is dropped
+                                // (disarmed); fall through to process this key
+                                // normally.
                             }
 
                             if is_non_text {
@@ -2281,23 +3873,45 @@ pub fn spawn<R: Runtime>(
                                 // edit, no token feed — and the buffer is
                                 // never written.
                                 let c = single_char.unwrap();
-                                tracing::info!(
-                                    "non-text key U+{:04X} — caret-only handling",
-                                    c as u32
-                                );
-                                // ONE coherent handler for all four nav
-                                // keys. Anything not mapped (Up/Down,
-                                // F1–F12, other PU codepoints) returns
-                                // `None` and we no-op. The Command flag
-                                // distinguishes Cmd+Left/Right (= Home/End
-                                // on macOS) from plain arrow navigation.
-                                if let Some(new_caret) =
-                                    nav_action(c, caret, line_buf.len(), modifiers.command)
-                                {
-                                    caret = new_caret;
+                                if is_vertical_nav(c) {
+                                    // Fix-B: Up/Down/PageUp/PageDown move the
+                                    // caret to another line/screen the single-
+                                    // line model can't follow. `nav_action`
+                                    // returns None for these (caret stays put =
+                                    // silent desync); reset the line instead.
+                                    tracing::info!(
+                                        "non-text key U+{:04X} — vertical nav, line reset",
+                                        c as u32
+                                    );
+                                    reset_line_for_caret_move(
+                                        &app_handle,
+                                        &mut tokenizer,
+                                        &mut line_buf,
+                                        &mut line_dwells,
+                                        &mut caret,
+                                        &mut anchors,
+                                        &mut last_correction,
+                                        "updown",
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "non-text key U+{:04X} — caret-only handling",
+                                        c as u32
+                                    );
+                                    // ONE coherent handler for the horizontal
+                                    // nav keys. Anything not mapped (F1–F12,
+                                    // other PU codepoints) returns `None` and
+                                    // we no-op. The Command flag distinguishes
+                                    // Cmd+Left/Right (= Home/End on macOS) from
+                                    // plain arrow navigation.
+                                    if let Some(new_caret) =
+                                        nav_action(c, caret, line_buf.len(), modifiers.command)
+                                    {
+                                        caret = new_caret;
+                                    }
+                                    // Anchor positions don't move on pure
+                                    // navigation, so no snapshot emit needed.
                                 }
-                                // Anchor positions don't move on pure
-                                // navigation, so no snapshot emit needed.
                             } else if modifiers.command || modifiers.control {
                                 // System shortcut (Cmd+X, Ctrl+X, Cmd+Shift+D,
                                 // etc.) — the key's character is the shortcut
@@ -2397,8 +4011,132 @@ pub fn spawn<R: Runtime>(
                                             anchors.apply_insert(caret, c);
                                             caret = new_caret;
 
+                                            // Always false now: the bubble defers
+                                            // injection to the Shift-accept, so a
+                                            // seal never resets the line and the
+                                            // trailing resolver tick always runs.
+                                            let corrected = false;
                                             if was_end_of_line {
+                                                // Clean forward append (typing on) —
+                                                // a pending suggestion survives this
+                                                // keystroke, subject to the distance
+                                                // cap enforced at the end of the arm.
+                                                keep_pending = true;
                                                 if let Some(tok) = tokenizer.observe_char(c) {
+                                                    // M3 correction Step 1: a word
+                                                    // just completed at a boundary
+                                                    // (space / punctuation — NOT
+                                                    // Return; see note below). If
+                                                    // the master gate is on and the
+                                                    // word is an enabled allow-list
+                                                    // pattern, fire a correction.
+                                                    // Capture what injection needs
+                                                    // BEFORE `tok` moves into
+                                                    // emit_sealed_token.
+                                                    // M3 bubble: the ENGINE decides what to suggest — the dictionary/bold
+                                                    // lane (a non-word converging on exactly one dictionary word, suggested
+                                                    // immediately) then the learned classifier. This is the SAME decision the
+                                                    // shadow log records below; the manual allow-list no longer gates a fire
+                                                    // (its per-pattern enable was retired, so it's always empty). The master
+                                                    // gate (`correction_enabled`) still arms the whole feature. Capture what
+                                                    // the bubble needs BEFORE `tok` moves into emit_sealed_token.
+                                                    let mut fire: Option<(String, String, usize, usize)> = None;
+                                                    // FIRE_TIMING t1 — set at the fire decision below; hoisted here
+                                                    // so it stays in scope for the t2 emit log (measurement only).
+                                                    let mut t1: u64 = 0;
+                                                    if matches!(tok.kind, TokenKind::Word) {
+                                                        let word_len = tok.end - tok.start;
+                                                        let word_end = tok.end;
+                                                        // Lever 2 — LEARNED lane first. `shadow_suggestion` is a
+                                                        // cheap lookup over the user's own confirmed `typed → target`
+                                                        // patterns; only when it has nothing do we run the dictionary
+                                                        // convergence scan (itself O(word) after Lever 1). Reordering
+                                                        // keeps the hot path minimal for repeat slips AND lets a
+                                                        // pattern the user has taught us win a tie over a generic
+                                                        // dictionary convergence. (Before, convergence won the tie;
+                                                        // for the same word both lanes almost always agree on the
+                                                        // target — where they differ, the learned pattern is the more
+                                                        // personal signal.) Raw suggestion: typed as the user typed it
+                                                        // (tok.core keeps their case), target lowercase.
+                                                        let raw: Option<(String, String)> = if let Some(sh) =
+                                                            shadow_suggestion(&tok.core, &word_patterns, lexicon, &motor_map)
+                                                        {
+                                                            if let Some(p) = shadow_log_path() {
+                                                                append_shadow_log(&p, now_ms(), &sh);
+                                                            }
+                                                            Some((tok.core.clone(), sh.target.clone()))
+                                                        } else {
+                                                            let scan = correction_engine::shadow_convergence_scan(
+                                                                &tok.core,
+                                                                lexicon,
+                                                                &motor_map,
+                                                            );
+                                                            if scan.convergent {
+                                                                if let Some(p) = shadow_log_path() {
+                                                                    append_shadow_bold_log(&p, now_ms(), &tok.core, &scan);
+                                                                }
+                                                                // convergent ⇒ exactly one fire target (the lone
+                                                                // candidate, or the frequency-dominant one).
+                                                                scan.target.as_ref().map(|t| (tok.core.clone(), t.clone()))
+                                                            } else {
+                                                                None
+                                                            }
+                                                        };
+                                                        // Contraction filter: drop apostrophe-only /
+                                                        // possessive fixes — Auto-Correct's job, not
+                                                        // ours (we own motor garbles).
+                                                        let apostrophe_suppressed = raw
+                                                            .as_ref()
+                                                            .is_some_and(|(t, g)| is_apostrophe_fix(t, g));
+                                                        let suggestion = if apostrophe_suppressed { None } else { raw };
+                                                        // Watch Dog Not Attack Dog (M3 autocorrect
+                                                        // coexistence): when a competing corrector is
+                                                        // behaviourally sensed AND this is a
+                                                        // host-redundant (common) fix, STAND DOWN — let
+                                                        // the host make the fix rather than double-correct
+                                                        // it. Idiosyncratic fixes are never host-redundant,
+                                                        // so they fall straight through and fire (his core
+                                                        // value — never suppressed). No app/settings read
+                                                        // (Principle #8); the shadow intent log above still
+                                                        // recorded what he WOULD suggest.
+                                                        let competitor_deferred = competitor_sense
+                                                            .is_deferring(now_ms())
+                                                            && suggestion.as_ref().is_some_and(|(t, g)| {
+                                                                correction_engine::is_host_redundant(t, g, lexicon)
+                                                            });
+                                                        // FIRE_TIMING t1 — the fire decision is resolved (Some/None).
+                                                        t1 = now_ms();
+                                                        // The master gate turns a suggestion into a live bubble. Log the
+                                                        // decision so a no-fire is diagnosable from the dev Terminal.
+                                                        // `competitor_deferred` is a content-free verdict bool
+                                                        // (Principle #8): it never names the app or the reason's source.
+                                                        tracing::info!(
+                                                            "FIRE_DECISION word={:?} gate_on={} suggestion={:?} apostrophe_suppressed={} competitor_deferred={} t1={} t1_minus_t0_ms={}",
+                                                            tok.core,
+                                                            allow_list.correction_enabled,
+                                                            suggestion.as_ref().map(|(t, g)| format!("{t}->{g}")),
+                                                            apostrophe_suppressed,
+                                                            competitor_deferred,
+                                                            t1,
+                                                            t1.saturating_sub(t_recv),
+                                                        );
+                                                        if allow_list.correction_enabled {
+                                                            if competitor_deferred {
+                                                                // A live bubble withheld to avoid
+                                                                // double-correcting the host — a deliberate,
+                                                                // counted drop (Principle #7). `fire` stays
+                                                                // None.
+                                                                funnel.competitor_deferred += 1;
+                                                            } else {
+                                                                // Preserve the user's capitalisation in the
+                                                                // target — never change their casing.
+                                                                fire = suggestion.map(|(t, g)| {
+                                                                    let g = match_source_case(&t, &g);
+                                                                    (t, g, word_len, word_end)
+                                                                });
+                                                            }
+                                                        }
+                                                    }
                                                     emit_sealed_token(
                                                         &app_handle,
                                                         tok,
@@ -2411,6 +4149,58 @@ pub fn spawn<R: Runtime>(
                                                         &mut proposer,
                                                         &mut funnel,
                                                     );
+                                                    if let Some((typed, target, word_len, word_end)) = fire {
+                                                        // M3 bubble: do NOT inject at seal — SUGGEST. The bubble shows
+                                                        // `typed → target`; nothing changes on screen until the user
+                                                        // accepts with an isolated Shift tap. Armed against the current
+                                                        // caret (end of line here) and cleared by the next keystroke, a
+                                                        // caret move, or the ~5s timeout — so an accept only ever injects
+                                                        // while the caret is still at this word's boundary.
+                                                        // Indices are case-independent (positions are
+                                                        // the same whatever the casing) — compare the
+                                                        // lowercased forms so a leading capital doesn't
+                                                        // throw the alignment off.
+                                                        let highlight = correction_engine::corrected_target_indices(
+                                                            &typed.to_lowercase(),
+                                                            &target.to_lowercase(),
+                                                        );
+                                                        let _ = app_handle.emit(
+                                                            EVT_CORRECTION_SUGGESTED,
+                                                            CorrectionSuggestedEvent {
+                                                                typed: typed.clone(),
+                                                                target: target.clone(),
+                                                                highlight,
+                                                            },
+                                                        );
+                                                        // FIRE_TIMING t2 — EVT_CORRECTION_SUGGESTED handed to Tauri.
+                                                        // One self-contained line carries the engine-side breakdown:
+                                                        //   t0 = keystroke received from L1, t1 = fire decided,
+                                                        //   t2 = event emitted; dwell_ms = the boundary key's
+                                                        //   press→release hold (emitted on keyUp, so this hold is
+                                                        //   part of physical-press → t0). os_ts is the CGEvent clock
+                                                        //   (uptime-based, NOT comparable to t0..t2 — context only).
+                                                        let t2 = now_ms();
+                                                        tracing::info!(
+                                                            "FIRE_TIMING typed={:?} target={:?} word_len={} t0_recv={} t1_decision={} t2_emit={} d_t0_t2_ms={} dwell_ms={} os_ts={}",
+                                                            typed,
+                                                            target,
+                                                            word_len,
+                                                            t_recv,
+                                                            t1,
+                                                            t2,
+                                                            t2.saturating_sub(t_recv),
+                                                            dwell_ms,
+                                                            timestamp_ms,
+                                                        );
+                                                        pending_suggestion = Some(PendingSuggestion {
+                                                            typed,
+                                                            target,
+                                                            boundary: c,
+                                                            word_len,
+                                                            word_end,
+                                                            armed_at_ms: now_ms(),
+                                                        });
+                                                    }
                                                 }
                                             } else {
                                                 // Mid-line insert: forward
@@ -2450,27 +4240,35 @@ pub fn spawn<R: Runtime>(
                                             // and the revisit case (a
                                             // mid-line edit may have
                                             // flipped a previously-resolved
-                                            // record).
-                                            tick_resolver(
-                                                &app_handle,
-                                                &mut resolver,
-                                                &mut motor_resolver,
-                                                &anchors,
-                                                &line_buf,
-                                                caret,
-                                                &mut ledger,
-                                                &mut motor_ledger,
-                                                &mut proposer,
-                                                &mut motor_map,
-                                                &mut word_patterns,
-                                                &mut funnel,
-                                                &mut tally,
-                                            );
-                                            let snap = anchors.snapshot();
-                                            let _ = app_handle.emit(
-                                                EVT_ANCHOR_SNAPSHOT,
-                                                anchor_emit_payload(&snap, &line_buf),
-                                            );
+                                            // record). Skipped when a
+                                            // correction just reset the line
+                                            // (it emitted its own snapshot).
+                                            if !corrected {
+                                                tick_resolver(
+                                                    &app_handle,
+                                                    &mut resolver,
+                                                    &mut motor_resolver,
+                                                    &anchors,
+                                                    &line_buf,
+                                                    caret,
+                                                    &mut ledger,
+                                                    &mut motor_ledger,
+                                                    &mut proposer,
+                                                    &mut motor_map,
+                                                    &mut word_freq,
+                                                    prompted_capture_active,
+                                                    &mut word_patterns,
+                                                    &mut guess_ledger,
+                                                    &mut funnel,
+                                                    &mut tally,
+                                                    &mut competitor_sense,
+                                                );
+                                                let snap = anchors.snapshot();
+                                                let _ = app_handle.emit(
+                                                    EVT_ANCHOR_SNAPSHOT,
+                                                    anchor_emit_payload(&snap, &line_buf),
+                                                );
+                                            }
                                         }
                                     }
                                     _ => {
@@ -2503,6 +4301,28 @@ pub fn spawn<R: Runtime>(
                             // (lexicon → candidates → score → decide)
                             // emitting per-stage panel events. The skeleton
                             // tge→the lookup is retired.
+
+                            // M3 bubble gating: keep the pending suggestion ONLY if
+                            // this was a clean forward keystroke (keep_pending) AND
+                            // the caret is still PAST the word and within the
+                            // distance cap; otherwise drop + hide it. Catches nav
+                            // keys, mid-line edits, a non-undo Escape, shortcuts,
+                            // and the over-the-cap case in one place. Bias toward
+                            // dismiss — a missed accept is fine, a wrong-place edit
+                            // is not.
+                            if let Some(ps) = &pending_suggestion {
+                                let dist = caret.saturating_sub(ps.word_end);
+                                // While the anchored accept is OFF, an accept is
+                                // possible ONLY at the immediate boundary (dist == 1),
+                                // so drop the bubble the moment the caret types past it
+                                // — a visible bubble must always mean Shift will work.
+                                // With anchored ON, keep it up to the distance cap.
+                                let cap = if ANCHORED_ACCEPT_ENABLED { MAX_ANCHOR_CHARS } else { 1 };
+                                if !keep_pending || caret <= ps.word_end || dist > cap {
+                                    pending_suggestion = None;
+                                    let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                                }
+                            }
                         }
                     }
                 }
@@ -2685,7 +4505,13 @@ pub fn spawn<R: Runtime>(
                             // weakest-keys at session start). Read-only.
                             let report: StabilityReport =
                                 motor_map.stability_report(WEAKEST_PREVIEW_N);
-                            update_tray_dot(&app_handle, &mut last_tray_dot, &report);
+                            current_practice_dot = wants_practice_dot(&report);
+                            apply_tray_icon(
+                                &app_handle,
+                                ui_not_active,
+                                current_practice_dot,
+                                &mut last_tray_icon,
+                            );
                             let _ = app_handle.emit(EVT_MOTOR_STABILITY, report);
                         }
                         EngineControl::RequestPracticeTrend { keys } => {
@@ -2699,6 +4525,42 @@ pub fn spawn<R: Runtime>(
                             );
                             let _ = app_handle.emit(EVT_PRACTICE_TREND, trend);
                         }
+                        EngineControl::SetPromptedCaptureActive(active) => {
+                            // C5e: gate the word-freq tally while prompted
+                            // (warm-up / Practice) text is on screen. Motor-map
+                            // observation is untouched. Content-blind — a bare
+                            // on/off, no app id, no text.
+                            prompted_capture_active = active;
+                            tracing::info!("PROMPTED_CAPTURE active={active}");
+                        }
+                        EngineControl::SetCorrectionEnabled(enabled) => {
+                            // M3 Step 1 master gate — the instant global on/off.
+                            // Persist + echo so the tray check and panel switch
+                            // converge on the engine's authoritative state. Turn
+                            // OFF disarms any pending undo (no fix to revert).
+                            if allow_list.set_enabled(enabled) {
+                                if !enabled {
+                                    last_correction = None;
+                                    if pending_suggestion.take().is_some() {
+                                        let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                                    }
+                                }
+                                tracing::info!("CORRECTION_GATE enabled={enabled}");
+                                persist_and_emit_allow_list(
+                                    &app_handle,
+                                    &allow_list,
+                                    allow_list_path.as_deref(),
+                                );
+                            } else {
+                                // No change, but still echo so an optimistic UI
+                                // that diverged reconverges.
+                                let _ = app_handle.emit(EVT_CORRECTION_STATE, allow_list.clone());
+                            }
+                        }
+                        EngineControl::RequestAllowList => {
+                            // Panel/tray pull fresh state on open. Read-only.
+                            let _ = app_handle.emit(EVT_CORRECTION_STATE, allow_list.clone());
+                        }
                     }
                 }
                 _ = watchdog.tick() => {
@@ -2710,6 +4572,17 @@ pub fn spawn<R: Runtime>(
                     // reloads converge to truth without waiting for a
                     // transition.
                     watchdog_ticks = watchdog_ticks.wrapping_add(1);
+
+                    // M3 bubble: drop a suggestion the user neither accepted (Shift)
+                    // nor typed past within the timeout — the UI auto-fades on the
+                    // same ~5s budget. Backstop for the pure-pause case; an active
+                    // typist clears it eagerly on the next keystroke.
+                    if let Some(ps) = &pending_suggestion {
+                        if now_ms().saturating_sub(ps.armed_at_ms) > SUGGESTION_TIMEOUT_MS {
+                            pending_suggestion = None;
+                            let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                        }
+                    }
 
                     // C5a verdict state machine: Kept / Abandoned fire on
                     // elapsed idle, so the resolver must tick even when no
@@ -2728,10 +4601,53 @@ pub fn spawn<R: Runtime>(
                         &mut motor_ledger,
                         &mut proposer,
                         &mut motor_map,
+                        &mut word_freq,
+                        prompted_capture_active,
                         &mut word_patterns,
+                        &mut guess_ledger,
                         &mut funnel,
                         &mut tally,
+                        &mut competitor_sense,
                     );
+
+                    // Watch Dog re-arm: zero stale competitor evidence once a
+                    // full idle window has passed with no footprint (the host
+                    // corrector went quiet), so a fresh competitor must clear the
+                    // N-footprint threshold again. The 1s watchdog is the idle
+                    // driver — `is_deferring`'s own time guard already lapses
+                    // deferral at the window edge; this keeps the counter honest.
+                    competitor_sense.decay(now_ms());
+
+                    // Idle line-buffer reset (desync recovery). tick_resolver
+                    // above already fired any due Kept/Abandoned verdicts on
+                    // this line, so clearing now drops only a stale, fully-
+                    // resolved buffer. The next keystroke starts a clean line —
+                    // breaking any desync that left a residual tail to the
+                    // right of the caret (the "edndd" cascade). Mirrors the
+                    // newline reset; the buffer is transient (Principle #7).
+                    if !line_buf.is_empty()
+                        && Instant::now()
+                            .duration_since(last_text_input_at)
+                            .as_millis() as u64
+                            >= LINE_IDLE_RESET_MS
+                    {
+                        tracing::info!(
+                            "IDLE-LINE-RESET cleared {} chars after >= {}ms idle",
+                            line_buf.len(),
+                            LINE_IDLE_RESET_MS
+                        );
+                        tokenizer.reset_line();
+                        line_buf.clear();
+                        line_dwells.clear();
+                        caret = 0;
+                        anchors.clear();
+                        let _ = app_handle.emit(EVT_LINE_RESET, ());
+                        let snap = anchors.snapshot();
+                        let _ = app_handle.emit(
+                            EVT_ANCHOR_SNAPSHOT,
+                            anchor_emit_payload(&snap, &line_buf),
+                        );
+                    }
 
                     // Component 5c: maintain the live motor-map file on a
                     // time cadence (not only every 100 obs / on shutdown,
@@ -2757,6 +4673,25 @@ pub fn spawn<R: Runtime>(
                         funnel.word_pattern_saves += 1;
                     }
 
+                    // C5e: same cadence for the local vocabulary tally's own
+                    // file. Observe-only — no funnel counter (it's a downstream
+                    // tally, not a capture stage that can silently drop data).
+                    flush_word_freq(
+                        &mut word_freq,
+                        word_freq_path.as_deref(),
+                        now_ms(),
+                        &mut last_word_freq_save_ms,
+                    );
+
+                    // Phase 1 guesser accuracy scoreboard: same cadence, its own
+                    // file. Observe-only — measurement, no injection.
+                    flush_guess_ledger(
+                        &mut guess_ledger,
+                        guess_accuracy_path.as_deref(),
+                        now_ms(),
+                        &mut last_guess_ledger_save_ms,
+                    );
+
                     // Progress Statistics: persist today's tally on the same
                     // cadence and roll it at the calendar-day boundary. Watchdog
                     // runs every 1s, so even an idle day rolls over promptly.
@@ -2767,14 +4702,16 @@ pub fn spawn<R: Runtime>(
                         &mut last_progress_save_ms,
                     );
 
-                    // Capture-integrity funnel (Principle #8): auto-dump
+                    // Capture-integrity funnel (Principle #7): auto-dump
                     // every 60s (watchdog ticks every 1s) so the funnel is
                     // reconstructable from logs after the fact, in addition
                     // to the on-demand Cmd+Shift+F chord.
                     if watchdog_ticks % 60 == 0 {
                         funnel.dump();
                         // Read-only kill-switch observability (no injection).
-                        dump_classifications(&word_patterns);
+                        dump_classifications(&word_patterns, &motor_map);
+                        // Observe-only guesser accuracy readout (no injection).
+                        dump_guess_accuracy(&guess_ledger);
                     }
 
                     // C5c motor stability: periodic read-model emit so a
@@ -2785,7 +4722,9 @@ pub fn spawn<R: Runtime>(
                             motor_map.stability_report(WEAKEST_PREVIEW_N);
                         // Tray "dot" reflects whether there are weak keys worth
                         // practicing — shape, not colour (it's a template icon).
-                        update_tray_dot(&app_handle, &mut last_tray_dot, &report);
+                        // The actual icon push happens below (after the health
+                        // debounce), so capture-stopped can override the badge.
+                        current_practice_dot = wants_practice_dot(&report);
                         let _ = app_handle.emit(EVT_MOTOR_STABILITY, report);
                     }
 
@@ -2846,6 +4785,45 @@ pub fn spawn<R: Runtime>(
                         );
                     }
 
+                    // ---- Debounced menu-bar "capture active?" signal. --------
+                    // The raw health above flips on every transient blip; the
+                    // menu-bar icon/status must NOT strobe, so we settle it: not
+                    // active only once capture has been continuously non-Live
+                    // past NOT_ACTIVE_DEBOUNCE_MS (the self-heal window). Going
+                    // back to Live flips active true immediately — good news
+                    // isn't debounced.
+                    if matches!(current_capture_health, CaptureHealth::Live) {
+                        non_live_since = None;
+                    } else if non_live_since.is_none() {
+                        non_live_since = Some(Instant::now());
+                    }
+                    ui_not_active = non_live_since.is_some_and(|since| {
+                        Instant::now().duration_since(since).as_millis() >= NOT_ACTIVE_DEBOUNCE_MS
+                    });
+
+                    // Push the menu-bar icon (capture-stopped overrides the
+                    // practice badge); no-op when unchanged.
+                    apply_tray_icon(
+                        &app_handle,
+                        ui_not_active,
+                        current_practice_dot,
+                        &mut last_tray_icon,
+                    );
+
+                    // Emit the settled UI state on change, and periodically so a
+                    // freshly-registered listener (the tray) converges. The
+                    // recovery action only matters while not active, so pin
+                    // permission_revoked to false when active (avoids a spurious
+                    // change emit from a stale flag).
+                    let ui = CaptureUiEvent {
+                        active: !ui_not_active,
+                        permission_revoked: ui_not_active && !permission_ok,
+                    };
+                    if last_ui_emit != Some(ui) || watchdog_ticks % HEALTH_REPEAT_TICKS == 0 {
+                        let _ = app_handle.emit(EVT_CAPTURE_UI, ui);
+                        last_ui_emit = Some(ui);
+                    }
+
                     // Component 5c: daily motor-map snapshot (Principle #6).
                     // The watchdog ticks every 1s and is the only periodic timer,
                     // so it stands in for "the first event of a new calendar day":
@@ -2867,6 +4845,25 @@ pub fn spawn<R: Runtime>(
                                 }
                             }
                             last_snapshot_date = Some(today);
+                        }
+                    }
+
+                    // C5e: daily word-tally snapshot (Principle #6), same
+                    // calendar-roll logic as the motor map, its own directory +
+                    // date guard. Never overwrites an existing dated file.
+                    if let Some(dir) = word_freq_snapshots_dir.as_deref() {
+                        let today = ymd_from_epoch_ms(now_ms());
+                        if last_word_freq_snapshot_date != Some(today) {
+                            let path =
+                                dir.join(format!("{:04}-{:02}-{:02}.json", today.0, today.1, today.2));
+                            if !path.exists() {
+                                let _ = std::fs::create_dir_all(dir);
+                                match word_freq.write_snapshot(&path) {
+                                    Ok(()) => tracing::info!("WORD_FREQ_SNAPSHOT_DAILY path={path:?}"),
+                                    Err(e) => tracing::warn!("word-freq snapshot failed: {e}"),
+                                }
+                            }
+                            last_word_freq_snapshot_date = Some(today);
                         }
                     }
                 }
@@ -2942,6 +4939,19 @@ pub fn spawn<R: Runtime>(
                 Err(e) => tracing::warn!("word-pattern store shutdown save failed: {e}"),
             }
         }
+        // Guesser accuracy scoreboard (M3 Phase 1): same graceful-shutdown flush.
+        if let Some(path) = guess_accuracy_path.as_deref() {
+            match guess_ledger.save_to(path) {
+                Ok(()) => tracing::info!(
+                    "GUESS_LEDGER_SAVED (shutdown) patterns={} tries={} hits={} path={:?}",
+                    guess_ledger.len(),
+                    guess_ledger.overall().tries,
+                    guess_ledger.overall().hits,
+                    path
+                ),
+                Err(e) => tracing::warn!("guess-accuracy ledger shutdown save failed: {e}"),
+            }
+        }
         // Progress Statistics: flush today's tally too, so a clean quit commits
         // the tail of today's words/slips (best-effort — the watchdog's ~2s
         // cadence is the primary durability, since this may not run under
@@ -2965,6 +4975,67 @@ pub fn spawn<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Watch Dog: competitor-sense state machine -----------------------
+
+    #[test]
+    fn competitor_sense_defers_after_threshold_and_rearms() {
+        let mut s = CompetitorSense::default();
+        // Armed (firing) until the threshold is cleared.
+        assert!(!s.is_deferring(1_000));
+        s.note_footprint(1_000);
+        assert!(!s.is_deferring(1_000), "one footprint is below N=2");
+        s.note_footprint(2_000);
+        assert!(s.is_deferring(2_000), "two footprints -> defer common lane");
+
+        // Stays deferring while footprints are recent.
+        assert!(s.is_deferring(2_000 + COMPETITOR_REARM_IDLE_MS - 1));
+        // The instant the idle window passes, deferral lapses (fire again).
+        assert!(!s.is_deferring(2_000 + COMPETITOR_REARM_IDLE_MS));
+
+        // Watchdog decay zeroes stale evidence, so re-arm needs N fresh
+        // footprints again (not just one riding on a stale count).
+        s.decay(2_000 + COMPETITOR_REARM_IDLE_MS);
+        s.note_footprint(100_000);
+        assert!(
+            !s.is_deferring(100_000),
+            "single fresh footprint must not re-defer"
+        );
+        s.note_footprint(101_000);
+        assert!(s.is_deferring(101_000));
+
+        // Focus/app change hard-resets immediately.
+        s.reset();
+        assert!(!s.is_deferring(101_000));
+    }
+
+    // ---- M3 bubble: casing preservation + contraction filter -------------
+
+    #[test]
+    fn match_source_case_preserves_user_casing() {
+        assert_eq!(match_source_case("teh", "the"), "the");
+        assert_eq!(match_source_case("Teh", "the"), "The");
+        assert_eq!(match_source_case("WAHT", "what"), "WHAT");
+        // Single leading capital, not all-caps.
+        assert_eq!(match_source_case("Recieve", "receive"), "Receive");
+        // A one-letter capital isn't "all caps" — leading-cap branch.
+        assert_eq!(match_source_case("I", "i"), "I");
+    }
+
+    #[test]
+    fn apostrophe_filter_suppresses_contractions_not_motor_garbles() {
+        // Pure apostrophe insertion (Auto-Correct's job) — suppressed.
+        assert!(is_apostrophe_fix("todays", "today's"));
+        assert!(is_apostrophe_fix("dont", "don't"));
+        // Possessive completion after a typed apostrophe — suppressed.
+        assert!(is_apostrophe_fix("key'", "key's"));
+        assert!(is_apostrophe_fix("One'", "one's"));
+        // Genuine MOTOR garble in an apostrophe word — NOT suppressed.
+        assert!(!is_apostrophe_fix("doens't", "doesn't"));
+        // No apostrophe in the target — never the filter's business.
+        assert!(!is_apostrophe_fix("teh", "the"));
+        assert!(!is_apostrophe_fix("haev", "have"));
+    }
 
     // ---- Component 5c snapshot date helpers ------------------------------
 

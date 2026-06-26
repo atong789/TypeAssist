@@ -1,127 +1,499 @@
-<!-- Settings — discrete card selectors only (no sliders, ever).
-     Today: the Practice word bank's spelling/locale. Native radios styled as
-     cards give the full WAI-ARIA radiogroup keyboard behaviour for free (Tab to
-     the group, arrows move + select), with the focus ring shown on the card via
-     :focus-within. The choice persists to localStorage and is read by the
-     separate Practice window at session start (same origin → shared storage). -->
+<!-- Settings — observing strip, warm-up language, state-aware Corrections, and the
+     on-device data controls (Back up / Restore / Delete) with real confirm
+     modals. Warm-up language reuses the existing locale pref (Practice reads it).
+     The Corrections toggle is the SAME state as the menu-bar dropdown's — read +
+     synced via corrections://state, written via set_correction_enabled (the
+     engine is the sole writer). Everything stays on-device; no network.
+
+     NOTE: the actual export / restore / delete FILE I/O is stubbed (see
+     TODO(data-layer)). The full screen + all three dialog flows are built and
+     wired to clearly-named functions, ready for the data-layer pass. -->
 <script lang="ts">
-  import { onMount } from "svelte";
-  import {
-    loadSpellingPref,
-    saveSpellingPref,
-    type SpellingPref,
-  } from "../lib/locale";
+  import { onMount, tick } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
+  import { loadSpellingPref, saveSpellingPref, type SpellingPref } from "../lib/locale";
+  import Modal from "../lib/Modal.svelte";
+  import RestoreDialog from "../lib/RestoreDialog.svelte";
+  import { backUp, deleteEverything } from "../lib/dataActions";
 
-  let pref: SpellingPref = "system";
-  // Load is async-on-mount, so guard the persist reaction until after it — the
-  // initial read must not immediately rewrite the stored value with the default.
-  let loaded = false;
-  onMount(() => {
-    pref = loadSpellingPref();
-    loaded = true;
-  });
-  $: if (loaded) saveSpellingPref(pref);
-
-  const options: { value: SpellingPref; title: string; sub: string }[] = [
-    { value: "system", title: "Follow system", sub: "Match your Mac's language & region" },
-    { value: "en-US", title: "English (US)", sub: "American spelling — color, gray" },
-    { value: "en-GB", title: "English (UK)", sub: "British spelling — colour, grey" },
-    { value: "en-IN", title: "English (India)", sub: "British spelling" },
+  // ---- Warm-up language — reuses the existing locale pref (Practice reads it).
+  let lang: SpellingPref = "system";
+  let langLoaded = false;
+  $: if (langLoaded) saveSpellingPref(lang);
+  const LANGS: { value: SpellingPref; label: string }[] = [
+    { value: "system", label: "Follow system" },
+    { value: "en-US", label: "English (US)" },
+    { value: "en-GB", label: "English (UK)" },
   ];
+  // Grouped control → app-wide keyboard convention: ONE Tab stop (roving
+  // tabindex); Left/Right (and Home/End) switch WITHIN it. Tab moves between
+  // controls, not between the three options.
+  let segEls: HTMLButtonElement[] = [];
+  function onSegKeydown(event: KeyboardEvent, i: number) {
+    let ni: number;
+    switch (event.key) {
+      case "ArrowRight":
+        ni = (i + 1) % LANGS.length;
+        break;
+      case "ArrowLeft":
+        ni = (i - 1 + LANGS.length) % LANGS.length;
+        break;
+      case "Home":
+        ni = 0;
+        break;
+      case "End":
+        ni = LANGS.length - 1;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    lang = LANGS[ni].value;
+    segEls[ni]?.focus();
+  }
+
+  // ---- Corrections master gate — the SAME on/off as the menu-bar toggle and
+  // Today's offer card (one source of truth). Off by default; the engine never
+  // flips it on. Always available — no unlock/readiness gate. Read on mount +
+  // sync via corrections://state; write via set_correction_enabled.
+  interface AllowListState {
+    correction_enabled: boolean;
+  }
+  let correctionEnabled = false;
+  function toggleCorrections() {
+    const next = !correctionEnabled;
+    correctionEnabled = next; // optimistic; the engine echo confirms
+    invoke("set_correction_enabled", { enabled: next }).catch(() => {});
+  }
+
+  onMount(() => {
+    lang = loadSpellingPref();
+    langLoaded = true;
+
+    invoke<AllowListState>("read_allow_list")
+      .then((al) => (correctionEnabled = !!al?.correction_enabled))
+      .catch(() => {});
+    invoke("request_allow_list").catch(() => {});
+    const off = listen<AllowListState>("corrections://state", (e) => {
+      correctionEnabled = !!e.payload?.correction_enabled;
+    });
+    return () => {
+      off.then((f) => f());
+    };
+  });
+
+  // ---- Data actions (UI + dialogs built; file I/O stubbed in lib/dataActions) ---
+  let restoreOpen = false;
+  let deleteOpen = false;
+  let lastBackup: string | null = null;
+  let deleteCancelBtn: HTMLButtonElement | undefined;
+
+  // The main "Back up" button + the delete-guardrail backup record the filename
+  // locally so the delete dialog can show "Backed up — …".
+  async function doBackup() {
+    lastBackup = await backUp();
+  }
+
+  // Explicitly focus the trigger BEFORE opening (WebKit doesn't focus buttons on
+  // click) so the modal records it as prevFocus and returns focus here on close.
+  function openRestore(e: MouseEvent) {
+    (e.currentTarget as HTMLElement | null)?.focus();
+    restoreOpen = true;
+  }
+  function openDelete(e: MouseEvent) {
+    (e.currentTarget as HTMLElement | null)?.focus();
+    deleteOpen = true;
+  }
+  // "Back up now" inside the delete modal removes its own button (the guardrail
+  // flips to "Backed up — …"), so move focus to a stable control in the dialog.
+  async function backupNow() {
+    await doBackup();
+    tick().then(() => deleteCancelBtn?.focus());
+  }
+
+  function confirmDelete() {
+    deleteEverything(); // erases on-device data + returns the app to Day one
+    deleteOpen = false;
+  }
 </script>
 
 <header class="screen-header"><h1>Settings</h1></header>
 
+<!-- 1) Observing strip -->
+<div class="observe">
+  <i class="ti ti-eye" aria-hidden="true"></i>
+  <span>Observing your typing · Everything stays on this Mac</span>
+</div>
+
+<!-- 2) Warm-up language -->
 <section class="group">
-  <h2 class="group-title">Practice language</h2>
-  <p class="group-help">Which spelling the Practice word bank uses.</p>
-  <fieldset class="card-group">
-    <legend class="sr-only">Practice language</legend>
-    {#each options as o}
-      <label class="opt-card" class:selected={pref === o.value}>
-        <input type="radio" name="practice-spelling" value={o.value} bind:group={pref} />
-        <span class="opt-title">{o.title}</span>
-        <span class="opt-sub">{o.sub}</span>
-      </label>
+  <h2 class="group-label">Warm-up language</h2>
+  <div class="segmented" role="radiogroup" aria-label="Warm-up language">
+    {#each LANGS as o, i}
+      <button
+        class="seg-btn"
+        class:on={lang === o.value}
+        role="radio"
+        aria-checked={lang === o.value}
+        tabindex={lang === o.value ? 0 : -1}
+        bind:this={segEls[i]}
+        on:click={() => (lang = o.value)}
+        on:keydown={(e) => onSegKeydown(e, i)}>{o.label}</button
+      >
     {/each}
-  </fieldset>
+  </div>
 </section>
 
+<!-- 3) Corrections — one always-available On/Off (no readiness gate). Same state
+     as the menu-bar toggle and Today's offer card. -->
+<section class="group">
+  <div class="row">
+    <div class="row-text">
+      <div class="row-title">Corrections</div>
+      <p class="row-desc">
+        When this is on, I’ll suggest a fix right after a word — accept it with a tap of Shift,
+        or press Esc to undo. The everyday corrections help straight away; the ones I’m still
+        learning join in over time. You’re always the one typing.
+      </p>
+    </div>
+    <button
+      class="switch"
+      class:on={correctionEnabled}
+      role="switch"
+      aria-checked={correctionEnabled}
+      aria-label="Corrections"
+      on:click={toggleCorrections}
+    >
+      <span class="knob" aria-hidden="true"></span>
+    </button>
+  </div>
+</section>
+
+<!-- 4) Your Typing Data -->
+<section class="group">
+  <h2 class="group-label">Your Typing Data</h2>
+  <p class="group-sub">
+    A copy of what TypeAssist has learned about your hands — kept only on this Mac.
+  </p>
+  <button class="btn-primary" on:click={doBackup}>
+    <i class="ti ti-download" aria-hidden="true"></i> Back up
+  </button>
+  <p class="help">
+    Saves a file you choose where to keep — an external drive, a cloud folder, or to carry to a
+    new Mac.
+  </p>
+  <div class="data-links">
+    <button class="link" on:click={openRestore}>Restore from a backup</button>
+    <button class="link danger" on:click={openDelete}>Delete everything</button>
+  </div>
+</section>
+
+<!-- Restore — the shared guarded warning dialog (also used by Onboarding). -->
+{#if restoreOpen}
+  <RestoreDialog
+    on:close={() => (restoreOpen = false)}
+    on:restored={() => (restoreOpen = false)}
+  />
+{/if}
+
+<!-- Delete — confirm modal -->
+{#if deleteOpen}
+  <Modal titleId="delete-title" on:cancel={() => (deleteOpen = false)}>
+    <div class="dlg-head">
+      <i class="ti ti-alert-triangle warn-icon" aria-hidden="true"></i>
+      <h2 id="delete-title" class="dlg-title">Delete everything I’ve learned?</h2>
+    </div>
+    <p class="dlg-body">
+      This erases the full picture of your typing — every pattern and correction I’ve built up so
+      far. You’ll start fresh from Day one, and it can’t be undone.
+    </p>
+    <div class="guardrail">
+      {#if lastBackup}
+        <span class="ok"><i class="ti ti-circle-check" aria-hidden="true"></i> Backed up — {lastBackup}</span>
+      {:else}
+        <span class="warn">Not backed up yet</span>
+        <button class="link" on:click={backupNow}>Back up now</button>
+      {/if}
+    </div>
+    <div class="dlg-actions">
+      <button class="btn-danger" on:click={confirmDelete}>Delete everything</button>
+      <div class="dlg-spacer"></div>
+      <button
+        class="btn-primary"
+        data-autofocus
+        bind:this={deleteCancelBtn}
+        on:click={() => (deleteOpen = false)}>Cancel</button
+      >
+    </div>
+  </Modal>
+{/if}
+
 <style>
-  .group {
-    margin-top: 1.25rem;
-    max-width: 32rem;
-  }
-  .group-title {
-    margin: 0 0 0.2rem;
-    font-size: 1rem;
-    font-weight: 600;
-  }
-  .group-help {
-    margin: 0 0 0.85rem;
+  /* ---- observing strip ---- */
+  .observe {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    max-width: 34rem;
+    margin: 0.25rem 0 0.5rem;
+    padding: 0.6rem 0.85rem;
+    border-radius: 8px;
+    border: 1px solid var(--hairline);
+    background: color-mix(in srgb, canvastext 3%, canvas);
     color: var(--text-secondary);
     font-size: 0.9rem;
   }
-
-  .card-group {
-    border: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
+  .observe .ti {
+    font-size: 1.05rem;
   }
 
-  /* Visually hidden but still focusable — the card carries the visible state. */
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0 0 0 0);
-    white-space: nowrap;
-    border: 0;
+  /* ---- groups ---- */
+  .group {
+    max-width: 34rem;
+    margin-top: 1.5rem;
+  }
+  .group-label {
+    margin: 0 0 0.6rem;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+  .group-sub {
+    margin: -0.3rem 0 0.85rem;
+    font-size: 0.9rem;
+    line-height: 1.5;
+    color: var(--text-secondary);
   }
 
-  .opt-card {
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
-    min-height: 44px;
-    padding: 0.7rem 0.9rem;
+  /* ---- segmented control (warm-up language) ---- */
+  .segmented {
+    display: inline-flex;
+    gap: 0.3rem;
+    padding: 0.25rem;
     border: 1px solid var(--hairline);
-    border-radius: 12px;
+    border-radius: 10px;
+  }
+  .seg-btn {
+    min-height: 36px;
+    padding: 0.4rem 0.95rem;
+    font: inherit;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    background: transparent;
+    border: none;
+    border-radius: 7px;
     cursor: pointer;
   }
-  .opt-card:hover {
+  .seg-btn.on {
+    background: color-mix(in srgb, var(--focus-ring) 16%, canvas);
+    color: canvastext;
+  }
+  .seg-btn:hover:not(.on) {
     background: color-mix(in srgb, canvastext 5%, canvas);
   }
-  .opt-card.selected {
-    border-color: var(--focus-ring);
-    background: color-mix(in srgb, var(--focus-ring) 10%, canvas);
-  }
-  /* The radio is visually hidden, so show the ring on the card when it's
-     focused (keyboard nav). Always-on :focus-within, not :focus-visible. */
-  .opt-card:focus-within {
+  .seg-btn:focus {
     outline: 3px solid var(--focus-ring);
     outline-offset: 2px;
   }
-  .opt-card input {
-    position: absolute;
-    opacity: 0;
-    width: 1px;
-    height: 1px;
+
+  /* ---- corrections row ---- */
+  .row {
+    display: flex;
+    align-items: flex-start;
+    gap: 1rem;
+    padding: 0.9rem 1rem;
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
   }
-  .opt-card input:focus {
-    outline: none; /* ring is drawn on the card via :focus-within */
-  }
-  .opt-title {
+  .row-title {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
     font-weight: 600;
   }
-  .opt-sub {
+  .row-desc {
+    margin: 0.4rem 0 0;
+    font-size: 0.9rem;
+    line-height: 1.55;
     color: var(--text-secondary);
+  }
+  .row-text {
+    flex: 1;
+    min-width: 0;
+  }
+
+  /* ---- toggle switch ---- */
+  .switch {
+    position: relative;
+    flex-shrink: 0;
+    width: 42px;
+    height: 24px;
+    margin-top: 0.1rem;
+    padding: 0;
+    border: none;
+    border-radius: 12px;
+    background: color-mix(in srgb, canvastext 22%, canvas);
+    cursor: pointer;
+  }
+  .switch .knob {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #fff;
+  }
+  .switch.on {
+    background: var(--focus-ring);
+  }
+  .switch.on .knob {
+    left: 21px;
+  }
+  .switch:focus {
+    outline: 3px solid var(--focus-ring);
+    outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .switch,
+    .switch .knob {
+      transition:
+        background-color 120ms ease,
+        left 120ms ease;
+    }
+  }
+
+  /* ---- buttons + links ---- */
+  .btn-primary,
+  .btn-danger {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    min-height: 38px;
+    padding: 0.5rem 1.05rem;
+    font: inherit;
+    font-size: 0.92rem;
+    font-weight: 500;
+    border-radius: 9px;
+    cursor: pointer;
+  }
+  .btn-primary {
+    border: none;
+    background: var(--focus-ring);
+    color: #fff;
+  }
+  .btn-primary:hover {
+    background: color-mix(in srgb, var(--focus-ring) 88%, black);
+  }
+  /* Destructive action — NEUTRAL muted outline (never red; the app avoids red/green
+     for colour-blind safety). Destructiveness is carried by the amber alert icon,
+     the copy, the confirm step, and Cancel being the highlighted blue default. */
+  .btn-danger {
+    background: transparent;
+    border: 1px solid color-mix(in srgb, canvastext 28%, canvas);
+    color: var(--text-secondary);
+  }
+  .btn-danger:hover {
+    background: color-mix(in srgb, canvastext 6%, canvas);
+    color: canvastext;
+  }
+  .btn-primary:focus,
+  .btn-danger:focus {
+    outline: 3px solid var(--focus-ring);
+    outline-offset: 2px;
+  }
+  .help {
+    margin: 0.6rem 0 0;
+    max-width: 30rem;
     font-size: 0.85rem;
+    line-height: 1.5;
+    color: var(--text-secondary);
+  }
+
+  /* Discreet text links (Restore / Delete). */
+  .data-links {
+    display: flex;
+    gap: 1.4rem;
+    margin-top: 1.1rem;
+  }
+  .link {
+    padding: 0.3rem 0.1rem;
+    font: inherit;
+    font-size: 0.9rem;
+    color: var(--link);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+  }
+  .link:hover {
+    text-decoration: underline;
+  }
+  /* Neutral muted, not red — destructiveness is made clear by the confirm dialog,
+     not by colour alone. */
+  .link.danger {
+    color: var(--text-secondary);
+  }
+  .link:focus {
+    outline: 3px solid var(--focus-ring);
+    outline-offset: 2px;
+    border-radius: 5px;
+  }
+
+  /* ---- dialog content ---- */
+  .dlg-head {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    margin-bottom: 0.6rem;
+  }
+  /* Amber caution — never red (colour-blind-safe). */
+  .warn-icon {
+    font-size: 1.3rem;
+    color: var(--warning);
+  }
+  .dlg-title {
+    margin: 0 0 0.6rem;
+    font-size: 1.1rem;
+    font-weight: 600;
+  }
+  .dlg-head .dlg-title {
+    margin: 0;
+  }
+  .dlg-body {
+    margin: 0;
+    font-size: 0.92rem;
+    line-height: 1.55;
+    color: var(--text-secondary);
+  }
+  .guardrail {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    margin-top: 1rem;
+    padding: 0.6rem 0.8rem;
+    border-radius: 9px;
+    background: color-mix(in srgb, canvastext 4%, canvas);
+    font-size: 0.86rem;
+  }
+  .guardrail .warn {
+    color: var(--text-secondary);
+  }
+  /* Confirmation reads in the blue accent, never green (colour-blind-safe). */
+  .guardrail .ok {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--link);
+  }
+  .dlg-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-top: 1.3rem;
+  }
+  .dlg-spacer {
+    flex: 1;
   }
 </style>

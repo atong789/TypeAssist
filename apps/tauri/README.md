@@ -25,4 +25,4 @@ From the repo root: `just dev`. This builds + signs the Swift sidecar, then runs
 
 ## UI constraints — enforced by stylesheet
 
-- `input[type="range"]` is hidden globally in `src/app.css`. Use discrete card selectors instead. See product principle 5 in `CLAUDE.md`.
+- `input[type="range"]` is hidden globally in `src/app.css`. Use discrete card selectors instead. See Principle #5 in `CLAUDE.md`.

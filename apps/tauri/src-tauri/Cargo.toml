@@ -36,4 +36,14 @@ tracing-subscriber.workspace = true
 behavioural-model = { path = "../../../crates/behavioural-model" }
 volatility-map = { path = "../../../crates/volatility-map" }
 correction-engine = { path = "../../../crates/correction-engine" }
-storage = { path = "../../../crates/storage" }
+
+# macOS-only: a small native shim so the native tray NSMenu lands its first
+# keyboard focus on the topmost ACTIONABLE item (skipping the disabled status
+# header), instead of AppKit's stale default. Tauri seals off NSMenu access, so
+# we reach the menu via the public NSMenuDidBeginTracking notification. Versions
+# pinned to what tauri/muda already resolve, so the NSMenu types are identical.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSNotification", "NSString", "NSArray", "NSOperation", "NSGeometry"] }
+objc2-app-kit = { version = "0.3", features = ["NSMenu", "NSMenuItem", "NSEvent", "NSApplication", "NSResponder", "NSGraphicsContext"] }
+block2 = "0.6"
