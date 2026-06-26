@@ -12,7 +12,6 @@
   import { onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import { appState } from "../lib/previewSettings";
   import { loadSpellingPref, saveSpellingPref, type SpellingPref } from "../lib/locale";
   import Modal from "../lib/Modal.svelte";
   import RestoreDialog from "../lib/RestoreDialog.svelte";
@@ -54,9 +53,10 @@
     segEls[ni]?.focus();
   }
 
-  // ---- Corrections master gate — the SAME on/off as the menu-bar toggle. Off by
-  // default; the engine never flips it on (Fluent only REVEALS it). Read on mount
-  // + sync via corrections://state; write via set_correction_enabled.
+  // ---- Corrections master gate — the SAME on/off as the menu-bar toggle and
+  // Today's offer card (one source of truth). Off by default; the engine never
+  // flips it on. Always available — no unlock/readiness gate. Read on mount +
+  // sync via corrections://state; write via set_correction_enabled.
   interface AllowListState {
     correction_enabled: boolean;
   }
@@ -145,45 +145,29 @@
   </div>
 </section>
 
-<!-- 3) Corrections — state-aware -->
+<!-- 3) Corrections — one always-available On/Off (no readiness gate). Same state
+     as the menu-bar toggle and Today's offer card. -->
 <section class="group">
-  {#if $appState === "fluent"}
-    <div class="row">
-      <div class="row-text">
-        <div class="row-title">Corrections</div>
-        <p class="row-desc">
-          Ready. When I’m sure, I’ll suggest the fix as you type — accept with Tab, or keep
-          typing to ignore it. You’re always the one typing.
-        </p>
-      </div>
-      <button
-        class="switch"
-        class:on={correctionEnabled}
-        role="switch"
-        aria-checked={correctionEnabled}
-        aria-label="Corrections"
-        on:click={toggleCorrections}
-      >
-        <span class="knob" aria-hidden="true"></span>
-      </button>
+  <div class="row">
+    <div class="row-text">
+      <div class="row-title">Corrections</div>
+      <p class="row-desc">
+        When this is on, I’ll suggest a fix right after a word — accept it with a tap of Shift,
+        or press Esc to undo. The everyday corrections help straight away; the ones I’m still
+        learning join in over time. You’re always the one typing.
+      </p>
     </div>
-  {:else}
-    <div class="row">
-      <div class="row-text">
-        <div class="row-title">Corrections <i class="ti ti-lock lock" aria-hidden="true"></i></div>
-        <p class="row-desc">
-          {#if $appState === "building"}
-            Getting there. I’m quietly guessing your corrections in the background and checking
-            them against what you actually do. I’m not consistently right yet, so I won’t step in.
-            When I am, I’ll ask.
-          {:else}
-            Not yet. I’ve only just met your hands. Once I’ve watched enough to be useful — and
-            checked my guesses against your own corrections — I’ll offer to turn this on.
-          {/if}
-        </p>
-      </div>
-    </div>
-  {/if}
+    <button
+      class="switch"
+      class:on={correctionEnabled}
+      role="switch"
+      aria-checked={correctionEnabled}
+      aria-label="Corrections"
+      on:click={toggleCorrections}
+    >
+      <span class="knob" aria-hidden="true"></span>
+    </button>
+  </div>
 </section>
 
 <!-- 4) Your Typing Data -->
@@ -328,10 +312,6 @@
     align-items: center;
     gap: 0.45rem;
     font-weight: 600;
-  }
-  .row-title .lock {
-    font-size: 0.95rem;
-    color: var(--text-secondary);
   }
   .row-desc {
     margin: 0.4rem 0 0;

@@ -17,6 +17,8 @@
         "title": "TypeAssist",
         "width": 780,
         "height": 620,
+        "minWidth": 780,
+        "minHeight": 620,
         "resizable": false,
         "center": true,
         "visible": false
@@ -48,23 +50,10 @@
         "shadow": false
       },
       {
-        "label": "allowlist",
-        "title": "Corrections",
-        "width": 380,
-        "height": 480,
-        "resizable": false,
-        "decorations": false,
-        "transparent": true,
-        "alwaysOnTop": true,
-        "visible": false,
-        "skipTaskbar": true,
-        "shadow": false
-      },
-      {
         "label": "cue",
         "title": "Correction",
-        "width": 260,
-        "height": 72,
+        "width": 320,
+        "height": 112,
         "resizable": false,
         "decorations": false,
         "transparent": true,

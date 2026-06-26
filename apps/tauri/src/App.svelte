@@ -2,14 +2,13 @@
   import { onMount, tick, type ComponentType } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import DebugPanel from "./routes/DebugPanel.svelte";
-  import Home from "./routes/Home.svelte";
   import Today from "./routes/Today.svelte";
   import Progress from "./routes/Progress.svelte";
   import Settings from "./routes/Settings.svelte";
   import FeedbackDialog from "./lib/FeedbackDialog.svelte";
   import Onboarding from "./routes/Onboarding.svelte";
   import { modalOpen } from "./lib/modal";
-  import { onboarded, appState } from "./lib/previewSettings";
+  import { onboarded } from "./lib/previewSettings";
 
   // DEV-ONLY preview-state switcher. Loaded via a dynamic import GUARDED by
   // import.meta.env.DEV so a production build folds the branch to `false`, drops
@@ -20,11 +19,10 @@
     import("./lib/PreviewSwitcher.svelte").then((m) => (PreviewSwitcher = m.default));
   }
 
-  // First-run onboarding gates the shell. On "Get started" (or a restore), it
-  // completes and drops the user onto Today in Day one — observe-only, NOT a
-  // warm-up — so the first day breathes.
+  // First-run onboarding ("DayOne") gates the shell. On "Get started" (or a
+  // restore), it completes and drops the user onto Today — observe-only, NOT a
+  // warm-up — so the first day breathes. Onboarding never recurs once done.
   async function completeOnboarding() {
-    appState.set("day1");
     route = "today";
     onboarded.set(true);
     // Let the shell mount (tabEls + navRovingIndex update for "today"), then land
@@ -46,14 +44,18 @@
   // Builder's debug view — hidden behind Cmd+Shift+D. Not a user feature.
   let debugOpen = false;
 
+  // DEV-ONLY state-preview overlay — hidden behind Cmd+Shift+P, dev builds only
+  // (the toggle is guarded by import.meta.env.DEV, and the component itself is
+  // dropped from release builds). Lets the builder force Today's empty/normal
+  // state and replay onboarding without touching real data.
+  let previewOpen = false;
+
   // ---- Shell navigation -------------------------------------------------
-  // Front-end rebuild, shell only. The locked design: FOUR primary tabs, then a
-  // three-tier utility group at the bottom — Feedback as a soft accent
-  // invitation ("Tell me what you think"), then About + Privacy & Terms of
-  // Service as tiny muted links. Each opens a PLACEHOLDER panel for now; real
-  // screen content is built one at a time next.
+  // THREE primary tabs (Home retired — its only job, the Corrections invite,
+  // moved to Today), then a three-tier utility group at the bottom — Feedback as
+  // a soft accent invitation ("Tell me what you think"), then About + Privacy &
+  // Terms of Service as tiny muted links.
   type Route =
-    | "home"
     | "today"
     | "progress"
     | "settings"
@@ -61,10 +63,9 @@
     | "about"
     | "privacy";
 
-  // Only these four are tabs (a WAI-ARIA roving tablist). Icons are Tabler,
+  // Only these three are tabs (a WAI-ARIA roving tablist). Icons are Tabler,
   // bundled locally (see main.ts) — never a CDN.
   const tabs: { route: Route; label: string; icon: string }[] = [
-    { route: "home", label: "Home", icon: "ti-home" },
     { route: "today", label: "Today", icon: "ti-sun" },
     { route: "progress", label: "Progress", icon: "ti-chart-bar" },
     { route: "settings", label: "Settings", icon: "ti-settings" },
@@ -78,7 +79,7 @@
     privacy: "Privacy & Terms of Service",
   };
 
-  let route: Route = "home";
+  let route: Route = "today";
   let tabEls: HTMLButtonElement[] = [];
 
   // The nav's roving anchor: the index of the tab that holds tabindex="0" (the
@@ -231,6 +232,16 @@
       debugOpen = !debugOpen;
       return;
     }
+    if (
+      import.meta.env.DEV &&
+      event.metaKey &&
+      event.shiftKey &&
+      (event.key === "p" || event.key === "P")
+    ) {
+      event.preventDefault();
+      previewOpen = !previewOpen;
+      return;
+    }
     // A modal owns Tab while it's open — stand down so the two traps don't fight.
     if ($modalOpen) return;
     if (event.key !== "Tab" || !rootEl) return;
@@ -290,20 +301,60 @@
   </nav>
 
   <div class="panel" id="screen-panel" role="tabpanel" aria-labelledby={`tab-${route}`}>
-    <!-- TEMPORARY, DEV-ONLY: preview-state switcher (loaded only in dev — see the
-         guarded dynamic import above). Absent from release builds entirely.
-         Remove with automatic state detection. -->
-    {#if PreviewSwitcher}
+    <!-- DEV-ONLY state-preview overlay: loaded only in dev (guarded dynamic
+         import above) and shown only when toggled with Cmd+Shift+P. Absent from
+         release builds entirely. -->
+    {#if PreviewSwitcher && previewOpen}
       <svelte:component this={PreviewSwitcher} />
     {/if}
-    {#if route === "home"}
-      <Home />
-    {:else if route === "today"}
+    {#if route === "today"}
       <Today on:navigate={handleNavigate} />
     {:else if route === "progress"}
       <Progress />
     {:else if route === "settings"}
       <Settings />
+    {:else if route === "about"}
+      <!-- About — copy verbatim from design doc Section 08 About panel. Reuses
+           the Privacy wrapper/typography. Version is the app's actual 0.1.0. -->
+      <header class="screen-header"><h1>{activeLabel}</h1></header>
+      <div class="privacy about-stack">
+        <p class="about-lead">Hi, I’m Jordan.</p>
+        <p class="privacy-p">
+          I’m the quiet helper inside TypeAssist. I was made for hands that don’t always land where
+          you mean — so I learn the small ways your fingers slip, and gently offer the word you
+          meant. You’re always the one typing; I only ever suggest.
+        </p>
+        <p class="privacy-p">
+          The more we type together, the better I come to know your hands. Everything I learn stays
+          right here on your Mac — no cloud, no account, no one else.
+        </p>
+        <p class="about-foot">TypeAssist · version 0.1.0 — everything stays on your Mac.</p>
+      </div>
+    {:else if route === "privacy"}
+      <!-- Privacy & Terms — copy is verbatim from design doc Section 08 (honesty
+           pass: the vocabulary count CAN include learned names/terms, and stays
+           on-device). British "recognise" is intentional. -->
+      <header class="screen-header"><h1>{activeLabel}</h1></header>
+      <div class="privacy">
+        <section class="privacy-block">
+          <h2 class="privacy-h">What I learn</h2>
+          <p class="privacy-p">
+            The shape of how you type: which keys you slip on, the short words you fix (like “teh” →
+            “the”), and your own everyday vocabulary — a private count of the words you use most,
+            and how often. The words you reach for again and again become part of that count — your
+            own names and terms included — so I recognise them instead of treating them as slips.
+          </p>
+        </section>
+        <section class="privacy-block">
+          <h2 class="privacy-h">What I never keep</h2>
+          <p class="privacy-p">
+            Your sentences, your documents, and your passwords. I skip secure fields entirely,
+            ignore anything you paste or auto-fill, and keep no log of what you write. The count is
+            only ever single words and how often you use them — never the sentences they sit in —
+            and none of it ever leaves this Mac.
+          </p>
+        </section>
+      </div>
     {:else}
       <header class="screen-header"><h1>{activeLabel}</h1></header>
       <p class="placeholder">Shell only — this screen’s content is coming next.</p>
@@ -492,5 +543,44 @@
     margin: 0;
     color: var(--text-secondary);
     font-size: 0.95rem;
+  }
+
+  /* ---- Privacy & Terms content (two blocks, doc Section 08) ---- */
+  .privacy {
+    max-width: 34rem;
+  }
+  .privacy-block {
+    margin-top: 1.4rem;
+  }
+  .privacy-h {
+    margin: 0 0 0.4rem;
+    font-size: 1.02rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .privacy-p {
+    margin: 0;
+    font-size: 0.95rem;
+    line-height: 1.65;
+    color: canvastext;
+  }
+
+  /* ---- About panel (reuses .privacy wrapper + .privacy-p typography) ---- */
+  .about-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+    margin-top: 0.2rem;
+  }
+  .about-lead {
+    margin: 0;
+    font-size: 1.05rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .about-foot {
+    margin: 0.3rem 0 0;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
   }
 </style>

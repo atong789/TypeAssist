@@ -298,35 +298,33 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
         Some(lock_icon()),
         None::<&str>,
     )?;
-    // M3 correction Step 1 — the menu-bar master gate (instant, one-action
-    // global on/off, the brief's "global off") + the curation panel opener. The
-    // check's initial state is read off disk so it reflects the persisted gate;
-    // it then tracks the engine's authoritative echo (see `setup`). Default is
-    // OFF — the feature ships dark.
-    //
-    // DEFERRED (reveal-when-ready layer): the Corrections group is NOT part of
-    // the while-learning menu. `corr_toggle` is still built and returned so the
-    // engine-echo sync in `setup` keeps working; it (and a "Corrections…"
-    // opener) resurface by adding them — with their own divider — to the menu
-    // when correction is ready to suggest.
+    // Corrections — the menu-bar master gate: a single, always-present item in
+    // its own group above Quit. It's a CheckMenuItem, so the check on the right
+    // IS the state (On = checked, Off = unchecked); tapping flips it. The initial
+    // state is read off disk so it reflects the persisted gate; it then tracks
+    // the engine's authoritative echo (see `setup`). Default is OFF — the engine
+    // never turns it on itself, and there is no unlock/reveal gate.
     let corr_enabled = read_allow_list()
         .map(|al| al.correction_enabled)
         .unwrap_or(false);
     let corr_toggle = CheckMenuItem::with_id(
         app,
         "corr_toggle",
-        "Enable corrections",
+        "Corrections",
         true,
         corr_enabled,
         None::<&str>,
     )?;
-    // One divider only (locked rule): Quit isolated at the bottom, past it.
+    // Two dividers: Corrections sits in its own group, and Quit stays isolated at
+    // the very bottom.
     let sep = PredefinedMenuItem::separator(app)?;
+    let sep_quit = PredefinedMenuItem::separator(app)?;
     let quit = PredefinedMenuItem::quit(app, Some("Quit TypeAssist"))?;
     let menu = Menu::with_items(
         app,
         &[
-            &status, &practice, &progress, &open_main, &settings, &sep, &quit,
+            &status, &practice, &progress, &open_main, &settings, &sep, &corr_toggle, &sep_quit,
+            &quit,
         ],
     )?;
 
@@ -347,7 +345,6 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
             "settings" => show_main(app, "settings"),
             "practice" => show_practice(app),
             "progress" => show_progress(app),
-            "corrections" => show_corrections(app),
             // Capture-stopped recovery (permission intact): re-arm the tap /
             // respawn the sidecar in place — no System Settings round-trip.
             "restart_capture" => {
@@ -557,24 +554,6 @@ fn open_main_progress(app: AppHandle) {
     show_main(&app, "progress");
 }
 
-/// Anchor the Corrections (allow-list) panel under the tray icon, show + focus
-/// it. Same menu-bar-dropdown behaviour as Practice/Progress (hides on blur).
-/// `corrections://open` tells it to (re)load its state on each open.
-fn show_corrections<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(w) = app.get_webview_window("allowlist") {
-        let _ = w.move_window(Position::TrayBottomCenter);
-        let _ = w.show();
-        let _ = w.set_focus();
-        let _ = app.emit("corrections://open", ());
-    }
-}
-
-/// Tauri command: open the Corrections allow-list panel from inside the app.
-#[tauri::command]
-fn open_corrections(app: AppHandle) {
-    show_corrections(&app);
-}
-
 /// Show + focus the Reconnect panel (its own webview window, label "reconnect").
 /// Surfaced by the menu-bar "Reconnect…" recovery item when the sidecar reports
 /// Accessibility was revoked. Centred (not tray-anchored), and — unlike the
@@ -694,25 +673,6 @@ fn set_correction_enabled(
         .map_err(|e| format!("engine control channel closed: {e}"))
 }
 
-/// Tauri command: enable (add) or disable (remove) one `typed → target` pattern
-/// in the allow-list. The panel's per-pattern toggle posts this; the engine
-/// persists + echoes `corrections://state`.
-#[tauri::command]
-fn set_pattern_enabled(
-    typed: String,
-    target: String,
-    enabled: bool,
-    sender: tauri::State<EngineControlSender>,
-) -> Result<(), String> {
-    sender
-        .send(EngineControl::SetPatternEnabled {
-            typed,
-            target,
-            enabled,
-        })
-        .map_err(|e| format!("engine control channel closed: {e}"))
-}
-
 /// Tauri command: ask the engine to (re)emit the current allow-list on
 /// `corrections://state`. The panel calls this on open.
 #[tauri::command]
@@ -735,6 +695,43 @@ fn read_allow_list() -> Result<AllowList, String> {
     AllowList::load_from(&path).map_err(|e| format!("could not read allow_list.json: {e}"))
 }
 
+/// FIRE_TIMING helper — wall-clock UNIX-epoch ms, the SAME clock as the engine's
+/// `now_ms()` and the webview's `Date.now()`, so every t0..t4 stamp is directly
+/// comparable on this machine. Measurement only.
+fn fire_timing_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// FIRE_TIMING t4 — the bubble webview reports back the instant it received the
+/// `corrections://suggested` event (t3_js) and the instant the card painted
+/// (t4_paint, next animation frame). Logged here so the whole t0..t4 chain lands
+/// in one dev log on one clock. Measurement only — does not affect firing.
+#[tauri::command]
+fn log_bubble_timing(t3_js: u64, t4_paint: u64) {
+    tracing::info!(
+        "FIRE_TIMING_UI t3_js={} t4_paint={} d_t3_t4_ms={}",
+        t3_js,
+        t4_paint,
+        t4_paint.saturating_sub(t3_js),
+    );
+}
+
+/// DEV-ONLY: force-show the correction bubble with dummy content (the Cmd+Shift+P
+/// overlay's "Show bubble" button). Emits a synthetic `corrections://suggested`
+/// so the cue window shows (Rust listener) AND the bubble renders (JS listener) —
+/// isolating the UI/window path from the engine's fire decision. The button that
+/// calls this is excluded from release builds.
+#[tauri::command]
+fn dev_show_bubble(app: AppHandle) {
+    let _ = app.emit(
+        engine::EVT_CORRECTION_SUGGESTED,
+        serde_json::json!({ "typed": "waht", "target": "what", "highlight": [0, 1] }),
+    );
+}
+
 /// The on-device data directory the read-only Progress commands resolve files
 /// against. Mirrors the engine's `typeassist_dir`: `TYPEASSIST_DATA_DIR`
 /// overrides (the dev-safety scratch valve), else `~/.typeassist`. `None` when
@@ -751,7 +748,8 @@ fn typeassist_data_dir() -> Option<std::path::PathBuf> {
 /// so a long-idle pattern reads as the lower weight the engine actually sees.
 /// `class` is the coordination/precision tag, **derived on read** from the
 /// `typed→target` pair (`"coord"` / `"precis"`), so nothing new is persisted to
-/// the store; `None` for the rare pair that isn't a clean motor slip.
+/// the store. Non-motor pairs (apostrophe/casing/grammar fixes) are filtered out
+/// of this ledger entirely, so `class` is always present in practice.
 #[derive(serde::Serialize)]
 struct ImpactPattern {
     typed: String,
@@ -788,22 +786,69 @@ fn read_word_patterns() -> Result<Vec<ImpactPattern>, String> {
     }
     let store = correction_engine::WordPatternStore::load_from(&path)
         .map_err(|e| format!("could not read word_patterns.json: {e}"))?;
+    let lexicon = correction_engine::Lexicon::shared();
+    // Load the motor map too, so the ledger's readiness reflects the same
+    // Motor-Map-aware (affected-key) evidence bar the engine uses. Best-effort:
+    // a missing/unreadable map → an empty map → no easing (the base bar), never
+    // an error. Read-only.
+    let motor_map = typeassist_data_dir()
+        .map(|d| d.join("motor_map.json"))
+        .filter(|p| p.exists())
+        .and_then(|p| correction_engine::MotorMap::load_from(&p).ok())
+        .unwrap_or_default();
     let mut out: Vec<ImpactPattern> = store
         .snapshots()
         .into_iter()
-        .map(|s| {
-            let class = correction_engine::classify_slip(&s.typed, &s.target).map(|c| c.as_tag());
+        .filter_map(|s| {
+            use correction_engine::{MotorEdit, ObserveReason, PatternReadiness};
+            // Reconciled with the risk-tiered, suggest-only classifier (the same
+            // `classify` the engine uses). The ledger shows only **genuine motor
+            // slips** — pairs that pass the structural gates (single-motor shape,
+            // real-word target, multi-letter both ends). The "changed my mind"
+            // word-swaps (`so → for`), single-letter cases (`s → is`, `f → of`),
+            // non-word targets, and cross-token merge fragments (`have → havif`)
+            // all fall into a structural `Observe` reason and are dropped here, so
+            // they no longer masquerade as slips. (Still captured per Principle #7
+            // where applicable — just not surfaced.)
+            //
+            // `ready` is the pattern's REAL readiness from the classifier
+            // (`Suggest` clears its risk-tiered bar — low for a non-word source,
+            // high for a real-word source), not a flat-12 cut.
+            let ready =
+                match correction_engine::classify(&s.typed, &s.target, &store, lexicon, &motor_map)
+                {
+                    PatternReadiness::Suggest { .. } => true,
+                    // Genuine slip, just not yet actionable — show it as "observing".
+                    PatternReadiness::Observe {
+                        reason:
+                            ObserveReason::InsufficientEvidence
+                            | ObserveReason::Stale
+                            | ObserveReason::BrakeTripped,
+                    } => false,
+                    // Not a motor slip at all (swap / single-letter / non-word target
+                    // / merge / unseen) → drop from the ledger.
+                    PatternReadiness::Observe { .. } => return None,
+                };
+            // Group tag from the strict motor shape, consistent with the filter
+            // above (transposition = coordination; everything else = precision).
+            // `single_motor_edit` is guaranteed `Some` for a surviving row.
+            let class = match correction_engine::single_motor_edit(&s.typed, &s.target)? {
+                MotorEdit::Transposition => "coord",
+                MotorEdit::AdjacentSubstitution
+                | MotorEdit::DroppedLetter
+                | MotorEdit::ExtraLetter => "precis",
+            };
             let highlight = correction_engine::corrected_target_indices(&s.typed, &s.target);
             let keys = correction_engine::involved_keys(&s.typed, &s.target);
-            ImpactPattern {
+            Some(ImpactPattern {
                 typed: s.typed,
                 target: s.target,
                 obs: s.weight,
-                ready: s.weight >= correction_engine::TIER1_MIN_OBSERVATIONS,
-                class,
+                ready,
+                class: Some(class),
                 highlight,
                 keys,
-            }
+            })
         })
         .collect();
     out.sort_by(|a, b| {
@@ -975,7 +1020,6 @@ pub fn run() {
             open_practice,
             open_progress,
             open_main_progress,
-            open_corrections,
             open_accessibility_settings,
             open_input_monitoring_settings,
             reconnect_open_accessibility,
@@ -983,9 +1027,10 @@ pub fn run() {
             reconnect_surface,
             focus_main_window,
             set_correction_enabled,
-            set_pattern_enabled,
             request_allow_list,
             read_allow_list,
+            dev_show_bubble,
+            log_bubble_timing,
             read_word_patterns,
             read_progress_stats,
             read_key_scores
@@ -1012,9 +1057,7 @@ pub fn run() {
             // (losing focus) dismisses them. Practice keeps focus while typing,
             // so an active round never hides; Progress is read-only.
             WindowEvent::Focused(false)
-                if window.label() == "practice"
-                    || window.label() == "progress"
-                    || window.label() == "allowlist" =>
+                if window.label() == "practice" || window.label() == "progress" =>
             {
                 let _ = window.hide();
                 // C5e: the warm-up / Practice round is gone — resume feeding the
@@ -1063,27 +1106,35 @@ pub fn run() {
                     });
             }
 
-            // M3 correction Step 1 — the visible cue. On every applied
-            // correction (and its undo) briefly show the small HUD near the
-            // top-right of the screen, then hide it. Rust owns show / position /
-            // hide so the cue needs no positioner JS dependency and is shown
-            // WITHOUT focus (the window is also `focus: false`), so it never
-            // steals the caret from the app the user is typing in. The cue
-            // webview renders the `typed → target` text from the same event.
+            // M3 correction bubble — the suggest/accept/undo HUD. Rust owns
+            // show + position (top-right, no positioner JS dependency) and the
+            // window is `focus: false`, so it never steals the caret from the app
+            // the user is typing in. We show on BOTH a new suggestion and an
+            // apply/undo; the bubble webview owns its own HIDE (it knows the
+            // stage-dependent lifetimes — ~5s suggest, 6s accepted-undo, brief
+            // familiar), so there's no Rust timer racing the UI's fade.
             {
                 let handle = app.handle().clone();
+                let show_cue = move |h: &tauri::AppHandle| {
+                    if let Some(w) = h.get_webview_window("cue") {
+                        let _ = w.move_window(Position::TopRight);
+                        let _ = w.show();
+                    }
+                };
+                let h_sug = handle.clone();
+                let show_sug = show_cue.clone();
                 app.handle()
-                    .listen(engine::EVT_CORRECTION_APPLIED, move |_| {
-                        if let Some(w) = handle.get_webview_window("cue") {
-                            let _ = w.move_window(Position::TopRight);
-                            let _ = w.show();
-                            let w_hide = w.clone();
-                            tauri::async_runtime::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
-                                let _ = w_hide.hide();
-                            });
-                        }
+                    .listen(engine::EVT_CORRECTION_SUGGESTED, move |_| {
+                        // FIRE_TIMING t3 — the Tauri main process received the
+                        // suggestion event and is about to show the cue window.
+                        // (The webview's JS listener fires separately; t3_js/t4
+                        // come from log_bubble_timing.) Measurement only.
+                        tracing::info!("FIRE_TIMING t3_rust={}", fire_timing_now_ms());
+                        show_sug(&h_sug);
                     });
+                let h_app = handle.clone();
+                app.handle()
+                    .listen(engine::EVT_CORRECTION_APPLIED, move |_| show_cue(&h_app));
             }
 
             match engine::spawn(&app.handle()) {

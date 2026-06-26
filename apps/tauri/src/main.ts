@@ -6,7 +6,6 @@ import "@tabler/icons-webfont/dist/tabler-icons.min.css";
 import App from "./App.svelte";
 import PracticePanel from "./routes/PracticePanel.svelte";
 import ProgressPanel from "./routes/ProgressPanel.svelte";
-import AllowlistPanel from "./routes/AllowlistPanel.svelte";
 import Cue from "./routes/Cue.svelte";
 import ReconnectPanel from "./routes/ReconnectPanel.svelte";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -20,13 +19,11 @@ const Component =
     ? PracticePanel
     : label === "progress"
       ? ProgressPanel
-      : label === "allowlist"
-        ? AllowlistPanel
-        : label === "cue"
-          ? Cue
-          : label === "reconnect"
-            ? ReconnectPanel
-            : App;
+      : label === "cue"
+        ? Cue
+        : label === "reconnect"
+          ? ReconnectPanel
+          : App;
 
 const app = new Component({
   target: document.getElementById("app")!,

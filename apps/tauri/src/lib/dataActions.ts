@@ -1,7 +1,6 @@
 // On-device data actions — Back up / Restore / Delete. ONE place for the stubs so
 // the data-layer pass wires a single source. Everything stays on this Mac; there
 // is no network path here (Principle #8). The real file I/O is TODO(data-layer).
-import { appState } from "./previewSettings";
 
 export function backupFilename(): string {
   const d = new Date();
@@ -30,10 +29,11 @@ export async function restoreFromBackup(): Promise<void> {
   console.info("[stub] restore (replace, never merge)");
 }
 
-// Erase ALL learned data on disk so the app truly starts fresh at Day one.
+// Erase ALL learned data on disk so the app truly starts fresh. Afterwards every
+// screen reflects the now-empty store on its own (sparse), so there is no state
+// flag to reset.
 export function deleteEverything(): void {
   // TODO(data-layer): erase motor map, word patterns, snapshots, key scores, and
   // allow-list patterns on disk so nothing learned survives.
   console.info("[stub] delete everything");
-  appState.set("day1");
 }

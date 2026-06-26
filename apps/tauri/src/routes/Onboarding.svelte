@@ -223,7 +223,7 @@
       {#if step === 1}
         <h1 class="ob-hi">Hi, I’m Jordan.</h1>
         <p class="ob-lede">
-          I’ll quietly learn how your hands type, and in time help you type more smoothly — all on
+          I’ll quietly learn how your hands type, and in time help your words land the way you meant — all on
           this Mac. First, what should I call you?
         </p>
         <input
@@ -244,7 +244,7 @@
         </div>
         <p class="ob-lede">
           Jordan works entirely on this Mac — but macOS still needs your OK. Turn on both below and
-          Jordan starts catching your slips right away.
+          Jordan starts learning right away.
         </p>
 
         <!-- Each row reflects its OWN grant (`axOn` / `imOn` from the per-grant
@@ -261,7 +261,7 @@
             </span>
             <div class="ob-perm-body">
               <span class="ob-perm-label">Accessibility</span>
-              <span class="ob-perm-sub">Lets Jordan see which text field you’re in, and fix it.</span>
+              <span class="ob-perm-sub">Lets Jordan see which field you’re typing in, and stay out of password fields.</span>
               {#if axOn}
                 <span class="ob-perm-allowed">
                   <i class="ti ti-check" aria-hidden="true"></i>Allowed

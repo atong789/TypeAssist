@@ -213,7 +213,7 @@
         </span>
         <div class="perm-body">
           <span class="perm-label">Accessibility</span>
-          <span class="perm-sub">Lets Jordan see which text field you’re in, and fix it.</span>
+          <span class="perm-sub">Lets Jordan see which field you’re typing in, and stay out of password fields.</span>
           {#if axGranted}
             <span class="perm-allowed"><i class="ti ti-check" aria-hidden="true"></i>Allowed</span>
           {:else}

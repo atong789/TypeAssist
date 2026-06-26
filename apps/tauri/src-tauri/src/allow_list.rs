@@ -79,8 +79,13 @@ impl AllowList {
 
     /// The target this typed word should be corrected to, **iff** the master
     /// gate is on and `typed` matches an enabled pattern (case-insensitive).
-    /// Returns `None` when the gate is off, the list is empty, or there's no
-    /// match — the single chokepoint the engine asks "should I correct this?".
+    ///
+    /// NOTE: unused since the bubble fires from the engine's classifier/bold lane
+    /// rather than the manual allow-list (whose per-pattern enable was retired —
+    /// it's always empty). Only `correction_enabled` (the master gate) is still
+    /// read. Retained with `enable`/`disable` for the planned ignore-based
+    /// back-off; remove the whole `patterns` mechanism if that doesn't land.
+    #[allow(dead_code)]
     pub fn target_for(&self, typed: &str) -> Option<&str> {
         if !self.correction_enabled {
             return None;
@@ -106,6 +111,12 @@ impl AllowList {
     /// no-op-after-normalize pair (empty, or `typed == target`) is rejected so
     /// the list can't hold a pattern that would never fire or would loop.
     /// Returns `true` if the list changed.
+    ///
+    /// NOTE: the manual per-pattern "enable" UI was removed in the frontend
+    /// redesign — the engine now decides what to suggest and `disable` is the
+    /// teach-stop. This is kept (and exercised by tests) for the M3 §5 bubble
+    /// pass, which re-wires the fire decision onto the classifier.
+    #[allow(dead_code)]
     pub fn enable(&mut self, typed: &str, target: &str) -> bool {
         let typed = normalize_word(typed);
         let target = normalize_word(target);
@@ -123,9 +134,14 @@ impl AllowList {
         true
     }
 
-    /// Disable (remove) a pattern by its typed form — the Escape-undo
-    /// teach-stop and the panel's off toggle both land here. Returns `true` if
-    /// a pattern was removed.
+    /// Disable (remove) a pattern by its typed form. Returns `true` if a pattern
+    /// was removed.
+    ///
+    /// NOTE: currently unused — the Escape-undo teach-stop was dropped (undo now
+    /// only reverts; v42). Retained (and tested) for the planned ignore-based
+    /// back-off (a pattern the user keeps ignoring stops being suggested), which
+    /// is firing-logic work outside the bubble task. Mirrors [`enable`].
+    #[allow(dead_code)]
     pub fn disable(&mut self, typed: &str) -> bool {
         let typed = normalize_word(typed);
         let before = self.patterns.len();

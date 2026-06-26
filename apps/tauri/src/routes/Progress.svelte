@@ -7,16 +7,15 @@
      panel to corrections touching that key; "← Show all corrections" clears it.
 
      Heat = the blue accent, deeper = more slips for the active lens (never red),
-     scaled relative to the user's own worst live key. State-aware (shared
-     appState): Day one = all faint/dashed + lens toggle disabled; Building /
-     Fluent = REAL coverage — sampled keys shaded, under-sampled keys stay faint
-     (we never force a key to "seen"). Observe-only; reads nothing it shouldn't.
-     Colours: app blue + soft blue (#7fb6ee) only — never green or red. -->
+     scaled relative to the user's own worst live key. The map fills CONTINUOUSLY
+     as data accrues — sampled keys shade in, under-sampled keys stay faint/dashed
+     (we never force a key to "seen"); no per-state variants. Observe-only; reads
+     nothing it shouldn't. Colours: app blue + soft blue only — never green/red. -->
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { appState } from "../lib/previewSettings";
   import CorrectionPair from "../lib/CorrectionPair.svelte";
+  import { devProgressState } from "../lib/previewSettings";
 
   type Lens = "precision" | "coordination";
 
@@ -47,6 +46,18 @@
   let keyScores: KeyScore[] = [];
   let patterns: ImpactPattern[] = [];
   let lens: Lens = "precision";
+
+  // DEV-ONLY override (Cmd+Shift+P overlay): force the day-one / no-data state on
+  // a Mac that already has data. Folds to false in release builds (the guard),
+  // and blanks the EFFECTIVE views only — real data on disk is never touched.
+  // Everything downstream (keyboard, caption, impact panel) reads the `eff*`
+  // arrays, so forcing empty makes the whole screen render its no-data state.
+  $: forceEmpty = import.meta.env.DEV && $devProgressState === "empty";
+  $: effKeyScores = forceEmpty ? [] : keyScores;
+  $: effPatterns = forceEmpty ? [] : patterns;
+  // Entering the forced day-one view, drop any stale key selection so the panel
+  // shows the clean no-data state, not "The q key".
+  $: if (forceEmpty) selectedKey = null;
   // The selected key links the map and the panel: null → the panel shows the
   // FULL list; a key → that key highlights and the panel filters to the
   // corrections that involve it. Selection follows focus (arrow-navigation) and
@@ -57,7 +68,7 @@
   // count. With a key selected, scope to the corrections that touch it.
   const scopeToKey = (list: ImpactPattern[], key: string | null) =>
     key ? list.filter((p) => p.keys.includes(key)) : list;
-  $: scopedPatterns = scopeToKey(patterns, selectedKey);
+  $: scopedPatterns = scopeToKey(effPatterns, selectedKey);
   // The lens drives the LIST too, not just the map shading: show ONLY the active
   // group (never both stacked). Precision → precision corrections; Coordination →
   // coordination corrections. Applies to the full list and the per-key drill-down.
@@ -81,7 +92,7 @@
   // read_key_scores has no space entry, so it is simply "not sampled" — it
   // renders faint/dashed like any key without confident data (and faint in Day
   // one). No synthesized value.
-  $: scoreByKey = new Map(keyScores.map((k) => [k.key, k]));
+  $: scoreByKey = new Map(effKeyScores.map((k) => [k.key, k]));
 
   // Roving tabindex — the keyboard is ONE Tab stop (like the main nav). Exactly
   // one key has tabindex 0 (the roving key), the rest tabindex -1. Arrows move
@@ -120,20 +131,19 @@
   const rawOf = (k: KeyScore | undefined, l: Lens) =>
     !k ? 0 : l === "precision" ? k.precision : k.coordination;
 
-  // Day one shows no heat at all; Building / Fluent both show real coverage.
-  $: dataLive = $appState !== "day1";
+  // Whether a key has been TYPED at all (v41): faint/dashed = truly no data =
+  // never pressed (`productions > 0`), the SAME rule on both lenses. The moment a
+  // key has any presses we show its real value, however small — a key typed but
+  // with a 0 mis-hit rate OR 0 letter-order slips sits at the lowest shade, never
+  // dashed (e.g. q pressed 141× with no swaps is "seen", not "unknown"). We never
+  // hold a key faint for a low count and never synthesize a shade. The space bar
+  // follows the same rule (no entry → never pressed → faint).
+  const isSeen = (k: KeyScore | undefined): boolean => !!k && k.productions > 0;
   function isLive(key: string): boolean {
-    if (!dataLive) return false;
-    const k = scoreByKey.get(key);
-    return !!(k && k.well_sampled);
+    return isSeen(scoreByKey.get(key));
   }
-  // Relative scaling — the brightest live key for the active lens tops the ramp.
-  $: maxRaw = dataLive
-    ? Math.max(
-        0,
-        ...[...scoreByKey.values()].filter((k) => k.well_sampled).map((k) => rawOf(k, lens)),
-      )
-    : 0;
+  // Relative scaling — the brightest seen key for the active lens tops the ramp.
+  $: maxRaw = Math.max(0, ...[...scoreByKey.values()].filter(isSeen).map((k) => rawOf(k, lens)));
 
   // Quiet → bright blue, relative to the user's own worst key; a key with too
   // little data is painted neutral, never falsely "good".
@@ -151,7 +161,10 @@
   // Per-key detail wording — verbatim shape from the design's Progress text.
   function keyDetail(key: string): string {
     const label = labelOf(key);
-    if (!isLive(key)) return `${label} — not enough yet. Keep typing and this fills in.`;
+    if (!isLive(key)) {
+      // Faint = never pressed (v41), on either lens — never "not enough".
+      return `${label} — I haven’t seen you type this key yet.`;
+    }
     const k = scoreByKey.get(key)!;
     if (lens === "precision") {
       const v = k.precision * 100;
@@ -165,19 +178,72 @@
       : `${label} — turns up in about ${c.toFixed(2)}% of letter-swaps.`;
   }
 
+  // Per-key render data, computed REACTIVELY off the loaded scores. This is the
+  // load-bearing fix: the keyboard mounts before the async `read_key_scores`
+  // resolves, and the per-key `style`/`muted`/`aria-label` in the markup are
+  // function calls that don't, on their own, tell Svelte they depend on
+  // scoreByKey/maxRaw/lens — so the board painted once (empty → faint) and never
+  // repainted when the data arrived or the lens changed. Referencing
+  // scoreByKey/maxRaw/lens HERE makes Svelte recompute this map (and thus
+  // re-render every key) the moment scores load or the lens flips.
+  interface KeyViz {
+    style: string;
+    live: boolean;
+    detail: string;
+  }
+  $: keyViz = ((_sbk, _max, _lens) => {
+    const m = new Map<string, KeyViz>();
+    for (const row of ROWS) {
+      for (const key of row) {
+        m.set(key, { style: keyStyle(key), live: isLive(key), detail: keyDetail(key) });
+      }
+    }
+    return m;
+  })(scoreByKey, maxRaw, lens);
+
   const keyLabel = (key: string) => (key === SPACE ? "space" : key);
 
-  $: caption =
-    $appState === "day1"
-      ? "I haven’t seen enough yet to show your pattern. Keep typing — this fills in on its own."
-      : $appState === "building"
-        ? "Filling in. The faint, dashed keys are ones I haven’t seen enough of yet — not “clean”, just unknown."
-        : "Your full picture. Tap a key, or use the arrow keys, to see the corrections behind it.";
+  // No-corrections message for a selected key — tells the SAME "seen but clean"
+  // story as the menu-bar popover's per-key readout ("… 0.0% of presses · 141
+  // presses seen"), instead of implying the key is under-observed. A genuinely
+  // unseen key says so plainly. Reactive (refs lens + scoreByKey) so it updates
+  // when the lens flips or scores load.
+  $: selectedEmpty = ((_l, _sbk) => {
+    if (!selectedKey) return "";
+    const label = keyLabel(selectedKey);
+    const k = scoreByKey.get(selectedKey);
+    const noun = lens === "precision" ? "mis-hits" : "letter-order slips";
+    if (!k || k.productions <= 0) {
+      return `I haven’t seen you type the ${label} key yet.`;
+    }
+    const presses = Math.round(k.productions).toLocaleString();
+    return `No ${noun} recorded on the ${label} key yet — seen on ${presses} presses.`;
+  })(lens, scoreByKey);
 
+  // Has the user typed at all yet? Drives the Progress day-one / no-data state
+  // (v41): before the first keystroke there's nothing on the map. The moment any
+  // key has data, Progress leaves this state for good (parallels Today's no-data
+  // welcome). `productions` is the master signal — coordination can't exist
+  // without it — but we OR both for safety.
+  $: hasAnyData = effKeyScores.some((k) => k.productions > 0 || k.coordination > 0);
+
+  // Caption — no-data-aware + lens-aware lead (v41):
+  //   • No data yet → a gentle line in Jordan's voice (the keyboard is all faint).
+  //   • With data → "tap a key…" + the faint-key meaning. Faint = never pressed on
+  //     BOTH lenses, so both say "haven't seen you type yet"; only the lead clause
+  //     (corrections vs letter-order slips) differs by lens.
+  $: caption = !hasAnyData
+    ? lens === "precision"
+      ? "I haven’t seen you type yet, so there’s nothing on the map. Keep going — the keys you lean on fill in as I learn your hands."
+      : "I haven’t seen you type yet, so there’s nothing on the map. Keep going — letter-order slips show up here as I learn your hands."
+    : lens === "precision"
+      ? "Tap a key, or use the arrow keys, to see the corrections behind it. The faint, dashed keys are ones I haven’t seen you type yet."
+      : "Tap a key, or use the arrow keys, to see the letter-order slips behind it. The faint, dashed keys are ones I haven’t seen you type yet.";
+
+  // Lens descriptor — the short "right key, clean hit" / "right keys, right order"
+  // tags, matching the menu-bar Progress glance (v41).
   $: lensDesc =
-    lens === "precision"
-      ? "How often each key gets mistyped."
-      : "Keys that get swapped with the ones next to them.";
+    lens === "precision" ? "right key, clean hit" : "right keys, right order";
 
   // Selecting a key links the map to the panel. Selection follows FOCUS (so
   // arrow-navigation reveals each key's corrections as you go) and click; the
@@ -271,7 +337,6 @@
       role="radio"
       aria-checked={lens === "precision"}
       tabindex={lens === "precision" ? 0 : -1}
-      disabled={$appState === "day1"}
       bind:this={lensEls.precision}
       on:click={() => (lens = "precision")}
       on:keydown={onLensKeydown}>Precision</button
@@ -282,13 +347,12 @@
       role="radio"
       aria-checked={lens === "coordination"}
       tabindex={lens === "coordination" ? 0 : -1}
-      disabled={$appState === "day1"}
       bind:this={lensEls.coordination}
       on:click={() => (lens = "coordination")}
       on:keydown={onLensKeydown}>Coordination</button
     >
   </div>
-  <p class="lens-desc">{$appState === "day1" ? " " : lensDesc}</p>
+  <p class="lens-desc">{lensDesc}</p>
 </div>
 
 <!-- Keyboard block — centred, with the caption beneath it. -->
@@ -297,15 +361,15 @@
     {#each ROWS as row, r}
       <div class="kb-row">
         {#each row as key, c}
+          {@const v = keyViz.get(key)}
           <button
             class="kb-key"
             class:space={key === SPACE}
-            class:muted={!isLive(key)}
+            class:muted={!v?.live}
             class:selected={selectedKey === key}
-            style={keyStyle(key)}
+            style={v?.style}
             tabindex={rovingKey === key ? 0 : -1}
-            disabled={$appState === "day1"}
-            aria-label={keyDetail(key)}
+            aria-label={v?.detail}
             aria-pressed={selectedKey === key}
             bind:this={keyEls[key]}
             on:click={() => selectKey(key)}
@@ -343,7 +407,7 @@
   {#if !hasShown}
     <p class="impact-empty">
       {#if selectedKey}
-        No {activeName} corrections recorded for the {keyLabel(selectedKey)} key yet.
+        {selectedEmpty}
       {:else}
         No {activeName} corrections yet — they’ll gather here as you type.
       {/if}
