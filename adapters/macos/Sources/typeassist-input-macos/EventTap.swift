@@ -9,6 +9,13 @@ final class EventTap {
     private var runLoopSource: CFRunLoopSource?
     private var keyDownTimestamps: [Int64: UInt64] = [:]
 
+    /// True while a Shift is held with nothing else pressed since — the window in
+    /// which an isolated Shift TAP (the correction-accept gesture) can complete.
+    /// Set when Shift goes down alone (`.flagsChanged`), cleared by any real key
+    /// or mouse-down (a `Shift+key` chord is not a tap). On Shift release while
+    /// still armed we emit `.shiftTap`.
+    private var shiftArmed = false
+
     /// Verbose per-keystroke `GATE_READ` diagnostics, off unless
     /// `TYPEASSIST_LOG_GATE=1`. Read once at init so the hot path is a bool
     /// check, not an env lookup. The `SECURE_FIELD_DROP` / `SECURE_FIELD_FOCUS`
@@ -27,6 +34,7 @@ final class EventTap {
         // too. We only need the click happened, never where — no coordinates.
         let mask = (1 << CGEventType.keyDown.rawValue)
             | (1 << CGEventType.keyUp.rawValue)
+            | (1 << CGEventType.flagsChanged.rawValue)
             | (1 << CGEventType.leftMouseDown.rawValue)
             | (1 << CGEventType.rightMouseDown.rawValue)
             | (1 << CGEventType.otherMouseDown.rawValue)
@@ -56,6 +64,9 @@ final class EventTap {
         switch command {
         case .injectCorrection(let deleteCount, let replacement):
             Accessibility.injectCorrection(deleteCount: deleteCount, replacement: replacement)
+        case .injectAnchored(let left, let deleteCount, let replacement, let right):
+            Accessibility.injectAnchored(
+                left: left, deleteCount: deleteCount, replacement: replacement, right: right)
         case .shutdown:
             stop()
             exit(0)
@@ -132,10 +143,23 @@ final class EventTap {
         // BEFORE the keycode/secure-gate path (a click is not a key).
         switch type {
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            shiftArmed = false // a click cancels an in-progress isolated-Shift tap
             bridge.emit(.caretMoved(reason: "mouse"))
+            return
+        case .flagsChanged:
+            // Modifier-key transition (no character). Drive the isolated-Shift-tap
+            // detector. Content-free, so handled before the secure-field gate.
+            handleFlagsChanged(event)
             return
         default:
             break
+        }
+
+        // A real key press cancels an isolated-Shift accept window — Shift+key is a
+        // chord, not a tap. Done BEFORE the secure-field gate so a password
+        // keystroke cancels it too (and no .shiftTap fires mid-password).
+        if type == .keyDown {
+            shiftArmed = false
         }
 
         // NOTE: our own injection echo is dropped on the ENGINE side by an exact
@@ -248,6 +272,31 @@ final class EventTap {
             }
         default:
             break
+        }
+    }
+
+    /// Isolated-Shift-tap detector, driven by `.flagsChanged` transitions.
+    /// Arms when Shift goes down with NO other modifier; emits `.shiftTap` when
+    /// Shift releases while still armed (cleared meanwhile by any real key /
+    /// mouse-down / chord). Caps Lock and Fn are ignored — only Ctrl/Opt/Cmd
+    /// count as "another modifier" that turns a tap into a chord.
+    private func handleFlagsChanged(_ event: CGEvent) {
+        let flags = event.flags
+        let shiftDown = flags.contains(.maskShift)
+        let otherMods = flags.contains(.maskControl)
+            || flags.contains(.maskAlternate)
+            || flags.contains(.maskCommand)
+        if shiftDown {
+            // Arm only when Shift is the sole modifier; a chord (e.g. Shift+Cmd)
+            // is never an accept tap.
+            shiftArmed = !otherMods
+        } else {
+            // Shift released. Fire only on a clean isolated tap.
+            if shiftArmed && !otherMods {
+                let timestampMs = UInt64(event.timestamp / 1_000_000)
+                bridge.emit(.shiftTap(timestampMs: timestampMs))
+            }
+            shiftArmed = false
         }
     }
 

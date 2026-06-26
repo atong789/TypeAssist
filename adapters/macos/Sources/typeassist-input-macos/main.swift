@@ -4,6 +4,11 @@ import Foundation
 
 let bridge = Bridge()
 
+// Build marker → stderr (the engine forwards sidecar stderr to its tracing log),
+// so the dev Terminal proves WHICH sidecar binary is running: this one emits the
+// isolated-Shift accept signal (`.shiftTap`, derived from `.flagsChanged`).
+FileHandle.standardError.write(Data("SIDECAR_BUILD shiftTap=enabled flagsChanged=on\n".utf8))
+
 // Skeleton-only: the daemon sets TYPEASSIST_AX_PROMPT=1 so macOS pops the
 // Accessibility dialog when the permission is missing. Production keeps the
 // prompt suppressed — L5 owns that conversation (see Accessibility.swift).

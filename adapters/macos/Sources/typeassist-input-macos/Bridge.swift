@@ -18,6 +18,9 @@ struct Modifiers: Codable {
 enum InputEvent {
     case key(key: String, timestampMs: UInt64, modifiers: Modifiers, dwellMs: UInt32)
     case backspace(timestampMs: UInt64)
+    /// Isolated Shift tap — the accept gesture for a correction suggestion.
+    /// Content-free. See `InputEvent::ShiftTap` in `events.rs`.
+    case shiftTap(timestampMs: UInt64)
     case permissionRequired
     case ready
     case shutdown
@@ -47,6 +50,8 @@ enum InputEvent {
 
 enum OutboundCommand {
     case injectCorrection(deleteCount: Int, replacement: String)
+    /// Anchored replace — see `InputEvent::InjectAnchored` in `events.rs`.
+    case injectAnchored(left: Int, deleteCount: Int, replacement: String, right: Int)
     case shutdown
     /// Tear down the current event tap and create a fresh one. Soft
     /// recovery path for the case where auto-re-enable hasn't worked
@@ -115,6 +120,8 @@ final class Bridge {
             ]
         case let .backspace(ts):
             payload = ["type": "backspace", "timestamp_ms": ts]
+        case let .shiftTap(ts):
+            payload = ["type": "shift_tap", "timestamp_ms": ts]
         case .permissionRequired:
             payload = ["type": "permission_required"]
         case .ready:
@@ -153,6 +160,13 @@ final class Bridge {
             guard let deleteCount = obj["delete_count"] as? Int,
                   let replacement = obj["replacement"] as? String else { return nil }
             return .injectCorrection(deleteCount: deleteCount, replacement: replacement)
+        case "inject_anchored":
+            guard let left = obj["left"] as? Int,
+                  let deleteCount = obj["delete_count"] as? Int,
+                  let replacement = obj["replacement"] as? String,
+                  let right = obj["right"] as? Int else { return nil }
+            return .injectAnchored(
+                left: left, deleteCount: deleteCount, replacement: replacement, right: right)
         case "shutdown":
             return .shutdown
         case "restart_tap":
