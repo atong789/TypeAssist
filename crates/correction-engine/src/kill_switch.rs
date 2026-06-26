@@ -231,6 +231,19 @@ pub fn shadow_motor_budget_for_len(source_len: usize) -> usize {
 /// falls through to the length-band path instead.
 pub const SHADOW_BOLD_MOTOR_BUDGET: usize = 1;
 
+/// **Cold-start frequency-dominance margin.** When a non-word reaches *more than
+/// one* base-dictionary word within a single motor edit, the bold lane still
+/// converges — but only when the most-frequent candidate outweighs the
+/// next-most-frequent by at least this ratio. Calibrated from real Norvig unigram
+/// frequencies so iconic swaps converge on day one (`teh→the` 493×, `thier→their`
+/// 110×, `wich→which` 121×) while genuinely ambiguous reaches stay deferred to the
+/// learned lane (`owen→own` 72×, `ther→the` 24×, `waht→what/want` 3×,
+/// `wierd→weird/wired` 1.4×). A lone candidate has no rival and converges
+/// unconditionally (the prior single-candidate rule), so this only ever *adds*
+/// reach — it never withdraws a fire the single-candidate path already made. Stays
+/// on the suggest path; nothing here is silent.
+pub const CONVERGENCE_DOMINANCE_RATIO: f64 = 100.0;
+
 /// Recency window: a pattern not observed within this many ms is "stale" — the
 /// hand may have grown out of it — and won't be suggested until refreshed. One
 /// 30-day half-life, shared with the motor map's decay so the two layers forget
@@ -708,15 +721,22 @@ pub struct ConvergenceScan {
     /// The typed token is not a known word — neither in the base dictionary nor
     /// in the user's learned vocabulary (`!Lexicon::is_known`).
     pub typed_is_non_word: bool,
-    /// Max motor-map affectedness over the keys the single-candidate edit
-    /// touches (`0.0` unless there is exactly one candidate). Surfaced even when
-    /// `~0` today, per the brief — the signal to watch as the map fills in.
+    /// Max motor-map affectedness over the keys the chosen target's edit touches
+    /// (`0.0` unless a target is chosen). Surfaced even when `~0` today, per the
+    /// brief — the signal to watch as the map fills in.
     pub affectedness: f32,
-    /// The convergence verdict: a non-word source, exactly one base-dictionary
-    /// candidate, and that candidate is not the user's own learned word. This is
-    /// the "would-suggest (bold)" condition — fires regardless of how many times
-    /// the pair has been seen.
+    /// The convergence verdict — true iff [`Self::target`] is `Some`. The
+    /// "would-suggest (bold)" condition: a non-word source converging on a single
+    /// dictionary word — either the lone candidate, or the frequency-dominant one
+    /// when several are reachable (see [`CONVERGENCE_DOMINANCE_RATIO`]). Fires
+    /// regardless of how many times the pair has been seen.
     pub convergent: bool,
+    /// The word this non-word converges on — the fire target — or `None` when it
+    /// does not converge. For a lone candidate this is that candidate; for several,
+    /// the frequency-dominant one when it clears [`CONVERGENCE_DOMINANCE_RATIO`].
+    /// Downstream reads THIS, not `candidates.first()`: the dominant target need
+    /// not sort first among the (alphabetically ordered) candidates.
+    pub target: Option<String>,
 }
 
 /// Exhaustive convergence-candidate scan: every clean-dictionary word reachable
@@ -808,20 +828,45 @@ pub fn shadow_convergence_scan(
         convergence_candidates_fullscan(&typed_n, lexicon, budget)
     };
 
-    // Affectedness of the edit's keys, meaningful only when one candidate exists.
-    let affectedness = if candidates.len() == 1 {
-        crate::slip_class::involved_keys(&typed_n, &candidates[0])
-            .into_iter()
-            .map(|k| motor_map.affectedness(k))
-            .fold(0.0_f32, f32::max)
+    // Convergence target (step 4). A non-word reaching exactly one real word
+    // converges on it (the original single-candidate rule, unchanged). When it
+    // reaches several, the frequency-dominant candidate still wins IF it outweighs
+    // its nearest rival by at least CONVERGENCE_DOMINANCE_RATIO — the cold-start
+    // tiebreak that rescues iconic swaps (teh→the) while leaving genuinely
+    // ambiguous reaches (waht→what/want) to the learned lane. The chosen target is
+    // never the user's own learned coinage. (`candidates` is non-empty only when
+    // `typed_is_non_word`, so that gate is implied here.)
+    let target: Option<String> = if candidates.is_empty() {
+        None
+    } else if candidates.len() == 1 {
+        (!lexicon.is_learned(&candidates[0])).then(|| candidates[0].clone())
     } else {
-        0.0
+        // Rank by Norvig unigram frequency, descending; ties keep the candidates'
+        // existing alphabetical order (stable sort) so the choice is deterministic.
+        let mut ranked: Vec<(&String, u64)> =
+            candidates.iter().map(|c| (c, lexicon.frequency(c))).collect();
+        ranked.sort_by_key(|&(_, freq)| std::cmp::Reverse(freq));
+        let (top_word, top_freq) = (ranked[0].0, ranked[0].1);
+        let second_freq = ranked[1].1;
+        // top_freq > 0 blocks the all-obscure case (no corpus frequency to lean
+        // on); second_freq == 0 makes the ratio test pass trivially (top is the
+        // only candidate with any frequency), which is the intended outcome.
+        let dominant = top_freq > 0
+            && (top_freq as f64) >= CONVERGENCE_DOMINANCE_RATIO * (second_freq as f64);
+        (dominant && !lexicon.is_learned(top_word)).then(|| top_word.clone())
     };
 
-    // Convergence (step 4): non-word source, exactly one candidate, and that
-    // candidate is not a word the user has registered as their own.
-    let convergent =
-        typed_is_non_word && candidates.len() == 1 && !lexicon.is_learned(&candidates[0]);
+    // Affectedness of the edit's keys, against the chosen target — meaningful only
+    // when a target is chosen.
+    let affectedness = match &target {
+        Some(t) => crate::slip_class::involved_keys(&typed_n, t)
+            .into_iter()
+            .map(|k| motor_map.affectedness(k))
+            .fold(0.0_f32, f32::max),
+        None => 0.0,
+    };
+
+    let convergent = target.is_some();
 
     ConvergenceScan {
         candidates,
@@ -829,6 +874,7 @@ pub fn shadow_convergence_scan(
         typed_is_non_word,
         affectedness,
         convergent,
+        target,
     }
 }
 
@@ -1512,8 +1558,10 @@ mod tests {
 
     #[test]
     fn convergence_holds_when_two_candidates() {
-        // A non-word that sits one motor edit from MORE than one real word is
-        // ambiguous — not bold, falls back to the learned/length-band path.
+        // "ther" reaches several real words (the / other / their / there …) and no
+        // one of them outweighs its nearest rival by CONVERGENCE_DOMINANCE_RATIO
+        // (top two ~24×), so it stays ambiguous — not bold, falls back to the
+        // learned/length-band path. (Contrast `teh`, where "the" dominates ~493×.)
         let lex = Lexicon::shared();
         let scan = shadow_convergence_scan("ther", lex, &MotorMap::new());
         assert!(scan.typed_is_non_word);
@@ -1523,6 +1571,38 @@ mod tests {
             scan.candidates
         );
         assert!(!scan.convergent);
+        assert_eq!(scan.target, None);
+    }
+
+    #[test]
+    fn convergence_fires_on_frequency_dominant_swap() {
+        // "teh" reaches the / ten / eh within one motor edit, but "the" outweighs
+        // the next candidate by ~493× — far past CONVERGENCE_DOMINANCE_RATIO — so
+        // the cold-start frequency-dominance tiebreak rescues the iconic swap on
+        // first sighting, even though there is more than one candidate.
+        let lex = Lexicon::shared();
+        let scan = shadow_convergence_scan("teh", lex, &MotorMap::new());
+        assert!(
+            scan.candidates.len() >= 2,
+            "expected several candidates, got {:?}",
+            scan.candidates
+        );
+        assert!(scan.convergent);
+        assert_eq!(scan.target.as_deref(), Some("the"));
+    }
+
+    #[test]
+    fn convergence_defers_on_close_frequency_pair() {
+        // "waht" reaches both "what" and "want"; "what" leads by only ~3×, well
+        // under the dominance margin, so it stays genuinely ambiguous (it really
+        // could be either) and defers to the learned lane — wrong is worse than
+        // missed.
+        let lex = Lexicon::shared();
+        let scan = shadow_convergence_scan("waht", lex, &MotorMap::new());
+        assert!(scan.candidates.iter().any(|c| c == "what"));
+        assert!(scan.candidates.iter().any(|c| c == "want"));
+        assert!(!scan.convergent);
+        assert_eq!(scan.target, None);
     }
 
     #[test]

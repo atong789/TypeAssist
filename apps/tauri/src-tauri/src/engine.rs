@@ -2250,8 +2250,9 @@ fn append_shadow_log(path: &Path, now: u64, s: &ShadowSuggestion) {
 /// [`append_shadow_log`].
 fn append_shadow_bold_log(path: &Path, now: u64, typed: &str, scan: &correction_engine::ConvergenceScan) {
     use std::io::Write;
-    // `convergent` guarantees exactly one candidate.
-    let candidate = scan.candidates.first().map(String::as_str).unwrap_or("");
+    // The fire target — the lone candidate, or the frequency-dominant one when
+    // several were reachable (so NOT necessarily `candidates.first()`).
+    let candidate = scan.target.as_deref().unwrap_or("");
     let line = format!(
         "{now} would-suggest(bold)  {} -> {}  candidates={}  nonword={}  budget={}  affected={:.2}  first-sighting\n",
         typed,
@@ -4074,8 +4075,9 @@ pub fn spawn<R: Runtime>(
                                                                 if let Some(p) = shadow_log_path() {
                                                                     append_shadow_bold_log(&p, now_ms(), &tok.core, &scan);
                                                                 }
-                                                                // convergent ⇒ exactly one candidate, the target.
-                                                                scan.candidates.first().map(|t| (tok.core.clone(), t.clone()))
+                                                                // convergent ⇒ exactly one fire target (the lone
+                                                                // candidate, or the frequency-dominant one).
+                                                                scan.target.as_ref().map(|t| (tok.core.clone(), t.clone()))
                                                             } else {
                                                                 None
                                                             }
