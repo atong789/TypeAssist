@@ -74,6 +74,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::slip_class::{single_motor_edit, MotorEdit};
 use crate::Outcome;
 
 /// Wall-clock timestamp, milliseconds since the UNIX epoch. Matches the
@@ -82,7 +83,14 @@ pub type Timestamp = u64;
 
 /// On-disk shape version. Bump alongside any change to [`MotorMap`] /
 /// [`SlipDistribution`] so a loader can refuse or migrate stale files.
-pub const MOTOR_MAP_VERSION: u32 = 1;
+///
+/// **v2 (Phase 2 Stage 1):** [`SlipDistribution::by_edit`] — the native per-key
+/// edit-type tally — was added. The field is serde-additive, so a v1 file still
+/// loads clean (the tally defaults to zero and accumulates from the next
+/// keystroke); the bump is a permanent marker in the file of *where edit-type
+/// recording began*. [`MotorMap::load_from`] stamps the current version on load,
+/// so an upgraded map carries v2 forward on its next save.
+pub const MOTOR_MAP_VERSION: u32 = 2;
 
 /// Decay half-life: 30 days, in milliseconds. A count left untouched for
 /// 30 days is worth half; for 60 days, a quarter.
@@ -153,6 +161,49 @@ pub struct StabilityReport {
     pub generated_at: Timestamp,
 }
 
+/// Per-key tally of which single-motor-edit *shape* this key's slips take — the
+/// native edit-type signal (Phase 2 Stage 1). The four shapes are exactly those
+/// [`crate::slip_class::single_motor_edit`] classifies. Decayed in lockstep with
+/// the owning [`SlipDistribution`] (it shares `last_update`), so a tendency
+/// reflects how the hand types *now* — same 30-day half-life as everything else.
+/// **Recording only** — no reader / override consumes it yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EditTypeTally {
+    /// Decayed count of adjacent-key fat-finger substitutions (`wprd → word`).
+    #[serde(default)]
+    pub adjacent_substitution: f32,
+    /// Decayed count of adjacent transpositions / swaps (`teh → the`).
+    #[serde(default)]
+    pub transposition: f32,
+    /// Decayed count of dropped letters (`te → the`).
+    #[serde(default)]
+    pub dropped_letter: f32,
+    /// Decayed count of extra / doubled letters (`worrd → word`).
+    #[serde(default)]
+    pub extra_letter: f32,
+}
+
+impl EditTypeTally {
+    /// True iff every shape is zero — used to skip serializing an empty tally so
+    /// a key with no edit-type data keeps its pre-v2 on-disk shape. (Counts are
+    /// only ever added-to or scaled by a positive factor, so `> 0.0` detects any
+    /// real data without an `==` float comparison.)
+    fn is_empty(&self) -> bool {
+        !(self.adjacent_substitution > 0.0
+            || self.transposition > 0.0
+            || self.dropped_letter > 0.0
+            || self.extra_letter > 0.0)
+    }
+
+    /// Scale every shape by the decay factor `f`.
+    fn scale(&mut self, f: f32) {
+        self.adjacent_substitution *= f;
+        self.transposition *= f;
+        self.dropped_letter *= f;
+        self.extra_letter *= f;
+    }
+}
+
 /// Per-intended-character record: how reliably this key is produced, and
 /// where it goes when it isn't.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +214,11 @@ pub struct SlipDistribution {
     /// Decayed counts of slips, keyed by the character actually typed:
     /// `incorrect[typed]` is how often this intended key came out as `typed`.
     pub incorrect: HashMap<char, f32>,
+    /// Native per-key edit-type tally (Phase 2 Stage 1). Serde-additive — a
+    /// pre-v2 file without it loads as an all-zero tally; skipped on write when
+    /// empty so untouched keys keep their pre-v2 shape.
+    #[serde(default, skip_serializing_if = "EditTypeTally::is_empty")]
+    pub by_edit: EditTypeTally,
     /// When this distribution was last decayed (and so the reference point
     /// for the next lazy decay). Milliseconds since epoch.
     pub last_update: Timestamp,
@@ -173,6 +229,7 @@ impl SlipDistribution {
         Self {
             correct_count: 0.0,
             incorrect: HashMap::new(),
+            by_edit: EditTypeTally::default(),
             last_update: now,
         }
     }
@@ -199,6 +256,7 @@ impl SlipDistribution {
                 *v *= f;
                 *v >= PRUNE_EPSILON
             });
+            self.by_edit.scale(f);
         }
         self.last_update = now;
     }
@@ -408,9 +466,51 @@ impl MotorMap {
                     return ObserveReport::default();
                 }
 
+                // Classify the single motor-edit SHAPE for the native edit-type
+                // tally (Phase 2 Stage 1). Strings are rebuilt from the SAME
+                // normalized chars the recording uses, so classification and
+                // recording can never disagree. `None` = a multi-edit fix (e.g.
+                // `worxc→word`): no clean shape, recorded the v0 way with no tally.
+                let typed_s: String = typed_chars.iter().collect();
+                let corrected_s: String = corrected_chars.iter().collect();
+                let edit = single_motor_edit(&typed_s, &corrected_s);
+
+                // Transposition is special. Levenshtein alignment renders a swap
+                // as an insert+delete (or two subs) — which either DROPS the
+                // re-ordered keystroke or files it as a precision mis-hit. Neither
+                // is right: both keys were produced cleanly; only their ORDER was
+                // wrong — a COORDINATION slip, not a precision one. So credit every
+                // key as correct (precision is intact, and the char count is
+                // preserved for the funnel) and tally the transposition on the two
+                // swapped keys; never touch the `incorrect` precision map.
+                if edit == Some(MotorEdit::Transposition) {
+                    let mut correct = 0u32;
+                    for &c in &typed_chars {
+                        self.bump_correct(c, now);
+                        correct += 1;
+                    }
+                    for (&t_c, &c_c) in typed_chars.iter().zip(&corrected_chars) {
+                        if t_c != c_c {
+                            // `c_c` is the intended char at the swapped position.
+                            self.bump_edit(c_c, MotorEdit::Transposition, now);
+                        }
+                    }
+                    self.total_observations += 1;
+                    self.obs_since_persist += 1;
+                    // debug!, not info!: prints the raw words (privacy).
+                    tracing::debug!(
+                        target: "motor_map",
+                        "MOTOR_OBSERVE_TRANSPOSITION typed={:?} corrected={:?} chars={}",
+                        typed,
+                        corrected,
+                        correct
+                    );
+                    return ObserveReport { correct, slips: 0 };
+                }
+
                 let mut correct = 0u32;
                 let mut slips = 0u32;
-                for op in ops {
+                for &op in &ops {
                     match op {
                         AlignOp::Match(c) => {
                             self.bump_correct(c, now);
@@ -428,9 +528,39 @@ impl MotorMap {
                             );
                         }
                         // Inserts / deletes are length changes, not key-for-key
-                        // slips — skipped in v0.
+                        // precision slips — still skipped for the `incorrect` map.
+                        // Their edit-type SHAPE (dropped / extra letter) is tallied
+                        // below.
                         AlignOp::Del(_) | AlignOp::Ins(_) => {}
                     }
+                }
+                // Native edit-type tally for the clean single-motor shapes. The
+                // attribution char is read straight from the alignment: the lone
+                // Sub's intended key, the lone Ins's dropped key, the lone Del's
+                // extra key. (Transposition handled above; `None` gets no tally.)
+                match edit {
+                    Some(MotorEdit::AdjacentSubstitution) => {
+                        if let Some(AlignOp::Sub { intended, .. }) =
+                            ops.iter().find(|o| matches!(o, AlignOp::Sub { .. }))
+                        {
+                            self.bump_edit(*intended, MotorEdit::AdjacentSubstitution, now);
+                        }
+                    }
+                    Some(MotorEdit::DroppedLetter) => {
+                        if let Some(AlignOp::Ins(c)) =
+                            ops.iter().find(|o| matches!(o, AlignOp::Ins(_)))
+                        {
+                            self.bump_edit(*c, MotorEdit::DroppedLetter, now);
+                        }
+                    }
+                    Some(MotorEdit::ExtraLetter) => {
+                        if let Some(AlignOp::Del(c)) =
+                            ops.iter().find(|o| matches!(o, AlignOp::Del(_)))
+                        {
+                            self.bump_edit(*c, MotorEdit::ExtraLetter, now);
+                        }
+                    }
+                    Some(MotorEdit::Transposition) | None => {}
                 }
                 self.total_observations += 1;
                 self.obs_since_persist += 1;
@@ -463,6 +593,25 @@ impl MotorMap {
             .or_insert_with(|| SlipDistribution::new(now));
         dist.decay_in_place(now);
         dist.correct_count += 1.0;
+    }
+
+    /// Tally one native edit-type observation on `key`'s distribution (Phase 2
+    /// Stage 1). Mirrors [`Self::bump_correct`] / [`Self::bump_incorrect`] —
+    /// creates the entry if needed, decays it to `now`, then increments the
+    /// matching shape. Independent of the per-key `incorrect` map: this records
+    /// the *shape* of the slip, that map records *where the key landed*.
+    fn bump_edit(&mut self, key: char, edit: MotorEdit, now: Timestamp) {
+        let dist = self
+            .dists
+            .entry(key)
+            .or_insert_with(|| SlipDistribution::new(now));
+        dist.decay_in_place(now);
+        match edit {
+            MotorEdit::AdjacentSubstitution => dist.by_edit.adjacent_substitution += 1.0,
+            MotorEdit::Transposition => dist.by_edit.transposition += 1.0,
+            MotorEdit::DroppedLetter => dist.by_edit.dropped_letter += 1.0,
+            MotorEdit::ExtraLetter => dist.by_edit.extra_letter += 1.0,
+        }
     }
 
     fn bump_incorrect(&mut self, intended: char, typed: char, now: Timestamp) {
@@ -596,6 +745,35 @@ impl MotorMap {
         }
     }
 
+    /// How **affected** an intended key is, in `[0, 1]` — the decayed slip rate
+    /// (`slips / total`, equivalently `1 - confidence`) of `intended`. This is
+    /// the physiology signal the Motor-Map-aware evidence bar reads: a key the
+    /// map shows slipping often is far likelier to be a true motor miss than a
+    /// change of mind, so a slip on it needs less repetition to surface.
+    ///
+    /// **Gated by [`MIN_SAMPLES`]:** below the sample bar we have too little to
+    /// say honestly, so we return `0.0` (treat as *unaffected* → the cautious
+    /// bar; physiology earns the easing only once there's evidence for it).
+    /// `0.0` is also returned for an unknown / unobservable key. Decayed against
+    /// [`Self::last_now`], so as the hand recovers the score — and the easing it
+    /// drives — falls on its own.
+    pub fn affectedness(&self, intended: char) -> f32 {
+        let Some(intended) = normalize_char(intended) else {
+            return 0.0;
+        };
+        match self.dists.get(&intended) {
+            Some(dist) => {
+                let total = dist.decayed_total(self.last_now);
+                if total < MIN_SAMPLES {
+                    return 0.0;
+                }
+                let correct = dist.decayed_correct(self.last_now);
+                ((total - correct) / total).clamp(0.0, 1.0)
+            }
+            None => 0.0,
+        }
+    }
+
     /// v0 readiness heuristic for the (still-manual) L2→L3 kill-switch:
     /// `true` once at least `top_n` keys have cleared [`MIN_SAMPLES`]. This
     /// is "does the map have enough to say something about the weakest
@@ -690,6 +868,11 @@ impl MotorMap {
         match serde_json::from_slice::<MotorMap>(&bytes) {
             Ok(mut map) => {
                 map.obs_since_persist = 0;
+                // Stamp the current shape version on load: a v1 file (pre
+                // edit-type) loads clean and carries the v2 marker forward on its
+                // next save — the permanent record of where edit-type recording
+                // began for this user's map.
+                map.version = MOTOR_MAP_VERSION;
                 Ok(map)
             }
             Err(e) => {
@@ -951,6 +1134,116 @@ mod tests {
         assert!(map2.query_probable_intent('r').is_empty());
     }
 
+    // --- Phase 2 Stage 1: native edit-type recording -----------------------
+
+    /// Read a key's edit-type tally (tests live in-module, so `dists` is reachable).
+    fn by_edit(map: &MotorMap, key: char) -> EditTypeTally {
+        map.dists.get(&key).map(|d| d.by_edit.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn transposition_records_one_swap_not_two_subs() {
+        // THE core Stage-1 fix. "teh" → "the" is an adjacent swap of e/h. It must
+        // record as ONE coordination event (a Transposition tally on BOTH swapped
+        // keys), with the per-key precision map left CLEAN — no e→h / h→e subs.
+        let mut map = MotorMap::new();
+        let rep = map.observe_outcome(Outcome::CorrectedToOther, "teh", Some("the"), T0);
+
+        // Every key was produced (precision intact); none is a precision mis-hit.
+        assert_eq!((rep.correct, rep.slips), (3, 0), "all 3 keys correct, 0 precision slips");
+        assert_eq!(map.confidence('t'), 1.0);
+        assert_eq!(map.confidence('e'), 1.0);
+        assert_eq!(map.confidence('h'), 1.0);
+
+        // The `incorrect` precision map is NOT polluted (the v1 bug).
+        assert!(map.query_probable_intent('h').is_empty(), "no h-slip recorded");
+        assert!(map.query_probable_intent('e').is_empty(), "no e-slip recorded");
+
+        // Exactly one transposition tally on each swapped key, and nothing else.
+        assert_eq!(by_edit(&map, 'h').transposition, 1.0);
+        assert_eq!(by_edit(&map, 'e').transposition, 1.0);
+        assert_eq!(by_edit(&map, 'h').adjacent_substitution, 0.0);
+        assert_eq!(by_edit(&map, 't').transposition, 0.0, "the unmoved key is untallied");
+    }
+
+    #[test]
+    fn adjacent_substitution_records_sub_and_edit_type() {
+        // "cst" → "cat": s/a are adjacent → one AdjacentSubstitution. The slip is
+        // still recorded in the precision map AND tallied as an edit-type.
+        let mut map = MotorMap::new();
+        map.observe_outcome(Outcome::CorrectedToOther, "cst", Some("cat"), T0);
+        // Precision map unchanged from v1: intended 'a' came out 's'.
+        assert_eq!(map.query_probable_intent('s'), vec![('a', 1.0)]);
+        // New: the shape is tallied on the intended key 'a'.
+        assert_eq!(by_edit(&map, 'a').adjacent_substitution, 1.0);
+        assert_eq!(by_edit(&map, 'a').transposition, 0.0);
+    }
+
+    #[test]
+    fn dropped_letter_records_edit_type() {
+        // "te" → "the": one dropped 'h'. Precision map untouched (the drop is not
+        // a key-for-key mis-hit); the shape is tallied on the dropped key 'h'.
+        let mut map = MotorMap::new();
+        let rep = map.observe_outcome(Outcome::CorrectedToOther, "te", Some("the"), T0);
+        assert_eq!((rep.correct, rep.slips), (2, 0), "t,e correct; drop is no precision slip");
+        assert!(map.query_probable_intent('h').is_empty());
+        assert_eq!(by_edit(&map, 'h').dropped_letter, 1.0);
+    }
+
+    #[test]
+    fn extra_letter_records_edit_type() {
+        // "worrd" → "word": one extra (doubled) 'r'. Shape tallied on 'r'.
+        let mut map = MotorMap::new();
+        let rep = map.observe_outcome(Outcome::CorrectedToOther, "worrd", Some("word"), T0);
+        assert_eq!((rep.correct, rep.slips), (4, 0), "w,o,r,d correct; extra is no precision slip");
+        assert_eq!(by_edit(&map, 'r').extra_letter, 1.0);
+    }
+
+    #[test]
+    fn multi_edit_falls_back_no_edit_type() {
+        // "worxc" → "word" is TWO edits (sub x→d, del c): not a single clean motor
+        // shape. The v0 substitution recording is preserved, and NO edit-type tally
+        // is written (no honest single shape to attribute).
+        let mut map = MotorMap::new();
+        map.observe_outcome(Outcome::CorrectedToOther, "worxc", Some("word"), T0);
+        assert_eq!(map.query_probable_intent('x'), vec![('d', 1.0)], "sub still recorded");
+        // No edit-type tally anywhere for this multi-edit fix.
+        for k in ['w', 'o', 'r', 'x', 'c', 'd'] {
+            assert!(by_edit(&map, k).is_empty(), "{k} must carry no edit-type tally");
+        }
+    }
+
+    #[test]
+    fn v2_motor_map_without_by_edit_loads_clean() {
+        // A v1-shaped file (no `by_edit`, version 1) must load clean: data
+        // preserved, tally defaults to zero, and the version is stamped to 2 (the
+        // permanent marker of where edit-type recording began).
+        let dir = std::env::temp_dir().join(format!("tam_v1_{}", T0));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("motor_map.json");
+        let v1_json = r#"{
+            "version": 1,
+            "dists": {
+                "a": { "correct_count": 12.0, "incorrect": { "s": 3.0 }, "last_update": 1700000000000 }
+            },
+            "last_now": 1700000000000,
+            "total_observations": 15
+        }"#;
+        fs::write(&path, v1_json).unwrap();
+
+        let map = MotorMap::load_from(&path).unwrap();
+        // Old data survived.
+        assert_eq!(map.query_probable_intent('s'), vec![('a', 1.0)]);
+        assert!((map.confidence('a') - 12.0 / 15.0).abs() < 1e-3);
+        // New field defaulted to an empty tally.
+        assert!(by_edit(&map, 'a').is_empty(), "missing by_edit defaults to zero");
+        // Version stamped forward.
+        assert_eq!(map.version, MOTOR_MAP_VERSION);
+        assert_eq!(MOTOR_MAP_VERSION, 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn corrected_with_no_text_is_a_noop() {
         let mut map = MotorMap::new();
@@ -1057,6 +1350,31 @@ mod tests {
     }
 
     #[test]
+    fn affectedness_is_sample_gated_slip_rate() {
+        let mut map = MotorMap::new();
+        // 'a': 25 clean + 25 slips → 50 total, slip rate 0.5, well-sampled.
+        for _ in 0..25 {
+            map.observe_outcome(Outcome::Kept, "a", None, T0);
+        }
+        for _ in 0..25 {
+            map.observe_outcome(Outcome::CorrectedToOther, "q", Some("a"), T0);
+        }
+        assert!((map.affectedness('a') - 0.5).abs() < 1e-3);
+        // 'a' affectedness == 1 - confidence.
+        assert!((map.affectedness('a') - (1.0 - map.confidence('a'))).abs() < 1e-6);
+
+        // 'b': only 3 obs → below MIN_SAMPLES → 0.0 (no easing without evidence).
+        for _ in 0..3 {
+            map.observe_outcome(Outcome::CorrectedToOther, "v", Some("b"), T0);
+        }
+        assert_eq!(map.affectedness('b'), 0.0);
+
+        // Unknown / unobservable keys → 0.0, never NaN.
+        assert_eq!(map.affectedness('z'), 0.0);
+        assert_eq!(map.affectedness('é'), 0.0);
+    }
+
+    #[test]
     fn is_stable_counts_well_sampled_keys() {
         let mut map = MotorMap::new();
         assert!(!map.is_stable(2));
@@ -1156,8 +1474,8 @@ mod tests {
         // A garbage file must NOT error the load (which would block engine
         // startup) and must NOT be silently wiped: it's moved aside and the
         // map comes up empty.
-        let path = std::env::temp_dir()
-            .join(format!("ta_motor_corrupt_{}.json", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("ta_motor_corrupt_{}.json", std::process::id()));
         fs::write(&path, b"{ this is not valid motor_map json").unwrap();
 
         let map = MotorMap::load_from(&path).expect("corrupt load must not error");
