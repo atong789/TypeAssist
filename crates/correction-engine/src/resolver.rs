@@ -384,7 +384,7 @@ fn compute_post_edit_text(
         }
         // Content drifted on a Tracking anchor — try a successor first.
         if let Some(succ) = find_successor(original.id, original.start, anchors, line_buf) {
-            return PostEdit::Resolved(succ);
+            return resolved_unless_straddles(succ);
         }
         // No successor. Distinguish mid-edit truncation (the user has
         // shrunk the word via inside-deletes and may still type more)
@@ -393,15 +393,45 @@ fn compute_post_edit_text(
         if is_proper_prefix(&content, &orig_chars) {
             return PostEdit::Incomplete(content);
         }
-        return PostEdit::Resolved(content);
+        return resolved_unless_straddles(content);
     }
 
     // Void path: anchor.start is frozen at the void position. An
     // immediate retype seals a new token at this position. No incomplete
     // state for Void anchors — deletion is unambiguous.
-    PostEdit::Resolved(
+    resolved_unless_straddles(
         find_successor(original.id, original.start, anchors, line_buf).unwrap_or_default(),
     )
+}
+
+/// **Fix-B caret-desync straddle guard (source fix).** The engine dead-reckons
+/// `line_buf` from keystrokes; a caret move it can't observe (the `edndd` /
+/// caret-desync class) can leave a `Tracking` anchor's `[start, end)` span
+/// stretched **across a word boundary**, so [`compute_post_edit_text`] slices a
+/// fragment of the *next* token onto this one — the cross-token merge
+/// (`have if` recovered as `have if` / `havif`) that was poisoning capture.
+///
+/// A correctly-tracked word's core never contains a boundary character: the
+/// tokenizer seals on whitespace, so any whitespace in a recovered post-edit is
+/// proof the span straddled a boundary and the line model is stale. Such a read
+/// is **not** a resolvable correction — return [`PostEdit::Incomplete`] so the
+/// merged text never reaches a verdict or [`post_edit_text`] (which then yields
+/// `None`, skipping capture in the store, the motor map, and the scoreboard
+/// alike). Better to skip one correction than to learn a phantom merged word.
+fn resolved_unless_straddles(content: Vec<char>) -> PostEdit {
+    if content.iter().any(|&c| is_line_boundary_char(c)) {
+        PostEdit::Incomplete(content)
+    } else {
+        PostEdit::Resolved(content)
+    }
+}
+
+/// A character the tokenizer treats as a hard word boundary — whitespace. A
+/// recovered single-word post-edit must never contain one (see
+/// [`resolved_unless_straddles`]). Apostrophe / hyphen are deliberately NOT here:
+/// they are legitimate intra-word characters (`don't`, `well-known`).
+fn is_line_boundary_char(c: char) -> bool {
+    c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
 /// The post-edit text the resolver would classify for `record`, as a
@@ -1570,5 +1600,65 @@ mod tests {
         // Longer than original (e.g. mid-line insert grew the anchor) —
         // can't be a prefix of original.
         assert!(!is_proper_prefix(&chars("bullion"), &chars("bullon")));
+    }
+
+    // ---- Fix-B caret-desync straddle guard (no cross-token merge) --------
+
+    #[test]
+    fn caret_jump_straddle_does_not_capture_a_merge() {
+        // Reproduces the caret-desync class. The user typed "have if". A caret
+        // move the engine couldn't observe left the "have" anchor's span
+        // stretched across the boundary into the next word, so its tracked span
+        // is now [0,7) over the whole "have if" — the exact desync that made
+        // `compute_post_edit_text` recover a cross-token merge and poison
+        // capture (`have → havif`).
+        let line: Vec<char> = "have if".chars().collect();
+        let mut anchors = AnchorTracker::new();
+        // end = 7 (not 4): the stale span straddles the space.
+        let aid = anchors.try_register(0, 7, "have").unwrap();
+        let mut ledger = DecisionLedger::new();
+        log_with_candidate(
+            &mut ledger,
+            leave_alone("have", LeaveAloneReason::BelowActiveTier),
+            aid,
+            None,
+            None,
+        );
+        let rec = ledger.iter().next().unwrap();
+
+        // The straddle guard must refuse to recover a boundary-crossing span:
+        // no merged text enters capture (post_edit_text → None), so the
+        // CorrectedToOther arm in the engine skips the store, the motor map,
+        // AND the scoreboard together.
+        let recovered = post_edit_text(rec, anchors.anchors(), &line);
+        assert_eq!(
+            recovered, None,
+            "a span straddling a word boundary must not capture a merge, got {recovered:?}"
+        );
+    }
+
+    #[test]
+    fn in_place_correction_without_boundary_still_resolves() {
+        // Regression guard: a normal in-place edit (no boundary char in the
+        // recovered span) must STILL be captured — the straddle guard only
+        // rejects boundary-crossing reads, never legitimate single-word fixes.
+        let line: Vec<char> = "havs".chars().collect(); // "have" edited in place
+        let mut anchors = AnchorTracker::new();
+        let aid = anchors.try_register(0, 4, "have").unwrap();
+        let mut ledger = DecisionLedger::new();
+        log_with_candidate(
+            &mut ledger,
+            leave_alone("have", LeaveAloneReason::BelowActiveTier),
+            aid,
+            None,
+            None,
+        );
+        let rec = ledger.iter().next().unwrap();
+
+        assert_eq!(
+            post_edit_text(rec, anchors.anchors(), &line).as_deref(),
+            Some("havs"),
+            "a boundary-free in-place edit must still resolve for capture"
+        );
     }
 }

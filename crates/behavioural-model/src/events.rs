@@ -18,6 +18,13 @@ pub enum InputEvent {
     },
     /// Backspace is broken out: self-corrections are signal, not noise.
     Backspace { timestamp_ms: u64 },
+    /// **Isolated Shift tap** — Shift pressed and released with no other key in
+    /// between (either Shift, reachable one-handed). The accept gesture for a
+    /// pending correction suggestion (the M3 bubble). The L1 adapter detects it
+    /// from `.flagsChanged` transitions and cancels the in-progress tap on any
+    /// real key or mouse-down, so this fires ONLY for a clean isolated tap — a
+    /// `Shift+key` chord never produces it. Carries no content (Principle #9).
+    ShiftTap { timestamp_ms: u64 },
     /// The adapter is up but lacks the OS permissions it needs to capture events.
     PermissionRequired,
     /// The adapter has finished initial setup and is now emitting key events.
@@ -87,6 +94,18 @@ pub enum OutboundCommand {
     /// trailing word-boundary character (e.g. the space) so the adapter stays
     /// dumb — it does no word logic of its own.
     InjectCorrection { delete_count: u32, replacement: String },
+    /// **Anchored replace (M3 bubble, accept-after-typing-on).** Replace a word
+    /// the caret has already moved PAST: move the caret left `left` chars (to just
+    /// after the word), delete `delete_count` (the word), type `replacement` (the
+    /// target, no boundary), then move right `right` chars to restore the caret.
+    /// Positional, not caret-relative — so an accept after the user typed on lands
+    /// on the right word. Used only within a strict same-line/distance/time gate.
+    InjectAnchored {
+        left: u32,
+        delete_count: u32,
+        replacement: String,
+        right: u32,
+    },
     /// Shut down the adapter.
     Shutdown,
     /// **Soft capture restart.** Ask the adapter to tear down its
@@ -114,6 +133,19 @@ mod tests {
             dwell_ms: 80,
         };
         let json = serde_json::to_string(&e).unwrap();
+        let back: InputEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn shift_tap_round_trips() {
+        // The Swift sidecar emits this on an isolated Shift tap (the accept
+        // gesture). snake_case tag + field name must match the Swift bridge.
+        let e = InputEvent::ShiftTap {
+            timestamp_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(json, r#"{"type":"shift_tap","timestamp_ms":1700000000000}"#);
         let back: InputEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
     }
@@ -199,6 +231,23 @@ mod tests {
         assert_eq!(json, r#"{"type":"autorepeat_dropped"}"#);
         let back: InputEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
+    }
+
+    #[test]
+    fn inject_anchored_command_round_trips() {
+        let c = OutboundCommand::InjectAnchored {
+            left: 6,
+            delete_count: 3,
+            replacement: "the".into(),
+            right: 6,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"inject_anchored","left":6,"delete_count":3,"replacement":"the","right":6}"#
+        );
+        let back: OutboundCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, back);
     }
 
     #[test]

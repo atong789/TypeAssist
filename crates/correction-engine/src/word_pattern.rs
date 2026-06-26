@@ -84,13 +84,6 @@ pub const WORD_PATTERN_VERSION: u32 = 1;
 /// edit-gated `CorrectedToOther`, not every kept character). **Tunable.**
 pub const PATTERN_PERSIST_EVERY: u64 = 20;
 
-/// **EASILY-FLIPPED CONSTANT.** Decayed occurrence weight a pattern must reach
-/// before it is even *eligible* to be Tier-1-ready (the classifier applies the
-/// remaining lexicon gates on top). The brief says "≈10–15 recent
-/// decay-adjusted observations"; 12 is the conservative midpoint. Tune from
-/// real data once the test suite is green.
-pub const TIER1_MIN_OBSERVATIONS: f32 = 12.0;
-
 /// Consecutive user-undos of the same pattern that trip the safety brake
 /// (CLAUDE.md → M3: demote Tier-1 → Tier-2 until it rebuilds). Reset by
 /// [`WordPatternStore::note_accept`].
@@ -670,14 +663,15 @@ mod tests {
     }
 
     #[test]
-    fn crossing_tier1_min_observations() {
+    fn crossing_realword_evidence_bar() {
+        use crate::kill_switch::REALWORD_SOURCE_EVIDENCE_BAR;
         let mut store = WordPatternStore::new();
-        // Just under the bar.
+        // Just under the high (real-word-source) bar.
         observe_n(&mut store, "teh", "the", 11, T0);
-        assert!(store.snapshot("teh", "the").unwrap().weight < TIER1_MIN_OBSERVATIONS);
+        assert!(store.snapshot("teh", "the").unwrap().weight < REALWORD_SOURCE_EVIDENCE_BAR);
         // One more clears it (12 ≥ 12).
         store.observe_correction(Outcome::CorrectedToOther, "teh", "the", T0);
-        assert!(store.snapshot("teh", "the").unwrap().weight >= TIER1_MIN_OBSERVATIONS);
+        assert!(store.snapshot("teh", "the").unwrap().weight >= REALWORD_SOURCE_EVIDENCE_BAR);
     }
 
     // ---- 3-strike brake -------------------------------------------------
