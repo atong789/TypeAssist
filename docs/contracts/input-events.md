@@ -47,6 +47,14 @@ Emitted when the adapter **drops a non-backspace auto-repeat keyDown**. A held t
 { "type": "autorepeat_dropped" }
 ```
 
+### `shift_tap`
+
+An **isolated Shift tap** — Shift pressed and released with no other key in between (either Shift, reachable one-handed). The accept gesture for a pending correction suggestion (the M3 bubble). The adapter derives it from `.flagsChanged` transitions and cancels the in-progress tap on any real key / mouse-down, so a `Shift+key` chord never produces it. Content-free.
+
+```json
+{ "type": "shift_tap", "timestamp_ms": 1729000000123 }
+```
+
 ### `permission_required`
 
 Emitted at startup if a required OS-level permission is missing (Accessibility OR Input Monitoring — capture needs both). The sidecar exits with status 2 immediately after. A `permission_status` (below) is emitted just *before* this, so a partial grant is observable even on a spawn that's about to exit.
