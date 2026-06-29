@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Embedded into the (unbundled) sidecar Mach-O via a `-sectcreate __TEXT
+      __info_plist` linker flag (see Package.swift). The sidecar has no .app
+      wrapper, so this is the only place macOS can read a friendly name from:
+      System Settings → Privacy & Security → Input Monitoring shows
+      CFBundleDisplayName / CFBundleName instead of the raw executable name.
+
+      CFBundleIdentifier intentionally equals the codesign --identifier in the
+      justfile (`typeassist-input-macos`). Keeping them identical means the
+      signature's Designated Requirement — which TCC keys the Accessibility /
+      Input-Monitoring grant on — does NOT change, so the existing grant
+      survives. Do not change this identifier (it is the internal signing id).
+    -->
+    <key>CFBundleName</key>
+    <string>TenCalmDigits Input</string>
+    <key>CFBundleDisplayName</key>
+    <string>TenCalmDigits Input</string>
+    <key>CFBundleIdentifier</key>
+    <string>typeassist-input-macos</string>
+    <key>CFBundleExecutable</key>
+    <string>typeassist-input-macos</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+</dict>
+</plist>

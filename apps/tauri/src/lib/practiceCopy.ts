@@ -67,5 +67,5 @@ export const copy = {
   },
 
   /** Honest empty state if the panel opens before the engine has any signal. */
-  coldStart: "we'll start with some everyday words while TypeAssist gets to know your hands.",
+  coldStart: "we'll start with some everyday words while TenCalmDigits gets to know your hands.",
 } as const;

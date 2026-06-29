@@ -1,14 +1,16 @@
 <!-- Progress — ONE integrated screen (main-window tab): the per-key keyboard map
      shows WHERE you slip, and the detail panel below shows the WORDS behind the
      shading. The map reuses read_key_scores (per-key precision / coordination
-     rates, well_sampled); the panel reads read_word_patterns (the corrections,
+     rates, gated only by `productions > 0` — NOT `well_sampled`; the menu-bar
+     Progress popover uses the same `isSeen` gate so a key reads identically on
+     both surfaces); the panel reads read_word_patterns (the corrections,
      each tagged coord/precis, with the soft-blue corrected letter and the keys
      it involves). Selecting a key links the two: it highlights AND filters the
      panel to corrections touching that key; "← Show all corrections" clears it.
 
      Heat = the blue accent, deeper = more slips for the active lens (never red),
      scaled relative to the user's own worst live key. The map fills CONTINUOUSLY
-     as data accrues — sampled keys shade in, under-sampled keys stay faint/dashed
+     as data accrues — seen keys shade in, never-typed keys stay faint/dashed
      (we never force a key to "seen"); no per-state variants. Observe-only; reads
      nothing it shouldn't. Colours: app blue + soft blue only — never green/red. -->
 <script lang="ts">
@@ -45,7 +47,9 @@
 
   let keyScores: KeyScore[] = [];
   let patterns: ImpactPattern[] = [];
-  let lens: Lens = "precision";
+  // Coordination leads (matches the menu-bar Progress popover's order), so it's
+  // the default-selected lens too.
+  let lens: Lens = "coordination";
 
   // DEV-ONLY override (Cmd+Shift+P overlay): force the day-one / no-data state on
   // a Mac that already has data. Folds to false in release builds (the guard),
@@ -138,7 +142,8 @@
   // dashed (e.g. q pressed 141× with no swaps is "seen", not "unknown"). We never
   // hold a key faint for a low count and never synthesize a shade. The space bar
   // follows the same rule (no entry → never pressed → faint).
-  const isSeen = (k: KeyScore | undefined): boolean => !!k && k.productions > 0;
+  const isSeen = (k: KeyScore | undefined): k is KeyScore =>
+    !!k && k.productions > 0;
   function isLive(key: string): boolean {
     return isSeen(scoreByKey.get(key));
   }
@@ -203,22 +208,35 @@
 
   const keyLabel = (key: string) => (key === SPACE ? "space" : key);
 
-  // No-corrections message for a selected key — tells the SAME "seen but clean"
-  // story as the menu-bar popover's per-key readout ("… 0.0% of presses · 141
-  // presses seen"), instead of implying the key is under-observed. A genuinely
-  // unseen key says so plainly. Reactive (refs lens + scoreByKey) so it updates
-  // when the lens flips or scores load.
-  $: selectedEmpty = ((_l, _sbk) => {
+  // Per-key summary HEADLINE for the detail panel — the SAME line the menu-bar
+  // Progress popover shows on tap ("k · 3.9% of presses mis-hit · 51 presses
+  // seen"), so the two surfaces match word-for-word and number-for-number. Same
+  // wording, same source: rawOf(k, lens) for the rate, k.productions for the
+  // count, the popover's exact `fmt1`/`<0.1` formatting. Sits above the
+  // itemized corrections. Reactive (refs lens + scoreByKey) so it tracks the
+  // lens flip and the async score load.
+  const fmt1 = (x: number) => x.toFixed(1);
+  $: keySummary = ((_l, _sbk) => {
     if (!selectedKey) return "";
     const label = keyLabel(selectedKey);
     const k = scoreByKey.get(selectedKey);
-    const noun = lens === "precision" ? "mis-hits" : "letter-order slips";
-    if (!k || k.productions <= 0) {
-      return `I haven’t seen you type the ${label} key yet.`;
+    if (!isSeen(k)) {
+      return `${label} · too few presses yet to read`;
     }
+    const pct = rawOf(k, lens) * 100;
+    const pctStr = pct === 0 ? "0.0" : pct < 0.1 ? "<0.1" : fmt1(pct);
     const presses = Math.round(k.productions).toLocaleString();
-    return `No ${noun} recorded on the ${label} key yet — seen on ${presses} presses.`;
+    const what =
+      lens === "precision"
+        ? `${pctStr}% of presses mis-hit`
+        : `letter-order slips on ${pctStr}% of presses`;
+    return `${label} · ${what} · ${presses} presses seen`;
   })(lens, scoreByKey);
+
+  // (The former `selectedEmpty` per-key "No … recorded" line was retired — the
+  // per-key headline above the list now states the rate + press count, so a
+  // second line saying the same thing was pure redundancy. The full, no-key
+  // empty message stays inline in the markup.)
 
   // Has the user typed at all yet? Drives the Progress day-one / no-data state
   // (v41): before the first keystroke there's nothing on the map. The moment any
@@ -286,7 +304,10 @@
   // Lens toggle keyboard model (app-wide convention): one Tab stop via roving
   // tabindex; Left/Right (and Home/End) switch WITHIN the control. Tab moves
   // BETWEEN controls (to the keyboard map), never lapping through this toggle.
-  const LENSES: Lens[] = ["precision", "coordination"];
+  // Coordination leads, Precision second — same order as the menu-bar Progress
+  // popover, so both surfaces read "Coordination | Precision". The arrow-nav
+  // order matches the visual button order (Left/Right cycle).
+  const LENSES: Lens[] = ["coordination", "precision"];
   let lensEls: Partial<Record<Lens, HTMLButtonElement>> = {};
   function onLensKeydown(event: KeyboardEvent) {
     const i = LENSES.indexOf(lens);
@@ -333,16 +354,6 @@
   <div class="lens-toggle" role="radiogroup" aria-label="Score lens">
     <button
       class="lens-btn"
-      class:on={lens === "precision"}
-      role="radio"
-      aria-checked={lens === "precision"}
-      tabindex={lens === "precision" ? 0 : -1}
-      bind:this={lensEls.precision}
-      on:click={() => (lens = "precision")}
-      on:keydown={onLensKeydown}>Precision</button
-    >
-    <button
-      class="lens-btn"
       class:on={lens === "coordination"}
       role="radio"
       aria-checked={lens === "coordination"}
@@ -350,6 +361,16 @@
       bind:this={lensEls.coordination}
       on:click={() => (lens = "coordination")}
       on:keydown={onLensKeydown}>Coordination</button
+    >
+    <button
+      class="lens-btn"
+      class:on={lens === "precision"}
+      role="radio"
+      aria-checked={lens === "precision"}
+      tabindex={lens === "precision" ? 0 : -1}
+      bind:this={lensEls.precision}
+      on:click={() => (lens = "precision")}
+      on:keydown={onLensKeydown}>Precision</button
     >
   </div>
   <p class="lens-desc">{lensDesc}</p>
@@ -404,14 +425,21 @@
     </p>
   {/if}
 
+  <!-- Per-key headline — mirrors the menu-bar popover's tap readout, above the
+       itemized corrections. Only when a key is selected. -->
+  {#if selectedKey}
+    <p class="key-summary">{keySummary}</p>
+  {/if}
+
   {#if !hasShown}
-    <p class="impact-empty">
-      {#if selectedKey}
-        {selectedEmpty}
-      {:else}
+    <!-- When a key is selected the headline above is the single per-key summary
+         (it already states the rate + press count), so no second "No … recorded"
+         line. The empty message is only for the full, no-key-selected list. -->
+    {#if !selectedKey}
+      <p class="impact-empty">
         No {activeName} corrections yet — they’ll gather here as you type.
-      {/if}
-    </p>
+      </p>
+    {/if}
   {:else}
     <!-- Only the active lens's group — never both stacked. -->
     <div class="grp">
@@ -485,6 +513,16 @@
     font-size: 0.92rem;
     line-height: 1.5;
     color: var(--text-secondary);
+  }
+  /* Per-key headline — the popover's tap readout, shown above the corrections.
+     Slightly emphasised (primary text, medium weight) so it reads as a summary
+     of the key, not body copy. */
+  .key-summary {
+    margin: 0.1rem 0 0.2rem;
+    font-size: 0.95rem;
+    line-height: 1.5;
+    font-weight: 500;
+    /* No explicit colour — inherits the panel's primary text, like .impact-title. */
   }
   .grp {
     margin-top: 0.9rem;

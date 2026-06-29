@@ -5,7 +5,7 @@
 export function backupFilename(): string {
   const d = new Date();
   const p = (n: number) => String(n).padStart(2, "0");
-  return `TypeAssist-backup-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.tabackup`;
+  return `TenCalmDigits-backup-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.tabackup`;
 }
 
 // Export ALL learned data to one dated file via the macOS save dialog. Returns the

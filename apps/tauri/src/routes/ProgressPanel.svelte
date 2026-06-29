@@ -60,8 +60,9 @@
   // Tapping the Coordination or Precision row opens a QWERTY map coloured by
   // that score per key. `precision`/`coordination` are RAW decayed rates in
   // 0..1 (engine-side); colour intensity is scaled *relative to the user's own
-  // worst key* here, so a board of small rates still reads. A key below the
-  // sample bar (`well_sampled === false`) is rendered neutral, never "good".
+  // worst key* here, so a board of small rates still reads. A key we've never
+  // seen typed (`productions === 0`) is rendered neutral, never "good" — the
+  // same `isSeen` gate the main-window Progress map uses (NOT `well_sampled`).
   type Score = "precision" | "coordination";
   interface KeyScore {
     key: string;
@@ -275,19 +276,29 @@
   const rawOf = (k: KeyScore | undefined, s: Score) =>
     !k ? 0 : s === "precision" ? k.precision : k.coordination;
 
-  // The brightest key sets the top of the ramp (relative scaling). Only
-  // well-sampled keys can set it, so a single noisy low-data key can't blow
-  // out the scale.
+  // A key "has data" the moment it's been typed at all (`productions > 0`) —
+  // the SAME rule the main-window Progress map uses (`isSeen`). We deliberately
+  // do NOT gate per-key state on `well_sampled` (productions ≥ MIN_SAMPLES):
+  // that higher bar made this popover disagree with the main window about which
+  // state a low-but-nonzero-press key (e.g. `j`) is in — the main window showed
+  // its real corrections while this surface said "too few presses". Precision
+  // reflects the full motor-map per-key signal, not a corrections-only subset,
+  // so any key the map has actually seen reads here, however few its presses.
+  const isSeen = (k: KeyScore | undefined): k is KeyScore =>
+    !!k && k.productions > 0;
+
+  // The brightest key sets the top of the ramp (relative scaling). Only keys
+  // we've actually seen can set it, so an unseen key can't blow out the scale.
   $: maxRaw = Math.max(
     0,
-    ...keyScores.filter((k) => k.well_sampled).map((k) => rawOf(k, kbScore)),
+    ...keyScores.filter(isSeen).map((k) => rawOf(k, kbScore)),
   );
 
-  // 0 (quiet, ~background) → 1 (bright blue, needs attention). Unsampled keys
+  // 0 (quiet, ~background) → 1 (bright blue, needs attention). Unseen keys
   // return null → painted neutral, not on the ramp.
   function intensity(letter: string): number | null {
     const k = scoreByKey.get(letter);
-    if (!k || !k.well_sampled) return null;
+    if (!isSeen(k)) return null;
     if (maxRaw <= 0) return 0;
     return Math.min(1, rawOf(k, kbScore) / maxRaw);
   }
@@ -316,7 +327,7 @@
   // shape; an unsampled key says so plainly.
   function keyReadout(letter: string): string {
     const k = scoreByKey.get(letter);
-    if (!k || !k.well_sampled) {
+    if (!isSeen(k)) {
       return `${letter} · too few presses yet to read`;
     }
     const pct = rawOf(k, kbScore) * 100;
@@ -334,7 +345,7 @@
   // so a lone hot key reads as "on x", not a misleading list.
   $: clusterSummary = (() => {
     const noun = kbScore === "precision" ? "mis-hits" : "letter-order slips";
-    const sampled = keyScores.filter((k) => k.well_sampled);
+    const sampled = keyScores.filter(isSeen);
     if (sampled.length === 0) {
       return `Not enough typing yet to show where your ${noun} cluster.`;
     }
@@ -642,7 +653,7 @@
                 {@const k = scoreByKey.get(letter)}
                 <button
                   class="kb-key"
-                  class:muted={!k || !k.well_sampled}
+                  class:muted={!isSeen(k)}
                   class:selected={selectedKey === letter}
                   style={keyStyle(letter)}
                   tabindex={rovingKey === letter ? 0 : -1}

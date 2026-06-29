@@ -38,7 +38,10 @@ enum InputEvent {
     case permissionStatus(accessibility: Bool, inputMonitoring: Bool)
     /// The caret may have moved somewhere the engine can't dead-reckon — a
     /// mouse/trackpad click (from the tap) or a focus/app change (from the
-    /// secure-field AX observer). Content-free: `reason` is only a log tag.
+    /// secure-field AX observer). Content-free: `reason` is only a log tag —
+    /// `mouse`, `app` (real application switch), or `focus-element` (in-app
+    /// focused-element re-publish; noisy in rich-text/web surfaces). Never an
+    /// app or element identity (Principle #8).
     case caretMoved(reason: String)
     /// **An auto-repeated keystroke the adapter did NOT forward.** Holding a
     /// (non-backspace) key fires repeated keyDowns but the adapter only emits
@@ -46,6 +49,13 @@ enum InputEvent {
     /// marker lets the engine's funnel count that loss (Principle #7: capture
     /// must see its own drop). Carries nothing — no key, no count, no timing.
     case autorepeatDropped
+    /// **Space keyDown observed (capture-integrity probe, QA-15).** Emitted on
+    /// each deliberate (non-auto-repeat) space keyDown, carrying the running
+    /// count. The keyDown is seen reliably even when the space's text key
+    /// (emitted on keyUp) is lost, so the engine can reconcile this against the
+    /// spaces it actually receives to flag a dropped space. Observe-only;
+    /// content-free (a count, never the character). See `InputEvent::SpaceObserved`.
+    case spaceObserved(total: UInt64)
 }
 
 enum OutboundCommand {
@@ -144,6 +154,8 @@ final class Bridge {
             payload = ["type": "caret_moved", "reason": reason]
         case .autorepeatDropped:
             payload = ["type": "autorepeat_dropped"]
+        case let .spaceObserved(total):
+            payload = ["type": "space_observed", "total": total]
         }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
               let s = String(data: data, encoding: .utf8) else {

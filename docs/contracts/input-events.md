@@ -47,6 +47,14 @@ Emitted when the adapter **drops a non-backspace auto-repeat keyDown**. A held t
 { "type": "autorepeat_dropped" }
 ```
 
+### `space_observed`
+
+Emitted on every **deliberate (non-auto-repeat) space keyDown**, carrying the adapter's cumulative count of such presses. The keyDown is observed reliably even when the space's text key (emitted later, on keyUp) is lost, so the core reconciles this running total against the spaces it actually receives to flag an intermittently **dropped space** (the QA-15 Google-Docs weld). **Observe-only** — drives no behaviour. Content-free (Principle #8/#9): a count, never the character, its timing, or the focused app.
+
+```json
+{ "type": "space_observed", "total": 42 }
+```
+
 ### `shift_tap`
 
 An **isolated Shift tap** — Shift pressed and released with no other key in between (either Shift, reachable one-handed). The accept gesture for a pending correction suggestion (the M3 bubble). The adapter derives it from `.flagsChanged` transitions and cancels the in-progress tap on any real key / mouse-down, so a `Shift+key` chord never produces it. Content-free.

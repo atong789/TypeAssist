@@ -4,7 +4,7 @@
 //! Why this exists. The tray menu is a native `NSMenu` (kept native so it opens
 //! over fullscreen apps — see `build_tray`). On macOS 26 the menu opens with
 //! NOTHING highlighted, so the user must press a key first, and Tab (not a menu
-//! key) jumps past Warm-up/Progress to "Open TypeAssist". The disabled status
+//! key) jumps past Warm-up/Progress to "Open TenCalmDigits". The disabled status
 //! header must be skipped and the first actionable item (Warm-up while active;
 //! Reconnect… / Restart capture while stopped) is lit the moment the menu opens.
 //!

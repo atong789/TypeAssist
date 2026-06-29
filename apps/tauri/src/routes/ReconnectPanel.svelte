@@ -196,7 +196,7 @@
     </div>
     <h1 class="title">Jordan needs permission again</h1>
     <p class="body">
-      TypeAssist lost access to watch your typing — this can happen after an update. Turn the one
+      TenCalmDigits lost access to watch your typing — this can happen after an update. Turn the one
       that’s off back on and Jordan picks up right where it left off.
     </p>
 

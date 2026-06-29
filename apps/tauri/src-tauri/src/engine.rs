@@ -471,7 +471,10 @@ fn is_vertical_nav(c: char) -> bool {
 /// Mirrors the newline reset (clears the line buffers + caret + anchors, resets
 /// the tokenizer line, emits `EVT_LINE_RESET` + the anchor snapshot) and also
 /// disarms any pending Escape-undo, whose revert would otherwise inject at the
-/// now-stale caret. `trigger` is a log tag only (`mouse` / `focus` / `updown`).
+/// now-stale caret. `trigger` is a content-free log tag only (`mouse` /
+/// `app` / `focus-element` / `updown`): `app` = a real application switch,
+/// `focus-element` = an in-app focused-element re-publish (noisy in rich-text /
+/// web surfaces). Fix-B resets the line model on all of them.
 fn reset_line_for_caret_move<R: Runtime>(
     app: &AppHandle<R>,
     tokenizer: &mut Tokenizer,
@@ -797,6 +800,17 @@ struct Funnel {
     /// engine WOULD have surfaced but withheld so it doesn't double-correct the
     /// host. Idiosyncratic fixes are never counted here (they always fire).
     competitor_deferred: u64,
+    /// **L1 space-drop detection (Principle #7, QA-15 Step 1 — observe-only).**
+    /// `space_observed` is the latest cumulative space-keyDown total the L1 tap
+    /// reported ([`InputEvent::SpaceObserved`]); `space_accepted` is the spaces
+    /// the engine actually received as Key events. The tap sees a space keyDown
+    /// even when its text key (emitted on keyUp) is lost, so a persistent
+    /// shortfall of accepted spaces is a dropped space — the Google-Docs weld.
+    /// `space_drops_suspected` is the cumulative settled shortfall (it only ever
+    /// rises). Counts only; never content. **Drives no behaviour** — it flags.
+    space_observed: u64,
+    space_accepted: u64,
+    space_drops_suspected: u64,
     /// Session start (ms since epoch), stamped at task spawn.
     session_started_ms: u64,
 }
@@ -806,6 +820,36 @@ impl Funnel {
         Self {
             session_started_ms: now,
             ..Default::default()
+        }
+    }
+
+    /// The engine received one space Key from the sidecar (QA-15 reconciliation).
+    fn note_space_accepted(&mut self) {
+        self.space_accepted += 1;
+    }
+
+    /// The L1 tap reports it has observed `total` space keyDowns. Updates the
+    /// running totals and returns the new cumulative suspected-drop count **iff a
+    /// not-yet-flagged drop just became evident** (so the caller logs
+    /// `SPACE_DROP_SUSPECTED` once per real drop), else `None`.
+    ///
+    /// One space may be legitimately in flight — its keyDown seen here but its
+    /// text key (keyUp) not yet processed — so the *settled* shortfall tolerates a
+    /// single in-flight press. Because a lost space is never recovered, the
+    /// settled shortfall is monotonic non-decreasing, so it doubles as the
+    /// cumulative drop count. `saturating_sub` keeps it sound if a `SpaceObserved`
+    /// marker itself is lost (accepted momentarily ahead of observed).
+    fn note_space_observed(&mut self, total: u64) -> Option<u64> {
+        self.space_observed = self.space_observed.max(total);
+        let settled = self
+            .space_observed
+            .saturating_sub(1) // tolerate one in-flight space
+            .saturating_sub(self.space_accepted);
+        if settled > self.space_drops_suspected {
+            self.space_drops_suspected = settled;
+            Some(settled)
+        } else {
+            None
         }
     }
 
@@ -819,7 +863,8 @@ impl Funnel {
              corr_sug: {}, corr_oth: {}, abandoned: {}}}, c_motor_observations: {{kept: {}, \
              slip: {}}}, c_motor_saves: {}, c_word_patterns: {{observed: {}, skipped: {}}}, \
              c_word_pattern_saves: {}, c_corrections: {{applied: {}, undone: {}}}, \
-             c_competitor_deferred: {}, session_started_at: {} }}",
+             c_competitor_deferred: {}, c_space: {{observed: {}, accepted: {}, \
+             drops_suspected: {}}}, session_started_at: {} }}",
             self.keystrokes_received,
             self.autorepeat_dropped,
             self.keystrokes_accepted,
@@ -838,6 +883,9 @@ impl Funnel {
             self.corrections_applied,
             self.corrections_undone,
             self.competitor_deferred,
+            self.space_observed,
+            self.space_accepted,
+            self.space_drops_suspected,
             self.session_started_ms,
         );
     }
@@ -1312,111 +1360,77 @@ fn tick_progress(
 /// practiced (a stability report only carries gated, trustworthy keys).
 const TREND_LOOKUP_N: usize = 64;
 
-/// Minimum slip rate for a key to count as "worth practicing" and light the
-/// tray dot. The dot reflects MOTOR-MAP STATE (is there a genuinely weak key?),
-/// not "did the user practice today" — so it keys off the worst slip rate, not
-/// merely whether any key has enough samples. **Tunable.** Starting at 5%: a
-/// clean typist (e.g. all keys <1% slip) shows no dot, which is honest; a
-/// recovering hand with a 20–40% slip on a slow finger lights it clearly.
-const PRACTICE_DOT_SLIP_THRESHOLD: f32 = 0.05;
-
-/// Whether there's a weak key "worth practicing" — drives the menu-bar badge
-/// dot. `weakest` is sorted worst-first, so the head is the highest slip rate;
-/// light the dot only when that clears the bar.
-fn wants_practice_dot(report: &StabilityReport) -> bool {
-    report
-        .weakest
-        .first()
-        .is_some_and(|(_, slip_rate)| *slip_rate >= PRACTICE_DOT_SLIP_THRESHOLD)
-}
-
-/// The menu-bar "capture stopped" icon: a hollow version of the keyboard glyph
-/// (rounded-square outline, no filled centre) with a diagonal slash through it —
-/// the universal "off" look (like wifi-off). Built in memory as a **template**
+/// The menu-bar "capture stopped" icon:
+/// the same hand glyph as the active state, with a diagonal slash composited
+/// over it — the universal "off" look (like wifi-off). On and Off are one
+/// identity differing only by the slash. Derived from `tray-icon.png` at
+/// runtime (so it tracks whatever base art is dropped in) as a **template**
 /// (alpha-only; macOS recolours it for the light/dark bar), so the alarm reads
 /// by SHAPE, never colour — NEVER red (a11y + the no-deficit-framing rule).
-/// 44×44 to match `tray-icon.png`, so swapping it in doesn't resize the icon.
+///
+/// The base hand is a *filled* glyph, so a same-colour slash drawn straight on
+/// top would be invisible inside the silhouette (template tints everything one
+/// colour). To make the slash read *through* the hand we carve a thin
+/// transparent **gutter** around it and lay the slash line inside that gutter —
+/// the groove + line is visible over filled and empty pixels alike.
 fn capture_off_icon() -> tauri::image::Image<'static> {
-    const N: i32 = 44;
-    let n = N as f32;
-    // Rounded-square outline, matching the base glyph's bounding box + radius.
-    let margin = 8.0;
-    let half = (n - 2.0 * margin) / 2.0; // half side of the square
-    let cx = n / 2.0;
-    let cy = n / 2.0;
-    let corner = 8.0;
-    let ring = 4.0; // outline stroke width
-                    // Diagonal slash, top-right → bottom-left (the "no/off" diagonal).
-    let inset = margin - 1.0;
-    let (ax, ay) = (n - inset, inset); // top-right
-    let (bx, by) = (inset, n - inset); // bottom-left
-    let slash = 4.5; // slash stroke width
+    let base = tauri::include_image!("icons/tray-icon.png");
+    let (w, h) = (base.width(), base.height());
+    let n = w as f32; // square asset; width drives the slash geometry
+    let mut rgba = base.rgba().to_vec();
 
-    // Signed distance to a rounded rectangle centred at (cx,cy).
-    let rrect_sdf = |px: f32, py: f32| -> f32 {
-        let qx = (px - cx).abs() - (half - corner);
-        let qy = (py - cy).abs() - (half - corner);
-        let ax = qx.max(0.0);
-        let ay = qy.max(0.0);
-        (ax * ax + ay * ay).sqrt() + qx.max(qy).min(0.0) - corner
-    };
-    // Distance from a point to the slash segment A→B.
+    // Diagonal slash, top-right → bottom-left, inset from the edges. Geometry
+    // scales with the asset so it holds if the art is dropped at another size.
+    let inset = n * (7.0 / 44.0);
+    let (ax, ay) = (n - inset, inset);
+    let (bx, by) = (inset, n - inset);
+    let slash = n * (4.5 / 44.0); // slash stroke width
+    let gutter = slash * 1.9; // transparent groove width around the slash
     let seg_dist = |px: f32, py: f32| -> f32 {
         let (dx, dy) = (bx - ax, by - ay);
         let len2 = dx * dx + dy * dy;
-        let t = if len2 > 0.0 {
-            (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let t = (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0);
         let (qx, qy) = (ax + t * dx, ay + t * dy);
         ((px - qx).powi(2) + (py - qy).powi(2)).sqrt()
     };
 
-    let mut rgba = vec![0u8; (N * N * 4) as usize];
-    for y in 0..N {
-        for x in 0..N {
+    for y in 0..h {
+        for x in 0..w {
             let px = x as f32 + 0.5;
             let py = y as f32 + 0.5;
-            // Outline coverage: within half a stroke of the rounded-rect edge.
-            let ring_cov = (1.0 - (rrect_sdf(px, py).abs() - ring / 2.0)).clamp(0.0, 1.0);
-            // Slash coverage: within half a stroke of the segment.
-            let slash_cov = (1.0 - (seg_dist(px, py) - slash / 2.0)).clamp(0.0, 1.0);
-            let cov = ring_cov.max(slash_cov);
-            let i = ((y * N + x) * 4) as usize;
-            // Template: opaque black, alpha carries the shape.
-            rgba[i + 3] = (cov * 255.0) as u8;
+            let d = seg_dist(px, py);
+            let line_cov = (1.0 - (d - slash / 2.0)).clamp(0.0, 1.0); // the slash itself
+            let gutter_cov = (1.0 - (d - gutter / 2.0)).clamp(0.0, 1.0); // the groove
+            let i = ((y * w + x) * 4) as usize;
+            // Carve the gutter out of the base alpha, then lay the slash back in.
+            let a0 = rgba[i + 3] as f32 / 255.0;
+            let carved = a0 * (1.0 - gutter_cov);
+            let final_a = carved.max(line_cov);
+            rgba[i + 3] = (final_a * 255.0) as u8;
         }
     }
-    tauri::image::Image::new_owned(rgba, N as u32, N as u32)
+    tauri::image::Image::new_owned(rgba, w, h)
 }
 
-/// Set the menu-bar icon from the two orthogonal signals, only touching the OS
-/// when the rendered state changes (tracked via `last`). The capture-stopped
-/// alarm WINS over the practice badge — a dead capture is the more urgent thing
-/// to show, and stacking both would muddy the glyph. All three are **template**
-/// images (monochrome, OS-recoloured) so the signal is shape, never colour.
-fn apply_tray_icon<R: Runtime>(
-    app: &AppHandle<R>,
-    not_active: bool,
-    practice_dot: bool,
-    last: &mut Option<(bool, bool)>,
-) {
-    let key = (not_active, practice_dot);
-    if *last == Some(key) {
+/// Set the menu-bar icon from the single capture-health signal, only touching
+/// the OS when the rendered state changes (tracked via `last`). TWO states by
+/// design: **On** (`tray-icon.png`, the plain hand) and **Off** (the same hand
+/// + diagonal slash, [`capture_off_icon`]) when capture is stopped. Both are
+/// **template** images (monochrome, OS-recoloured) so the signal is shape,
+/// never colour.
+fn apply_tray_icon<R: Runtime>(app: &AppHandle<R>, not_active: bool, last: &mut Option<bool>) {
+    if *last == Some(not_active) {
         return;
     }
     if let Some(tray) = app.tray_by_id("main-tray") {
         let icon = if not_active {
             capture_off_icon()
-        } else if practice_dot {
-            tauri::include_image!("icons/tray-icon-dot.png")
         } else {
             tauri::include_image!("icons/tray-icon.png")
         };
         let _ = tray.set_icon(Some(icon));
         let _ = tray.set_icon_as_template(true);
-        *last = Some(key);
+        *last = Some(not_active);
     }
 }
 
@@ -3104,13 +3118,10 @@ pub fn spawn<R: Runtime>(
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut watchdog_ticks: u64 = 0;
 
-        // Menu-bar icon state, reconciled from two signals (capture-stopped +
-        // practice-dot). `last_tray_icon` is the last `(not_active, practice_dot)`
-        // actually pushed to the OS (`None` until the first set). `current_practice_dot`
-        // persists the latest badge decision between stability emits so a
-        // health-driven icon refresh keeps the badge correct.
-        let mut last_tray_icon: Option<(bool, bool)> = None;
-        let mut current_practice_dot = false;
+        // Menu-bar icon state, driven by the single capture-stopped signal.
+        // `last_tray_icon` is the last `not_active` value actually pushed to the
+        // OS (`None` until the first set), so an unchanged state is a no-op.
+        let mut last_tray_icon: Option<bool> = None;
 
         // Debounced menu-bar "capture active?" state (drives EVT_CAPTURE_UI).
         // `non_live_since` = when health last LEFT Live (None while Live), so the
@@ -3242,6 +3253,15 @@ pub fn spawn<R: Runtime>(
                         // is not stale yet.
                         last_text_input_at = Instant::now();
                     }
+                    // QA-15 space-drop reconciliation (observe-only): a space the
+                    // engine RECEIVED here is matched against the tap's keyDown
+                    // count (the `SpaceObserved` arm below). Counted pre-filter so
+                    // it reconciles at the same L1 boundary as `received`.
+                    if let InputEvent::Key { key, .. } = &parsed {
+                        if key == " " {
+                            funnel.note_space_accepted();
+                        }
+                    }
 
                     if input_paused
                         && matches!(
@@ -3334,6 +3354,24 @@ pub fn spawn<R: Runtime>(
                             // it carries no content and feeds no pipeline stage.
                             funnel.autorepeat_dropped += 1;
                         }
+                        InputEvent::SpaceObserved { total } => {
+                            // QA-15 space-drop detector (Step 1, OBSERVE-ONLY).
+                            // The tap saw `total` deliberate space keyDowns; if the
+                            // engine has received fewer space Keys than that (beyond
+                            // one legitimately in flight), a space was dropped in
+                            // capture — the suspected cause of the Google-Docs weld.
+                            // Log it, content-free, so the flags can be correlated
+                            // against the welds the user actually sees. CHANGES
+                            // NOTHING — no compensation, no inject change.
+                            if let Some(suspected) = funnel.note_space_observed(total) {
+                                tracing::info!(
+                                    "SPACE_DROP_SUSPECTED observed={} accepted={} drops_suspected={}",
+                                    funnel.space_observed,
+                                    funnel.space_accepted,
+                                    suspected,
+                                );
+                            }
+                        }
                         InputEvent::PermissionRequired => {
                             tracing::warn!(
                                 "sidecar reports a capture permission missing — grant in \
@@ -3419,10 +3457,19 @@ pub fn spawn<R: Runtime>(
                             // Watch Dog re-arm: an app/focus change means a
                             // possibly different corrector regime, so hard-reset
                             // the competitor sense and fire normally again (fail
-                            // toward firing). ONLY on focus — a mouse click or
-                            // up/down within the same app keeps the sense (the
-                            // same competitor is still active). Content-free.
-                            if trigger == "focus" {
+                            // toward firing). A mouse click or up/down within the
+                            // same app keeps the sense (the same competitor is
+                            // still active). Content-free.
+                            //
+                            // STEP 1 (observe-only): the single `"focus"` reason
+                            // is now split at the L1 boundary into `"app"` (a real
+                            // application switch) and `"focus-element"` (an in-app
+                            // focused-element re-publish — noisy in rich-text/web
+                            // surfaces). Behaviour is UNCHANGED here: both tags
+                            // reset the sense exactly as the old `"focus"` did, so
+                            // we can first MEASURE how often each fires before
+                            // Step 2 narrows this to `"app"` only.
+                            if trigger == "app" || trigger == "focus-element" {
                                 competitor_sense.reset();
                             }
                             // The caret moved off the boundary — a pending bubble
@@ -4505,13 +4552,6 @@ pub fn spawn<R: Runtime>(
                             // weakest-keys at session start). Read-only.
                             let report: StabilityReport =
                                 motor_map.stability_report(WEAKEST_PREVIEW_N);
-                            current_practice_dot = wants_practice_dot(&report);
-                            apply_tray_icon(
-                                &app_handle,
-                                ui_not_active,
-                                current_practice_dot,
-                                &mut last_tray_icon,
-                            );
                             let _ = app_handle.emit(EVT_MOTOR_STABILITY, report);
                         }
                         EngineControl::RequestPracticeTrend { keys } => {
@@ -4720,11 +4760,6 @@ pub fn spawn<R: Runtime>(
                     if watchdog_ticks % MOTOR_STABILITY_EMIT_TICKS == 0 && !motor_map.is_empty() {
                         let report: StabilityReport =
                             motor_map.stability_report(WEAKEST_PREVIEW_N);
-                        // Tray "dot" reflects whether there are weak keys worth
-                        // practicing — shape, not colour (it's a template icon).
-                        // The actual icon push happens below (after the health
-                        // debounce), so capture-stopped can override the badge.
-                        current_practice_dot = wants_practice_dot(&report);
                         let _ = app_handle.emit(EVT_MOTOR_STABILITY, report);
                     }
 
@@ -4801,14 +4836,9 @@ pub fn spawn<R: Runtime>(
                         Instant::now().duration_since(since).as_millis() >= NOT_ACTIVE_DEBOUNCE_MS
                     });
 
-                    // Push the menu-bar icon (capture-stopped overrides the
-                    // practice badge); no-op when unchanged.
-                    apply_tray_icon(
-                        &app_handle,
-                        ui_not_active,
-                        current_practice_dot,
-                        &mut last_tray_icon,
-                    );
+                    // Push the menu-bar icon (On vs. capture-stopped Off);
+                    // no-op when unchanged.
+                    apply_tray_icon(&app_handle, ui_not_active, &mut last_tray_icon);
 
                     // Emit the settled UI state on change, and periodically so a
                     // freshly-registered listener (the tray) converges. The
@@ -4975,6 +5005,66 @@ pub fn spawn<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- QA-15 space-drop detector (Step 1, observe-only) ----------------
+
+    #[test]
+    fn space_reconciler_clean_stream_never_flags() {
+        // Every observed space keyDown is followed by its accepted Key — no drop.
+        let mut f = Funnel::new(0);
+        for n in 1..=10u64 {
+            assert_eq!(f.note_space_observed(n), None, "clean space {n} must not flag");
+            f.note_space_accepted();
+        }
+        assert_eq!(f.space_drops_suspected, 0);
+    }
+
+    #[test]
+    fn space_reconciler_flags_a_dropped_space_one_press_late() {
+        // keyDowns 1..4 observed; the text key for space 3 is LOST (no accept).
+        // The drop is provable only at the next keyDown, when the in-flight
+        // tolerance no longer hides it.
+        let mut f = Funnel::new(0);
+        assert_eq!(f.note_space_observed(1), None);
+        f.note_space_accepted();
+        assert_eq!(f.note_space_observed(2), None);
+        f.note_space_accepted();
+        assert_eq!(f.note_space_observed(3), None); // space 3 keyDown; its char is dropped
+        assert_eq!(f.note_space_observed(4), Some(1)); // now space 3's loss is evident
+        f.note_space_accepted(); // space 4's char arrives
+        assert_eq!(f.space_drops_suspected, 1);
+    }
+
+    #[test]
+    fn space_reconciler_counts_two_separate_drops_and_not_in_flight() {
+        // A single in-flight space (keyDown seen, keyUp pending) must never flag;
+        // two genuinely dropped spaces must count as two.
+        let mut f = Funnel::new(0);
+        f.note_space_observed(1);
+        f.note_space_accepted();
+        f.note_space_observed(2);
+        f.note_space_accepted();
+        f.note_space_observed(3); // dropped (no accept)
+        assert_eq!(f.note_space_observed(4), Some(1)); // drop #1 surfaces
+        f.note_space_accepted();
+        f.note_space_observed(5); // dropped (no accept)
+        assert_eq!(f.note_space_observed(6), Some(2)); // drop #2 surfaces
+        f.note_space_accepted();
+        assert_eq!(f.space_drops_suspected, 2);
+        // A trailing in-flight space (observed but not yet accepted) does not flag.
+        assert_eq!(f.note_space_observed(7), None);
+    }
+
+    #[test]
+    fn space_reconciler_tolerates_a_lost_observed_marker() {
+        // If a SpaceObserved marker itself is lost, an accept can momentarily lead
+        // observed; saturating arithmetic must not panic or under/over-flag, and
+        // the next (cumulative) total re-syncs.
+        let mut f = Funnel::new(0);
+        f.note_space_accepted(); // accepted before any observed (marker lost)
+        assert_eq!(f.note_space_observed(1), None); // re-sync, no false flag
+        assert_eq!(f.space_drops_suspected, 0);
+    }
 
     // ---- Watch Dog: competitor-sense state machine -----------------------
 

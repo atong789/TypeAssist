@@ -8,6 +8,10 @@ final class EventTap {
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var keyDownTimestamps: [Int64: UInt64] = [:]
+    /// Cumulative count of deliberate (non-auto-repeat) space keyDowns observed,
+    /// shipped to the engine via `.spaceObserved` for the QA-15 space-drop
+    /// reconciliation. Observe-only; content-free.
+    private var spaceDownCount: UInt64 = 0
 
     /// True while a Shift is held with nothing else pressed since — the window in
     /// which an isolated Shift TAP (the correction-accept gesture) can complete.
@@ -233,6 +237,16 @@ final class EventTap {
                 // justify moving every key onto keyDown later.
                 if isRepeat {
                     bridge.emit(.autorepeatDropped)
+                } else if keycode == 49 {
+                    // **Space-drop detector (QA-15, observe-only).** Keycode 49 =
+                    // space bar. The text key for this space is emitted later, on
+                    // keyUp (the lossy path); the keyDown here is observed
+                    // reliably. Count deliberate (non-repeat) space presses and
+                    // ship the running total so the engine can reconcile it
+                    // against the spaces it actually receives and flag a dropped
+                    // one. Content-free: a count, never the character.
+                    spaceDownCount += 1
+                    bridge.emit(.spaceObserved(total: spaceDownCount))
                 }
             }
         case .keyUp:

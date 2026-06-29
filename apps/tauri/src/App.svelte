@@ -173,7 +173,7 @@
     setTimeout(() => apply(false), 120);
   }
 
-  // Menu-bar entry: the tray's "Open TypeAssist" / "Settings" items show this
+  // Menu-bar entry: the tray's "Open TenCalmDigits" / "Settings" items show this
   // (otherwise hidden) window and ask it to land on a route. The webview stays
   // loaded across hide/show, so this listener is registered once; `app://route`
   // fires on EVERY re-show, so re-focusing here covers each menu-bar open.
@@ -320,7 +320,7 @@
       <div class="privacy about-stack">
         <p class="about-lead">Hi, I’m Jordan.</p>
         <p class="privacy-p">
-          I’m the quiet helper inside TypeAssist. I was made for hands that don’t always land where
+          I’m the quiet helper inside TenCalmDigits. I was made for hands that don’t always land where
           you mean — so I learn the small ways your fingers slip, and gently offer the word you
           meant. You’re always the one typing; I only ever suggest.
         </p>
@@ -328,7 +328,7 @@
           The more we type together, the better I come to know your hands. Everything I learn stays
           right here on your Mac — no cloud, no account, no one else.
         </p>
-        <p class="about-foot">TypeAssist · version 0.1.0 — everything stays on your Mac.</p>
+        <p class="about-foot">TenCalmDigits · version 0.1.0 — everything stays on your Mac.</p>
       </div>
     {:else if route === "privacy"}
       <!-- Privacy & Terms — copy is verbatim from design doc Section 08 (honesty
@@ -354,6 +354,88 @@
             and none of it ever leaves this Mac.
           </p>
         </section>
+
+        <!-- Terms of Use — BETA PLACEHOLDER (lawyer-reviewed later). Copy is
+             rendered verbatim; bracketed [PLACEHOLDERS] are intentional and must
+             stay literal. Reuses the .privacy wrapper + .privacy-h/.privacy-p
+             typography so Privacy and Terms read as one page. -->
+        <section class="privacy-block terms-start">
+          <h2 class="privacy-h">Terms of Use</h2>
+          <p class="terms-note">DRAFT — beta placeholder.</p>
+        </section>
+        <section class="privacy-block">
+          <h2 class="privacy-h">The short version</h2>
+          <p class="privacy-p">
+            TenCalmDigits is a small Mac app that watches how you type and gently offers corrections.
+            It runs entirely on your Mac. By using it, you agree to the terms below.
+          </p>
+        </section>
+        <section class="privacy-block">
+          <h2 class="privacy-h">What it is</h2>
+          <p class="privacy-p">
+            TenCalmDigits ("the app") is a typing aid. The assistant inside it is called Jordan. The
+            app learns the small ways your fingers slip and suggests the word you meant — you always
+            decide whether to accept. It is a convenience tool, not a medical device or a treatment,
+            and makes no health or recovery claims.
+          </p>
+        </section>
+        <section class="privacy-block">
+          <h2 class="privacy-h">On your Mac, and yours</h2>
+          <p class="privacy-p">
+            Everything the app learns stays on your Mac. There is no account, no cloud, and no
+            tracking. The only thing that ever leaves your Mac is a feedback message, and only if you
+            choose to write one and send it. The app does not read your passwords, secure fields, or
+            the sentences you write — see Privacy above for the full detail.
+          </p>
+        </section>
+        <section class="privacy-block">
+          <h2 class="privacy-h">Your responsibilities</h2>
+          <p class="privacy-p">
+            Use the app on a Mac you control, signed in to your own macOS account. The app suggests;
+            it never types for you — you are responsible for what you accept and for what you write.
+            Don't try to misuse, reverse-engineer, or redistribute the app except as these terms
+            allow.
+          </p>
+        </section>
+        <section class="privacy-block">
+          <h2 class="privacy-h">Permissions</h2>
+          <p class="privacy-p">
+            The app asks for macOS Accessibility and Input Monitoring so it can see your keystrokes.
+            You can turn these off at any time in System Settings; the app simply stops watching when
+            you do.
+          </p>
+        </section>
+        <section class="privacy-block">
+          <h2 class="privacy-h">No warranty</h2>
+          <p class="privacy-p">
+            The app is provided "as is," without warranty of any kind. It may make wrong suggestions
+            or miss the word you meant. To the fullest extent allowed by law, [LEGAL ENTITY / YOUR
+            NAME] is not liable for any loss arising from your use of the app. Always review your own
+            text before it matters.
+          </p>
+        </section>
+        <section class="privacy-block">
+          <h2 class="privacy-h">Beta</h2>
+          <p class="privacy-p">
+            During the beta, the app is provided free for testing and feedback. Features may change
+            or break. [Pricing / licensing terms for the public release — to be finalised.]
+          </p>
+        </section>
+        <section class="privacy-block">
+          <h2 class="privacy-h">Credits</h2>
+          <p class="privacy-p">
+            The hand icon is from Noto Emoji by Google, used under the SIL Open Font License 1.1. The
+            full license text ships with the app.
+          </p>
+        </section>
+        <section class="privacy-block">
+          <h2 class="privacy-h">Changes &amp; contact</h2>
+          <p class="privacy-p">
+            These terms may be updated; the current version travels with the app. Questions: [CONTACT
+            EMAIL]. These terms are governed by the laws of [JURISDICTION].
+          </p>
+        </section>
+        <p class="terms-foot">Version 0.1 (beta) — [DATE]. Pending legal review.</p>
       </div>
     {:else}
       <header class="screen-header"><h1>{activeLabel}</h1></header>
@@ -563,6 +645,25 @@
     font-size: 0.95rem;
     line-height: 1.65;
     color: canvastext;
+  }
+
+  /* ---- Terms of Use (beta placeholder; same wrapper + heading/body type) ---- */
+  /* A hairline + extra space marks the Privacy → Terms break while keeping them
+     one page. Headings reuse .privacy-h, bodies reuse .privacy-p. */
+  .terms-start {
+    margin-top: 2rem;
+    padding-top: 1.6rem;
+    border-top: 1px solid var(--hairline);
+  }
+  .terms-note {
+    margin: 0;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+  }
+  .terms-foot {
+    margin: 1.4rem 0 0;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
   }
 
   /* ---- About panel (reuses .privacy wrapper + .privacy-p typography) ---- */

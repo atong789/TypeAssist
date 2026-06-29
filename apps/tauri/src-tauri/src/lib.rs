@@ -259,7 +259,7 @@ fn lock_icon() -> tauri::image::Image<'static> {
 /// (acceptable: "nobody practices typing during a fullscreen call").
 fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>> {
     // The locked design-doc v23 §03 "while-learning" menu, top to bottom:
-    //   status · Warm-up · Progress · Open TypeAssist · Settings… · ─── · Quit
+    //   status · Warm-up · Progress · Open TenCalmDigits · Settings… · ─── · Quit
     // Status is a non-interactive header (disabled, so it never highlights or
     // fires); its text + dot are updated live by the debounced capture-UI
     // listener below. Active = a small filled blue dot; stopped = a small hollow
@@ -274,7 +274,7 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
     )?;
     let practice = MenuItem::with_id(app, "practice", "Warm-up", true, None::<&str>)?;
     let progress = MenuItem::with_id(app, "progress", "Progress", true, None::<&str>)?;
-    let open_main = MenuItem::with_id(app, "open_main", "Open TypeAssist", true, None::<&str>)?;
+    let open_main = MenuItem::with_id(app, "open_main", "Open TenCalmDigits", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
     // Recovery actions — built now, but NOT in the menu while active. The
     // debounced capture-UI listener inserts exactly one of them directly under
@@ -319,7 +319,7 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
     // the very bottom.
     let sep = PredefinedMenuItem::separator(app)?;
     let sep_quit = PredefinedMenuItem::separator(app)?;
-    let quit = PredefinedMenuItem::quit(app, Some("Quit TypeAssist"))?;
+    let quit = PredefinedMenuItem::quit(app, Some("Quit TenCalmDigits"))?;
     let menu = Menu::with_items(
         app,
         &[
@@ -333,9 +333,11 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
     // value back (keeping the check honest even if the post is dropped).
     let toggle_for_menu = corr_toggle.clone();
     TrayIconBuilder::with_id("main-tray")
-        // Template image: macOS recolors it for the light/dark menu bar. The
-        // "weak keys worth practicing" state is shown by SHAPE (a badge dot in
-        // tray-icon-dot.png), never colour — see the a11y rule.
+        // Template image (macOS recolors it for the light/dark menu bar): the
+        // plain hand glyph. TWO states only — this On icon and the capture-Off
+        // icon (hand + slash, built in `engine::capture_off_icon`); the engine
+        // swaps between them via `apply_tray_icon`. Signal is SHAPE, never
+        // colour — see the a11y rule.
         .icon(tauri::include_image!("icons/tray-icon.png"))
         .icon_as_template(true)
         .menu(&menu)
@@ -905,11 +907,19 @@ fn read_progress_stats() -> Result<Vec<ProgressDay>, String> {
 /// *relative to the user's own worst key* (the brief), so no absolute scale is
 /// baked in here.
 ///
-/// - `precision` — the motor map's per-key mis-hit rate (`slips / productions`):
-///   "right key, clean hit" targeting.
+/// - `precision` — "right key, clean hit" targeting. Like `coordination`, the
+///   numerator is sourced from the learned word-pattern corrections gated by the
+///   SAME `classify` filter the Impact ledger uses (adjacent-sub / dropped /
+///   extra-letter slips), attributed to `involved_keys`, over the key's motor-map
+///   `productions`. (Pre-2026-06-28 this read the motor map's raw per-key slip
+///   rate, which could shade a key the corrections list had nothing to show for —
+///   the two surfaces disagreed.)
 /// - `coordination` — the share of this key's productions implicated in a
 ///   learned adjacent-transposition correction (letter-order slips). Sourced
-///   from `word_patterns.json`, attributed to both swapped keys.
+///   from `word_patterns.json`, attributed to both swapped keys, and gated by
+///   the SAME genuine-slip `classify` filter the Impact ledger uses (so the
+///   keyboard and the corrections list agree — non-word-target junk swaps don't
+///   shade a key here either).
 /// - `productions` — decayed times the key was typed: the figure revealed on
 ///   tap, and the denominator behind both rates.
 /// - `well_sampled` — `productions >= MIN_SAMPLES`. Below the bar the UI paints
@@ -958,40 +968,113 @@ fn read_key_scores() -> Result<Vec<KeyScore>, String> {
         })
         .collect();
 
-    // Precision: per-key mis-hit rate straight from the motor map. Punctuation
-    // / digits the map tracks have no key on the board, so they're skipped.
+    // Denominator + sampling, from the motor map: `productions` (how many times
+    // the key was typed) and `well_sampled`. This is the ONE thing the motor map
+    // supplies to this view — both lenses divide by `productions` so they read on
+    // a "share of presses" scale, and a key under MIN_SAMPLES paints neutral.
+    // Punctuation / digits the map tracks have no key on the board, so skipped.
     let motor_path = dir.join("motor_map.json");
     if motor_path.exists() {
         let map = correction_engine::MotorMap::load_from(&motor_path)
             .map_err(|e| format!("could not read motor_map.json: {e}"))?;
         for s in map.key_stats() {
             if let Some(entry) = keys.get_mut(&s.key) {
-                entry.precision = s.slip_rate;
                 entry.productions = s.total;
                 entry.well_sampled = s.total >= correction_engine::MIN_SAMPLES;
             }
         }
     }
 
-    // Coordination: attribute each learned adjacent-transposition pattern's
-    // decayed weight to BOTH intended keys whose order slipped, then divide by
-    // that key's productions so it reads on the same "share of presses" scale as
-    // precision. A key with no productions stays at 0 (can't be a rate).
+    // BOTH lenses' numerators come from the SAME source as the Impact corrections
+    // ledger (`read_word_patterns`): the learned `word_patterns.json`, run through
+    // the same risk-tiered `classify` gate, attributed to the same `involved_keys`
+    // the ledger filters by. This is what keeps the keyboard and the corrections
+    // list in lock-step: a key shades for a lens ⇔ there is a genuine correction
+    // of that class touching it ⇔ clicking the key shows that correction (never an
+    // empty panel).
+    //
+    // - GENUINE gate (2026-06-28): a pattern counts only if `classify` returns
+    //   `Suggest` or a not-yet-actionable `Observe` (`InsufficientEvidence` /
+    //   `Stale` / `BrakeTripped`) — never a structural `Observe` (word-swap /
+    //   single-letter / NON-WORD TARGET / merge / unseen). Without it, junk like
+    //   `transpiostion → transpoistion` (non-word target) lit up its keys here
+    //   while the list correctly showed "none" — the two surfaces disagreed.
+    // - CLASS via the strict motor shape (`single_motor_edit`), exactly as the
+    //   ledger groups it: transposition → coordination; adjacent-sub / dropped /
+    //   extra letter → precision.
     let pattern_path = dir.join("word_patterns.json");
     if pattern_path.exists() {
+        use correction_engine::{MotorEdit, ObserveReason, PatternReadiness};
         let store = correction_engine::WordPatternStore::load_from(&pattern_path)
             .map_err(|e| format!("could not read word_patterns.json: {e}"))?;
+        let lexicon = correction_engine::Lexicon::shared();
+        // Best-effort motor map for the affected-key evidence bar (same easing
+        // the ledger applies): missing/unreadable → empty map → base bar, never
+        // an error. Read-only.
+        let class_motor_map = {
+            let p = dir.join("motor_map.json");
+            if p.exists() {
+                correction_engine::MotorMap::load_from(&p)
+                    .ok()
+                    .unwrap_or_default()
+            } else {
+                correction_engine::MotorMap::default()
+            }
+        };
         let mut coord_weight: BTreeMap<char, f32> = BTreeMap::new();
+        let mut precis_weight: BTreeMap<char, f32> = BTreeMap::new();
         for p in store.snapshots() {
-            if let Some((a, b)) = correction_engine::transposition_keys(&p.typed, &p.target) {
-                *coord_weight.entry(a).or_insert(0.0) += p.weight;
-                *coord_weight.entry(b).or_insert(0.0) += p.weight;
+            // Same genuine-slip gate as `read_word_patterns`: keep `Suggest` and
+            // the not-yet-actionable reasons; drop every structural `Observe`.
+            let genuine = match correction_engine::classify(
+                &p.typed,
+                &p.target,
+                &store,
+                lexicon,
+                &class_motor_map,
+            ) {
+                PatternReadiness::Suggest { .. } => true,
+                PatternReadiness::Observe {
+                    reason:
+                        ObserveReason::InsufficientEvidence
+                        | ObserveReason::Stale
+                        | ObserveReason::BrakeTripped,
+                } => true,
+                PatternReadiness::Observe { .. } => false,
+            };
+            if !genuine {
+                continue;
+            }
+            // Strict motor shape selects the lens bucket (guaranteed `Some` for a
+            // surviving row, but skip defensively if not).
+            let bucket = match correction_engine::single_motor_edit(&p.typed, &p.target) {
+                Some(MotorEdit::Transposition) => &mut coord_weight,
+                Some(
+                    MotorEdit::AdjacentSubstitution
+                    | MotorEdit::DroppedLetter
+                    | MotorEdit::ExtraLetter,
+                ) => &mut precis_weight,
+                None => continue,
+            };
+            // Attribute to the SAME keys the ledger filters by, so shading and the
+            // click-to-filter panel always agree.
+            for k in correction_engine::involved_keys(&p.typed, &p.target) {
+                *bucket.entry(k).or_insert(0.0) += p.weight;
             }
         }
+        // A key's rate is its class weight over its productions; no productions →
+        // stays 0 (can't be a rate), matching the "seen but clean" empty state.
         for (k, w) in coord_weight {
             if let Some(entry) = keys.get_mut(&k) {
                 if entry.productions > 0.0 {
                     entry.coordination = (w / entry.productions).min(1.0);
+                }
+            }
+        }
+        for (k, w) in precis_weight {
+            if let Some(entry) = keys.get_mut(&k) {
+                if entry.productions > 0.0 {
+                    entry.precision = (w / entry.productions).min(1.0);
                 }
             }
         }

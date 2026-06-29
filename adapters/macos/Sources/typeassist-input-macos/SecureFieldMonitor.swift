@@ -101,7 +101,15 @@ final class SecureFieldMonitor {
         // Fix-B: switching apps puts the caret in a different field/app the
         // engine can't dead-reckon — reset its line model. (Not emitted from
         // the initial bind in `start()`, which doesn't route through here.)
-        bridge.emit(.caretMoved(reason: "focus"))
+        //
+        // Reason tag `"app"` = a REAL application switch (a different corrector
+        // regime may be active). Distinct from the in-app focused-element
+        // re-publish below (`"focus-element"`), which fires repeatedly during
+        // ordinary editing in rich-text / web surfaces (Notes, Docs) without the
+        // user ever leaving the app. The engine resets the line model on BOTH
+        // (Fix-B's bias-toward-resetting), but only an `"app"` switch is a true
+        // change of corrector regime. Content-free tag — no app identity (#8).
+        bridge.emit(.caretMoved(reason: "app"))
         rebindToFrontmostApp()
     }
 
@@ -179,7 +187,16 @@ final class SecureFieldMonitor {
     /// (incl. trackpad) and Up/Down are covered by EventTap and the engine.
     private func axNotification(_ name: String) {
         if name == (kAXFocusedUIElementChangedNotification as String) {
-            bridge.emit(.caretMoved(reason: "focus"))
+            // Reason tag `"focus-element"` = the frontmost app re-published its
+            // focused AX element WITHOUT an app switch. In a plain NSTextField
+            // this is a genuine field-to-field move; in rich-text / web surfaces
+            // (Notes, Google Docs) the same element is re-vended constantly
+            // during ordinary editing (new line/paragraph node, inline UI, relayout),
+            // so this tag is NOISY by nature. Kept distinct from a real app
+            // switch (`"app"`) so a stateful consumer (Watch Dog's CompetitorSense)
+            // can choose NOT to reset on this churn while Fix-B still resets on
+            // both. Content-free tag — no element/app identity (#8).
+            bridge.emit(.caretMoved(reason: "focus-element"))
         }
         reevaluateNow()
         scheduleConfirmation()

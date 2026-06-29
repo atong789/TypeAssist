@@ -174,7 +174,7 @@
 <section class="group">
   <h2 class="group-label">Your Typing Data</h2>
   <p class="group-sub">
-    A copy of what TypeAssist has learned about your hands — kept only on this Mac.
+    A copy of what TenCalmDigits has learned about your hands — kept only on this Mac.
   </p>
   <button class="btn-primary" on:click={doBackup}>
     <i class="ti ti-download" aria-hidden="true"></i> Back up
