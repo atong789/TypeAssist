@@ -5,17 +5,24 @@
      synced via corrections://state, written via set_correction_enabled (the
      engine is the sole writer). Everything stays on-device; no network.
 
-     NOTE: the actual export / restore / delete FILE I/O is stubbed (see
-     TODO(data-layer)). The full screen + all three dialog flows are built and
-     wired to clearly-named functions, ready for the data-layer pass. -->
+     NOTE: "Back up" now opens the native save dialog and writes a real file
+     (placeholder bundle contents — see TODO(data-layer) in lib/dataActions).
+     Restore / Delete FILE I/O is still stubbed. The full screen + all three
+     dialog flows are built and wired to clearly-named functions. -->
 <script lang="ts">
   import { onMount, tick } from "svelte";
+  import { fade } from "svelte/transition";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { loadSpellingPref, saveSpellingPref, type SpellingPref } from "../lib/locale";
   import Modal from "../lib/Modal.svelte";
   import RestoreDialog from "../lib/RestoreDialog.svelte";
-  import { backUp, deleteEverything } from "../lib/dataActions";
+  import {
+    backUp,
+    deleteEverything,
+    pickAndPreviewBackup,
+    type RestoreSummary,
+  } from "../lib/dataActions";
 
   // ---- Warm-up language — reuses the existing locale pref (Practice reads it).
   let lang: SpellingPref = "system";
@@ -83,23 +90,59 @@
     };
   });
 
-  // ---- Data actions (UI + dialogs built; file I/O stubbed in lib/dataActions) ---
+  // ---- Data actions — Back up / Restore / Delete, wired to the Rust data layer. ----
   let restoreOpen = false;
   let deleteOpen = false;
   let lastBackup: string | null = null;
   let deleteCancelBtn: HTMLButtonElement | undefined;
 
+  // The picked-and-previewed backup, handed to the guarded confirm so it can
+  // describe the ACTUAL file (date + contents) instead of warning blind.
+  let restorePath = "";
+  let restoreSummary: RestoreSummary | null = null;
+  // A transient error if a picked file is invalid / a newer schema (shown inline
+  // by the data actions, not in a dialog that never opened).
+  let restoreError = "";
+
+  // Quiet, self-dismissing confirmation — a blue check (NEVER green, per locked
+  // design) that fades on its own after ~5s. Shared by Back up + Restore.
+  let confirmMsg = "";
+  let confirmTimer: ReturnType<typeof setTimeout> | undefined;
+  function flashConfirm(msg: string) {
+    confirmMsg = msg;
+    clearTimeout(confirmTimer);
+    confirmTimer = setTimeout(() => (confirmMsg = ""), 5000);
+  }
+
   // The main "Back up" button + the delete-guardrail backup record the filename
   // locally so the delete dialog can show "Backed up — …".
   async function doBackup() {
-    lastBackup = await backUp();
+    const name = await backUp();
+    lastBackup = name;
+    // Only confirm on a real write — a cancelled save dialog shows nothing.
+    if (name) flashConfirm("Backed up");
   }
 
-  // Explicitly focus the trigger BEFORE opening (WebKit doesn't focus buttons on
-  // click) so the modal records it as prevFocus and returns focus here on close.
-  function openRestore(e: MouseEvent) {
+  // Restore, reordered: pick the file → preview (read-only) → THEN the guarded
+  // confirm describes that file → apply on confirm. A cancelled pick shows
+  // nothing; a bad/newer file surfaces inline without ever opening the confirm.
+  async function openRestore(e: MouseEvent) {
     (e.currentTarget as HTMLElement | null)?.focus();
+    restoreError = "";
+    const r = await pickAndPreviewBackup();
+    if (r.status === "cancelled") return;
+    if (r.status === "error") {
+      restoreError = r.message;
+      return;
+    }
+    restorePath = r.path;
+    restoreSummary = r.summary;
     restoreOpen = true;
+  }
+  function onRestored() {
+    restoreOpen = false;
+    restoreSummary = null;
+    flashConfirm("Restored — your data’s back");
   }
   function openDelete(e: MouseEvent) {
     (e.currentTarget as HTMLElement | null)?.focus();
@@ -112,8 +155,11 @@
     tick().then(() => deleteCancelBtn?.focus());
   }
 
-  function confirmDelete() {
-    deleteEverything(); // erases on-device data + returns the app to Day one
+  async function confirmDelete() {
+    // Erases all on-device learning + history and resets Corrections to off —
+    // the engine echoes corrections://state (which flips the toggle) when done.
+    await deleteEverything();
+    lastBackup = null;
     deleteOpen = false;
   }
 </script>
@@ -181,18 +227,32 @@
     <button class="btn-primary" on:click={doBackup}>
       <i class="ti ti-download" aria-hidden="true"></i> Back up
     </button>
+    <!-- Quiet, self-dismissing confirmation — blue check, NOT green; fades ~5s. -->
+    {#if confirmMsg}
+      <span class="data-confirm" out:fade={{ duration: 350 }}>
+        <i class="ti ti-circle-check" aria-hidden="true"></i> {confirmMsg}
+      </span>
+    {/if}
   </div>
+  {#if restoreError}
+    <p class="data-error" role="alert" out:fade={{ duration: 350 }}>
+      <i class="ti ti-alert-circle" aria-hidden="true"></i> {restoreError}
+    </p>
+  {/if}
   <div class="data-links">
     <button class="link" on:click={openRestore}>Restore from a backup</button>
     <button class="link danger" on:click={openDelete}>Delete everything</button>
   </div>
 </section>
 
-<!-- Restore — the shared guarded warning dialog (also used by Onboarding). -->
-{#if restoreOpen}
+<!-- Restore — the guarded confirm, opened only AFTER a file is picked + previewed
+     so it describes the actual backup (date + contents). -->
+{#if restoreOpen && restoreSummary}
   <RestoreDialog
+    path={restorePath}
+    summary={restoreSummary}
     on:close={() => (restoreOpen = false)}
-    on:restored={() => (restoreOpen = false)}
+    on:restored={onRestored}
   />
 {/if}
 
@@ -204,8 +264,9 @@
       <h2 id="delete-title" class="dlg-title">Delete everything I’ve learned?</h2>
     </div>
     <p class="dlg-body">
-      This erases the full picture of your typing — every pattern and correction I’ve built up so
-      far. You’ll start fresh from Day one, and it can’t be undone.
+      This permanently erases everything I’ve learned — every pattern and day of history — and
+      turns Corrections back off. You’ll start fresh, like the first time you opened the app. This
+      can’t be undone.
     </p>
     <div class="guardrail">
       {#if lastBackup}
@@ -408,6 +469,25 @@
     display: flex;
     align-items: center;
     gap: 0.7rem;
+  }
+  /* Quiet confirmation — the app BLUE accent + a check, never green (locked
+     design: green is reserved out of the colour-blind-safe palette). */
+  .data-confirm {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--focus-ring);
+  }
+  .data-error {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.4rem;
+    margin: 0.65rem 0 0;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    color: #d23f3f;
   }
   /* Discreet text links (Restore / Delete) — directly beneath the Back up
      button, on one row. */

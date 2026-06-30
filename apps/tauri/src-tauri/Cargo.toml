@@ -19,6 +19,10 @@ tauri-build = { version = "2", features = [] }
 # moot here; paired with `"macOSPrivateApi": true` in tauri.conf.json.
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-shell = "2"
+# Native macOS save/open dialogs — used by the Settings "Back up" flow to let
+# the user choose where the dated backup file lands (iCloud / USB / a folder).
+# The dialog only returns a path; the file write stays in Rust (write_backup).
+tauri-plugin-dialog = "2"
 # Anchors the Practice panel under the menu-bar icon (TrayBottomCenter).
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 # tokio is already pulled in transitively via tauri/tauri-plugin-shell;

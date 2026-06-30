@@ -212,6 +212,15 @@ pub const EVT_CORRECTION_APPLIED: &str = "corrections://applied";
 /// bubble always means Shift will work (no "dead bubble"). No payload.
 pub const EVT_CORRECTION_DISMISSED: &str = "corrections://dismissed";
 
+/// **Data layer.** Result of a restore-from-backup. Payload `{ ok: bool,
+/// message: String }`: on success `message` is the chosen filename's worth of
+/// context; on failure it's a user-facing reason (bad file / newer version).
+/// The Settings restore dialog listens to close on success or surface the error.
+pub const EVT_DATA_RESTORED: &str = "data://restored";
+/// **Data layer.** Fired after "Delete everything" completes — the disk is
+/// first-launch-clean and the in-memory maps are empty. No payload.
+pub const EVT_DATA_DELETED: &str = "data://deleted";
+
 /// Engine-derived view of the sidecar's capture state. Transitions
 /// are observation-only this phase — driven by the Heartbeat
 /// InputEvent's `tap_enabled` flag. The watchdog (commit O) adds
@@ -345,6 +354,18 @@ pub enum EngineControl {
     /// **M3 correction Step 1.** Ask the engine to emit the current allow-list
     /// on [`EVT_CORRECTION_STATE`] — the panel/tray pull fresh state on open.
     RequestAllowList,
+    /// **Data layer — restore.** Replace the live learned data with a backup
+    /// file (path is a user-chosen `.typingbackup`). The engine — the sole
+    /// writer of `~/.typeassist` — re-validates the bundle, atomically replaces
+    /// the learned + history stores on disk, swaps its in-memory maps, and emits
+    /// [`EVT_DATA_RESTORED`] with the outcome. **Replace, never merge.** Leaves
+    /// the correction gate (`allow_list`) and diagnostics untouched.
+    RestoreData { path: String },
+    /// **Data layer — delete everything.** Erase all learned data + history +
+    /// diagnostics (a true first-launch-clean state), reset the in-memory maps,
+    /// and reset the correction gate to **off**. Emits [`EVT_DATA_DELETED`] plus
+    /// the refreshed [`EVT_CORRECTION_STATE`] / [`EVT_LEARNED_SNAPSHOT`].
+    DeleteAllData,
 }
 
 /// Tauri-managed handle for sending [`EngineControl`] messages to
@@ -1967,6 +1988,64 @@ fn flush_word_freq(
             false
         }
     }
+}
+
+/// **Data layer — restore.** Replace the live learned stores with a backup file.
+///
+/// Validate-all-then-apply: parse + version-check + confirm every core store
+/// deserializes BEFORE any write (so a bad file never leaves a half-restored
+/// disk). [`crate::backup::apply_bundle`] clears the learned/history footprint
+/// and writes the bundle's contents; we then reload each in-memory store from
+/// the freshly-written file (a cleared/absent store reloads as empty — a true
+/// **replace, never merge**). The decay timestamps came over verbatim, so decay
+/// continues the backup's curve rather than resetting to now. Runs only on the
+/// engine task (the sole writer), so no flush interleaves.
+fn restore_from_backup(
+    path: &str,
+    motor_map: &mut MotorMap,
+    word_freq: &mut WordFreq,
+    word_patterns: &mut WordPatternStore,
+) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("could not read backup: {e}"))?;
+    let bundle = crate::backup::parse_bundle(&bytes)?;
+    crate::backup::validate_core(&bundle)?;
+    let data_dir = typeassist_dir().ok_or_else(|| "no data directory (HOME unset)".to_string())?;
+    crate::backup::apply_bundle(&bundle, &data_dir)?;
+
+    *motor_map = match motor_map_path().as_deref() {
+        Some(p) if p.exists() => MotorMap::load_from(p).unwrap_or_else(|_| MotorMap::new()),
+        _ => MotorMap::new(),
+    };
+    *word_freq = match word_freq_path().as_deref() {
+        Some(p) if p.exists() => WordFreq::load_from(p).unwrap_or_else(|_| WordFreq::new()),
+        _ => WordFreq::new(),
+    };
+    *word_patterns = match word_patterns_path().as_deref() {
+        Some(p) if p.exists() => {
+            WordPatternStore::load_from(p).unwrap_or_else(|_| WordPatternStore::new())
+        }
+        _ => WordPatternStore::new(),
+    };
+    Ok(())
+}
+
+/// **Data layer — delete everything.** Erase all learned data + history +
+/// diagnostics from disk and reset the in-memory stores, returning the app to a
+/// first-launch-clean state. The correction gate (`allow_list`) is reset by the
+/// caller, which also persists + echoes it. Disk first, then memory: if a file
+/// removal fails we return `Err` with memory untouched (the engine keeps serving
+/// the old in-memory state rather than claiming a fresh start that didn't happen).
+fn delete_all_local_data(
+    motor_map: &mut MotorMap,
+    word_freq: &mut WordFreq,
+    word_patterns: &mut WordPatternStore,
+) -> Result<(), String> {
+    let data_dir = typeassist_dir().ok_or_else(|| "no data directory (HOME unset)".to_string())?;
+    crate::backup::delete_all_data(&data_dir)?;
+    *motor_map = MotorMap::new();
+    *word_freq = WordFreq::new();
+    *word_patterns = WordPatternStore::new();
+    Ok(())
 }
 
 /// Flush the guesser accuracy scoreboard to its own file on the same time
@@ -4600,6 +4679,86 @@ pub fn spawn<R: Runtime>(
                         EngineControl::RequestAllowList => {
                             // Panel/tray pull fresh state on open. Read-only.
                             let _ = app_handle.emit(EVT_CORRECTION_STATE, allow_list.clone());
+                        }
+                        EngineControl::RestoreData { path } => {
+                            // Sole-writer restore. Validate-all-then-apply; the
+                            // helper swaps the in-memory maps on success.
+                            match restore_from_backup(
+                                &path,
+                                &mut motor_map,
+                                &mut word_freq,
+                                &mut word_patterns,
+                            ) {
+                                Ok(()) => {
+                                    // The runtime lexicon isn't carried in the
+                                    // bundle — start it clean so is_known relearns
+                                    // rather than carrying the pre-restore session.
+                                    proposer.reset_all();
+                                    tracing::info!("DATA_RESTORED from {path}");
+                                    let _ = app_handle.emit(
+                                        EVT_DATA_RESTORED,
+                                        serde_json::json!({ "ok": true, "message": "" }),
+                                    );
+                                    let _ = app_handle
+                                        .emit(EVT_LEARNED_SNAPSHOT, proposer.learned_snapshot());
+                                    let _ = app_handle.emit(
+                                        EVT_MOTOR_STABILITY,
+                                        motor_map.stability_report(WEAKEST_PREVIEW_N),
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!("DATA_RESTORE failed: {e}");
+                                    let _ = app_handle.emit(
+                                        EVT_DATA_RESTORED,
+                                        serde_json::json!({ "ok": false, "message": e }),
+                                    );
+                                }
+                            }
+                        }
+                        EngineControl::DeleteAllData => {
+                            // Sole-writer delete → a true first-launch-clean state.
+                            match delete_all_local_data(
+                                &mut motor_map,
+                                &mut word_freq,
+                                &mut word_patterns,
+                            ) {
+                                Ok(()) => {
+                                    proposer.reset_all();
+                                    // Genuine clean slate: corrections back to off
+                                    // (default) + allow-list cleared, persisted and
+                                    // echoed so the tray + Settings toggle converge.
+                                    allow_list.set_enabled(false);
+                                    allow_list.patterns.clear();
+                                    last_correction = None;
+                                    if pending_suggestion.take().is_some() {
+                                        let _ =
+                                            app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                                    }
+                                    persist_and_emit_allow_list(
+                                        &app_handle,
+                                        &allow_list,
+                                        allow_list_path.as_deref(),
+                                    );
+                                    tracing::info!("DATA_DELETED — fresh start");
+                                    let _ = app_handle.emit(
+                                        EVT_DATA_DELETED,
+                                        serde_json::json!({ "ok": true, "message": "" }),
+                                    );
+                                    let _ = app_handle
+                                        .emit(EVT_LEARNED_SNAPSHOT, proposer.learned_snapshot());
+                                    let _ = app_handle.emit(
+                                        EVT_MOTOR_STABILITY,
+                                        motor_map.stability_report(WEAKEST_PREVIEW_N),
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!("DATA_DELETE failed: {e}");
+                                    let _ = app_handle.emit(
+                                        EVT_DATA_DELETED,
+                                        serde_json::json!({ "ok": false, "message": e }),
+                                    );
+                                }
+                            }
                         }
                     }
                 }

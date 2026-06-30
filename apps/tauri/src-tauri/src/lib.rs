@@ -4,6 +4,7 @@
 //! loop). See `engine.rs`.
 
 mod allow_list;
+mod backup;
 mod engine;
 #[cfg(target_os = "macos")]
 mod menu_focus;
@@ -556,6 +557,62 @@ fn open_main_progress(app: AppHandle) {
     show_main(&app, "progress");
 }
 
+/// Tauri command: build the real backup bundle and write it to the user-chosen
+/// path (from the native save dialog). Reads every learned/history store under
+/// the data dir and writes ONE OS-portable, versioned `.typingbackup` file — all
+/// disk I/O in Rust (the webview never touches the filesystem). Read-only on
+/// `~/.typeassist`; the only write is the external backup file (atomic store
+/// writes mean the read never sees a torn file, so this is safe from a command —
+/// no engine round-trip needed). No network path — purely local (Principle #8).
+#[tauri::command]
+fn create_backup(path: String) -> Result<(), String> {
+    let data_dir = typeassist_data_dir().ok_or("no data directory (HOME unset)".to_string())?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let bytes = backup::build_bundle(&data_dir, env!("CARGO_PKG_VERSION"), now_ms)?;
+    correction_engine::persist::durable_write(std::path::Path::new(&path), &bytes)
+        .map_err(|e| format!("could not write backup to {path}: {e}"))
+}
+
+/// Tauri command: read + validate a backup file WITHOUT touching the live data —
+/// the guarded restore dialog calls this so it can show what it's about to
+/// overwrite (and refuse a bad / newer-schema file) before anything is replaced.
+/// Read-only; the actual replace goes through the engine (the sole writer).
+#[tauri::command]
+fn restore_preview(path: String) -> Result<backup::RestoreSummary, String> {
+    let bytes = std::fs::read(&path).map_err(|e| format!("could not read backup: {e}"))?;
+    let bundle = backup::parse_bundle(&bytes)?;
+    backup::validate_core(&bundle)?;
+    Ok(backup::summarize(&bundle))
+}
+
+/// Tauri command: apply a (already-previewed) backup. Routed through the engine
+/// task — the sole writer of `~/.typeassist` — which re-validates, atomically
+/// replaces the learned + history stores, swaps its in-memory maps, and emits
+/// `data://restored` with the outcome (the UI listens to close or show an error).
+#[tauri::command]
+fn apply_restore(
+    path: String,
+    sender: tauri::State<EngineControlSender>,
+) -> Result<(), String> {
+    sender
+        .send(EngineControl::RestoreData { path })
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
+/// Tauri command: "Delete everything" — erase all learned data + history +
+/// diagnostics and reset corrections to off (a true first-launch-clean state).
+/// Routed through the engine (the sole writer); it emits `data://deleted` and
+/// the refreshed `corrections://state` when done.
+#[tauri::command]
+fn delete_all_data(sender: tauri::State<EngineControlSender>) -> Result<(), String> {
+    sender
+        .send(EngineControl::DeleteAllData)
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
 /// Show + focus the Reconnect panel (its own webview window, label "reconnect").
 /// Surfaced by the menu-bar "Reconnect…" recovery item when the sidecar reports
 /// Accessibility was revoked. Centred (not tray-anchored), and — unlike the
@@ -1092,6 +1149,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_positioner::init())
         .invoke_handler(tauri::generate_handler![
             reset_lexicon,
@@ -1116,7 +1174,11 @@ pub fn run() {
             log_bubble_timing,
             read_word_patterns,
             read_progress_stats,
-            read_key_scores
+            read_key_scores,
+            create_backup,
+            restore_preview,
+            apply_restore,
+            delete_all_data
         ])
         .on_window_event(|window, event| match event {
             // Menu-bar app: a window's close button / Cmd+W must NOT quit the
