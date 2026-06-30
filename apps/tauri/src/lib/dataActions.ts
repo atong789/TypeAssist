@@ -18,7 +18,11 @@ const BACKUP_EXT = "typingbackup";
 export function backupFilename(): string {
   const d = new Date();
   const p = (n: number) => String(n).padStart(2, "0");
-  return `TenCalmDigits-backup-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.${BACKUP_EXT}`;
+  // Local 24-hour HHMM time is ALWAYS appended so multiple same-day backups
+  // get distinct suggested names and never collide / overwrite each other.
+  const date = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  const time = `${p(d.getHours())}${p(d.getMinutes())}`;
+  return `TenCalmDigits-backup-${date}-${time}.${BACKUP_EXT}`;
 }
 
 const BACKUP_FILTER = [{ name: "TenCalmDigits backup", extensions: [BACKUP_EXT] }];
