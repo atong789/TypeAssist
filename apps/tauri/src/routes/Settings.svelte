@@ -152,9 +152,8 @@
     <div class="row-text">
       <div class="row-title">Corrections</div>
       <p class="row-desc">
-        When this is on, I’ll suggest a fix right after a word — accept it with a tap of Shift,
-        or press Esc to undo. The everyday corrections help straight away; the ones I’m still
-        learning join in over time. You’re always the one typing.
+        When this is on, I’ll suggest a fix right after a word — tap Shift to accept, Esc to undo.
+        The fixes I’m still learning will join in over time. You’re always the one typing.
       </p>
     </div>
     <button
@@ -170,19 +169,19 @@
   </div>
 </section>
 
-<!-- 4) Your Typing Data -->
+<!-- 4) Your Typing Data — one caption above the button; Restore / Delete sit as
+     two discreet links directly beneath it, on one row. -->
 <section class="group">
   <h2 class="group-label">Your Typing Data</h2>
   <p class="group-sub">
-    A copy of what TenCalmDigits has learned about your hands — kept only on this Mac.
+    A copy of what TenCalmDigits has learned about your hands — kept only on this Mac. Saves a
+    file you can keep anywhere: a drive, a cloud folder, or a new Mac.
   </p>
-  <button class="btn-primary" on:click={doBackup}>
-    <i class="ti ti-download" aria-hidden="true"></i> Back up
-  </button>
-  <p class="help">
-    Saves a file you choose where to keep — an external drive, a cloud folder, or to carry to a
-    new Mac.
-  </p>
+  <div class="backup-row">
+    <button class="btn-primary" on:click={doBackup}>
+      <i class="ti ti-download" aria-hidden="true"></i> Back up
+    </button>
+  </div>
   <div class="data-links">
     <button class="link" on:click={openRestore}>Restore from a backup</button>
     <button class="link danger" on:click={openDelete}>Delete everything</button>
@@ -404,19 +403,18 @@
     outline: 3px solid var(--focus-ring);
     outline-offset: 2px;
   }
-  .help {
-    margin: 0.6rem 0 0;
-    max-width: 30rem;
-    font-size: 0.85rem;
-    line-height: 1.5;
-    color: var(--text-secondary);
+  /* Back up button + its self-dismissing confirmation, on one baseline row. */
+  .backup-row {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
   }
-
-  /* Discreet text links (Restore / Delete). */
+  /* Discreet text links (Restore / Delete) — directly beneath the Back up
+     button, on one row. */
   .data-links {
     display: flex;
     gap: 1.4rem;
-    margin-top: 1.1rem;
+    margin-top: 1rem;
   }
   .link {
     padding: 0.3rem 0.1rem;
