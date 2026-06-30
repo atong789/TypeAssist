@@ -264,7 +264,7 @@
       <h2 id="delete-title" class="dlg-title">Delete everything I’ve learned?</h2>
     </div>
     <p class="dlg-body">
-      This permanently erases everything I’ve learned — every pattern and day of history — and
+      This permanently erases everything I’ve learned — every pattern and your days of history — and
       turns Corrections back off. You’ll start fresh, like the first time you opened the app. This
       can’t be undone.
     </p>
@@ -475,10 +475,17 @@
   .data-confirm {
     display: inline-flex;
     align-items: center;
-    gap: 0.35rem;
+    gap: 0.4rem;
     font-size: 0.9rem;
     font-weight: 500;
     color: var(--focus-ring);
+  }
+  /* The check is the eye-catcher — ~double the label — so the confirmation is
+     hard to miss, while staying the calm app blue (never green) with the label
+     understated beside it: a quiet confirmation, not a loud banner. */
+  .data-confirm i {
+    font-size: 1.8rem;
+    line-height: 1;
   }
   .data-error {
     display: flex;

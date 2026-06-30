@@ -325,6 +325,16 @@
           meant. You’re always the one typing; I only ever suggest.
         </p>
         <p class="privacy-p">
+          I keep a small dictionary, too. Most of it I came with — the everyday words. The rest is
+          yours: your name, the people and places you write about, the words only you reach for. So
+          when something is simply you, I know it’s right and leave it be.
+        </p>
+        <p class="privacy-p">
+          If you ever want to see what I notice, that’s Progress. I keep a gentle record of how your
+          hands are doing — the keys you land cleanly, and the moments letters arrive out of order.
+          Not a score, not a test. Just a quiet picture, there if it helps.
+        </p>
+        <p class="privacy-p">
           The more we type together, the better I come to know your hands. Everything I learn stays
           right here on your Mac — no cloud, no account, no one else.
         </p>

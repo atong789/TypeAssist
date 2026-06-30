@@ -418,7 +418,7 @@
       </button>
     </div>
   {:else}
-    <h2 class="impact-title">The corrections behind your slip rate</h2>
+    <h2 class="impact-title">What’s behind your slip rate</h2>
     <p class="impact-sub">
       Each one is a fix you made as you typed. Noticing them is how your keyboard map and
       percentages take shape.

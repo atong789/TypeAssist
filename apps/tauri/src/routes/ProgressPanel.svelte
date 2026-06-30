@@ -787,7 +787,7 @@
       <!-- Impact — the glance: the top few corrections in each group, by count.
            Read-only (no pills, no thresholds); the full list lives in the app. -->
       <div class="impact">
-        <p class="impact-lead">The corrections behind your slip rate</p>
+        <p class="impact-lead">What’s behind your slip rate</p>
 
         {#if !hasImpact}
           <p class="impact-empty">
