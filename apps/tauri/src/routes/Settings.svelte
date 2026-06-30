@@ -14,7 +14,6 @@
   import { fade } from "svelte/transition";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import { loadSpellingPref, saveSpellingPref, type SpellingPref } from "../lib/locale";
   import Modal from "../lib/Modal.svelte";
   import RestoreDialog from "../lib/RestoreDialog.svelte";
   import {
@@ -24,41 +23,10 @@
     type RestoreSummary,
   } from "../lib/dataActions";
 
-  // ---- Warm-up language — reuses the existing locale pref (Practice reads it).
-  let lang: SpellingPref = "system";
-  let langLoaded = false;
-  $: if (langLoaded) saveSpellingPref(lang);
-  const LANGS: { value: SpellingPref; label: string }[] = [
-    { value: "system", label: "Follow system" },
-    { value: "en-US", label: "English (US)" },
-    { value: "en-GB", label: "English (UK)" },
-  ];
-  // Grouped control → app-wide keyboard convention: ONE Tab stop (roving
-  // tabindex); Left/Right (and Home/End) switch WITHIN it. Tab moves between
-  // controls, not between the three options.
-  let segEls: HTMLButtonElement[] = [];
-  function onSegKeydown(event: KeyboardEvent, i: number) {
-    let ni: number;
-    switch (event.key) {
-      case "ArrowRight":
-        ni = (i + 1) % LANGS.length;
-        break;
-      case "ArrowLeft":
-        ni = (i - 1 + LANGS.length) % LANGS.length;
-        break;
-      case "Home":
-        ni = 0;
-        break;
-      case "End":
-        ni = LANGS.length - 1;
-        break;
-      default:
-        return;
-    }
-    event.preventDefault();
-    lang = LANGS[ni].value;
-    segEls[ni]?.focus();
-  }
+  // ---- Warm-up language — fixed to English (US) for beta. The locale
+  // machinery (lib/locale.ts) stays in place and Practice still reads the
+  // stored pref; we just don't surface a picker until UK English ships, so
+  // there's no control state to hold here.
 
   // ---- Corrections master gate — the SAME on/off as the menu-bar toggle and
   // Today's offer card (one source of truth). Off by default; the engine never
@@ -75,9 +43,6 @@
   }
 
   onMount(() => {
-    lang = loadSpellingPref();
-    langLoaded = true;
-
     invoke<AllowListState>("read_allow_list")
       .then((al) => (correctionEnabled = !!al?.correction_enabled))
       .catch(() => {});
@@ -172,23 +137,12 @@
   <span>Observing your typing · Everything stays on this Mac</span>
 </div>
 
-<!-- 2) Warm-up language -->
+<!-- 2) Warm-up language — fixed to English (US) for beta. Non-interactive: the
+     picker is unsurfaced (no slider/segmented control), the locale code stays. -->
 <section class="group">
   <h2 class="group-label">Warm-up language</h2>
-  <div class="segmented" role="radiogroup" aria-label="Warm-up language">
-    {#each LANGS as o, i}
-      <button
-        class="seg-btn"
-        class:on={lang === o.value}
-        role="radio"
-        aria-checked={lang === o.value}
-        tabindex={lang === o.value ? 0 : -1}
-        bind:this={segEls[i]}
-        on:click={() => (lang = o.value)}
-        on:keydown={(e) => onSegKeydown(e, i)}>{o.label}</button
-      >
-    {/each}
-  </div>
+  <p class="lang-fixed">English (US)</p>
+  <p class="lang-note">UK English coming after beta.</p>
 </section>
 
 <!-- 3) Corrections — one always-available On/Off (no readiness gate). Same state
@@ -326,36 +280,17 @@
     color: var(--text-secondary);
   }
 
-  /* ---- segmented control (warm-up language) ---- */
-  .segmented {
-    display: inline-flex;
-    gap: 0.3rem;
-    padding: 0.25rem;
-    border: 1px solid var(--hairline);
-    border-radius: 10px;
-  }
-  .seg-btn {
-    min-height: 36px;
-    padding: 0.4rem 0.95rem;
-    font: inherit;
-    font-size: 0.9rem;
+  /* ---- warm-up language (fixed label for beta; picker unsurfaced) ---- */
+  .lang-fixed {
+    margin: 0;
+    font-size: 0.95rem;
     font-weight: 600;
+  }
+  .lang-note {
+    margin: 0.3rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.5;
     color: var(--text-secondary);
-    background: transparent;
-    border: none;
-    border-radius: 7px;
-    cursor: pointer;
-  }
-  .seg-btn.on {
-    background: color-mix(in srgb, var(--focus-ring) 16%, canvas);
-    color: canvastext;
-  }
-  .seg-btn:hover:not(.on) {
-    background: color-mix(in srgb, canvastext 5%, canvas);
-  }
-  .seg-btn:focus {
-    outline: 3px solid var(--focus-ring);
-    outline-offset: 2px;
   }
 
   /* ---- corrections row ---- */

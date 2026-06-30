@@ -61,6 +61,8 @@ export function resolveVariant(pref: SpellingPref): SpellingVariant {
 // "meter" is also a measuring device — ambiguous to swap blindly).
 const PAIRS: [string, string][] = [
   ["gray", "grey"],
+  ["harbor", "harbour"],
+  ["harbors", "harbours"],
   ["color", "colour"],
   ["colors", "colours"],
   ["colored", "coloured"],
@@ -111,4 +113,54 @@ export function localizeSentence(
     .split(" ")
     .map((w) => map.get(w) ?? w)
     .join(" ");
+}
+
+// ---- Dev guard: the bank can't silently regress -------------------------------
+//
+// The bank (`sentences.txt`) is stored in British form and americanized word by
+// word via `PAIRS`. A British word added to the bank but missing from `PAIRS`
+// would leak through unchanged on a US locale — exactly the `harbour` bug. We
+// can't carry a full US/UK dictionary, so we keep a curated reference of British
+// spellings we know about; the guard (run in dev from `sentenceBank`) fails if a
+// bank word is in this reference but has no `PAIRS` entry. Grow this list when a
+// new divergent word joins the bank — that's the signal to add its pair too.
+const BRITISH_REFERENCE: ReadonlySet<string> = new Set([
+  // -our
+  "harbour", "harbours", "colour", "colours", "coloured", "favour", "favours",
+  "favourite", "favourites", "behaviour", "behaviours", "neighbour", "neighbours",
+  "flavour", "flavours", "honour", "honours", "labour", "odour", "rumour",
+  "vapour", "vigour", "armour", "parlour", "saviour", "splendour",
+  // -re
+  "centre", "centres", "centred", "theatre", "theatres", "litre", "litres",
+  "metre", "metres", "fibre", "fibres", "calibre", "sombre", "spectre", "lustre",
+  "manoeuvre",
+  // -ise / -yse
+  "realise", "realised", "realises", "organise", "organised", "recognise",
+  "recognised", "apologise", "apologised", "analyse", "analysed", "paralyse",
+  // -ce
+  "defence", "offence", "licence", "pretence",
+  // doubled-l
+  "travelling", "travelled", "traveller", "cancelled", "modelling", "labelled",
+  "marvellous", "woollen", "jewellery", "counsellor", "signalled",
+  // -ogue
+  "catalogue", "dialogue", "monologue",
+  // misc
+  "grey", "greyer", "mould", "moulded", "smoulder", "plough", "ploughed",
+  "draught", "draughts", "tyre", "tyres", "kerb", "pyjamas", "aluminium",
+  "programme", "cosy", "sceptical", "skilful",
+]);
+
+/** Bank words that are British spellings we recognise but have no `PAIRS` entry,
+ *  so `localizeSentence(_, "american")` would leave them British. Empty = healthy.
+ *  Called by `sentenceBank` in dev to hard-fail before such a word can ship. */
+export function findUnpairedBritishWords(
+  sentences: readonly string[],
+): string[] {
+  const offenders = new Set<string>();
+  for (const s of sentences) {
+    for (const w of s.split(" ")) {
+      if (BRITISH_REFERENCE.has(w) && !TO_AMERICAN.has(w)) offenders.add(w);
+    }
+  }
+  return [...offenders].sort();
 }
