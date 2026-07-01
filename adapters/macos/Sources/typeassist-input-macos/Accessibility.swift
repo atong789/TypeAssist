@@ -71,12 +71,41 @@ enum Accessibility {
             .post(tap: .cgSessionEventTap)
     }
 
+    /// US-layout characters that are produced by holding Shift: every shifted
+    /// symbol on the ANSI keyboard. Uppercase letters are handled separately via
+    /// `isUppercase` (covers the full alphabet without enumerating it).
+    private static let shiftedSymbols: Set<Character> = [
+        "~", "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "_", "+",
+        "{", "}", "|", ":", "\"", "<", ">", "?",
+    ]
+
+    /// True when posting `character` on the US layout would require the Shift
+    /// key held — any uppercase letter, or a shifted symbol.
+    private static func requiresShift(_ character: Character) -> Bool {
+        character.isUppercase || shiftedSymbols.contains(character)
+    }
+
     /// Post a single character as a Unicode keystroke (layout-independent).
+    ///
+    /// QA-21: native Cocoa reads the `keyboardSetUnicodeString` payload directly,
+    /// so case survives regardless of modifier flags. Chromium/Electron surfaces
+    /// (browser Gmail/Docs, Claude desktop) instead reconstruct the character
+    /// from the virtual keycode + modifier flags, so a shift-requiring character
+    /// posted with NO `.maskShift` flag lands in its unshifted (lowercase) form —
+    /// `Setting` → `setting`. Setting `.maskShift` on both the down and up events
+    /// for those characters makes the web layer reconstruct the shifted form; it
+    /// does NOT change what Cocoa inserts (still the Unicode payload), so native
+    /// is unaffected. Char COUNT is unchanged, so the count-based echo-skip
+    /// (`pending_echo` in engine.rs) is untouched.
     private static func typeCharacter(_ character: Character, source: CGEventSource) {
         let units = Array(String(character).utf16)
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
             return
+        }
+        if requiresShift(character) {
+            down.flags = .maskShift
+            up.flags = .maskShift
         }
         units.withUnsafeBufferPointer { buffer in
             down.keyboardSetUnicodeString(stringLength: units.count, unicodeString: buffer.baseAddress)
