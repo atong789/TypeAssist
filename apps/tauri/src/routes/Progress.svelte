@@ -81,7 +81,15 @@
   $: activeCap = lens === "precision" ? "right key, clean hit" : "right keys, right order";
   $: activeRows = scopedPatterns.filter((p) => p.class === activeClass);
   $: hasShown = activeRows.length > 0;
-  const obsCount = (o: number) => Math.round(o);
+
+  // Each row shows a proportional weight BAR instead of a raw ×N count — the
+  // same treatment as the menu-bar Impact list. Width is relative to the largest
+  // decayed weight in the VISIBLE list (the active lens's rows, already sorted
+  // desc), so "longer = comes up more often". A nonzero slip keeps a sliver.
+  $: maxImpactObs = Math.max(0, ...activeRows.map((p) => p.obs));
+  const IMPACT_BAR_MIN = 8; // % of the bar zone — a nonzero slip still reads
+  $: barWidth = (obs: number) =>
+    maxImpactObs > 0 ? Math.max(IMPACT_BAR_MIN, (obs / maxImpactObs) * 100) : 0;
 
   const SPACE = "space";
   // The board: three letter rows + a real space-bar row.
@@ -451,11 +459,14 @@
         {#each activeRows as p}
           <li class="crow">
             <CorrectionPair typed={p.typed} target={p.target} highlight={p.highlight} />
-            <span class="count">{obsCount(p.obs)}×</span>
+            <span class="wbar-zone" aria-hidden="true">
+              <span class="wbar" style="width: {barWidth(p.obs)}%"></span>
+            </span>
           </li>
         {/each}
       </ul>
     </div>
+    <p class="impact-note">Longer bar = comes up more often. Not an exact count.</p>
   {/if}
 </section>
 
@@ -555,10 +566,24 @@
     padding: 0.5rem 0;
     border-bottom: 1px solid color-mix(in srgb, var(--hairline) 60%, transparent);
   }
-  .count {
+  /* Proportional weight bar (replaces the ×N count) — same treatment as the
+     menu-bar Impact list: fixed ~90px zone, the bar fills a fraction of it, in
+     the same muted neutral tone as the 7-day chart bars. */
+  .wbar-zone {
     flex-shrink: 0;
-    font-size: 0.86rem;
-    font-variant-numeric: tabular-nums;
+    width: 90px;
+    display: flex;
+    align-items: center;
+  }
+  .wbar {
+    height: 4px;
+    border-radius: 2px;
+    background: color-mix(in srgb, canvastext 22%, canvas);
+    min-width: 0;
+  }
+  .impact-note {
+    margin: 0.7rem 0 0;
+    font-size: 0.82rem;
     color: var(--text-secondary);
   }
 

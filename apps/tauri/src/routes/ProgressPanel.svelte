@@ -101,7 +101,19 @@
   $: topCoord = patterns.filter((p) => p.class === "coord").slice(0, TOP_N);
   $: topPrecis = patterns.filter((p) => p.class === "precis").slice(0, TOP_N);
   $: hasImpact = topCoord.length > 0 || topPrecis.length > 0;
-  const obsCount = (o: number) => Math.round(o);
+
+  // Impact rows show a proportional weight BAR instead of a raw ×N count. Width
+  // is relative to the largest decayed weight shown across BOTH groups, so a
+  // Coordination bar and a Precision bar are directly comparable ("longer =
+  // comes up more often"). A nonzero slip keeps a visible sliver.
+  $: maxImpactObs = Math.max(
+    0,
+    ...topCoord.map((p) => p.obs),
+    ...topPrecis.map((p) => p.obs),
+  );
+  const IMPACT_BAR_MIN = 8; // % of the bar zone — a nonzero slip still reads
+  $: barWidth = (obs: number) =>
+    maxImpactObs > 0 ? Math.max(IMPACT_BAR_MIN, (obs / maxImpactObs) * 100) : 0;
 
   // ---- Statistics derivations -------------------------------------------
   //
@@ -176,20 +188,46 @@
   $: coordSeries = weekly.map((w) => w.coord);
   $: precisSeries = weekly.map((w) => w.precis);
 
+  // Decayed aggregate for the composition rows. SAME source the keyboard paints
+  // (`read_key_scores`): per-key decayed correction weight over decayed
+  // productions. Aggregate = Σ(rate·productions) / Σ(productions) over seen keys
+  // = Σ(weight)/Σ(productions) — a productions-weighted mean, so a row's % and
+  // its per-key keyboard drill-down agree. Null until any key has productions.
+  // (Deliberately NOT today's coord/precis — those now live in the Today box.)
+  $: decayedAgg = (() => {
+    let coordW = 0;
+    let precisW = 0;
+    let prod = 0;
+    for (const k of keyScores) {
+      if (k.productions > 0) {
+        coordW += k.coordination * k.productions;
+        precisW += k.precision * k.productions;
+        prod += k.productions;
+      }
+    }
+    return { coordW, precisW, prod };
+  })();
+  $: coordDecayedPct =
+    decayedAgg.prod > 0 ? round1((decayedAgg.coordW / decayedAgg.prod) * 100) : null;
+  $: precisDecayedPct =
+    decayedAgg.prod > 0 ? round1((decayedAgg.precisW / decayedAgg.prod) * 100) : null;
+
   // The two composition rows, each a tap target into its per-key keyboard map.
-  // Built in the script (not the template) so the `Score` typing is clean.
+  // Built in the script (not the template) so the `Score` typing is clean. The
+  // `pct` is the DECAYED value (matches the keyboard); the trend `series` stays
+  // the weekly history from the daily snapshots.
   $: compRows = [
     {
       name: "Coordination",
       caption: "right keys, right order",
-      pct: coordPct,
+      pct: coordDecayedPct,
       series: coordSeries,
       score: "coordination" as Score,
     },
     {
       name: "Precision",
       caption: "right key, clean hit",
-      pct: precisPct,
+      pct: precisDecayedPct,
       series: precisSeries,
       score: "precision" as Score,
     },
@@ -709,22 +747,44 @@
         </div>
       {:else}
         <div class="stats">
-          <div class="cards">
-            <div class="card">
-              <div class="card-label">Words today</div>
-              <div class="card-value">{wordsToday.toLocaleString()}</div>
-            </div>
-            <div class="card">
-              <div class="card-label">Slip rate</div>
-              <div class="card-value">
-                {slipPct === null ? "—" : `${fmt1(slipPct)}%`}
+          <!-- Today — live same-day numbers only (left: Words; right: today's
+               slip rate + its two parts). Decoupled from the decayed section
+               below. -->
+          <div class="today-area">
+            <div class="area-label">Today</div>
+            <div class="cards today-cards">
+              <div class="card">
+                <div class="card-label">Words</div>
+                <div class="card-value">{wordsToday.toLocaleString()}</div>
+              </div>
+              <div class="card today-slip">
+                <div class="today-slip-top">
+                  <span class="card-label">Slip rate</span>
+                  <span class="today-slip-value">
+                    {slipPct === null ? "—" : `${fmt1(slipPct)}%`}
+                  </span>
+                </div>
+                <div class="today-parts">
+                  <div class="today-part">
+                    <span>Coordination</span>
+                    <span class="today-part-val">
+                      {coordPct === null ? "—" : `${fmt1(coordPct)}%`}
+                    </span>
+                  </div>
+                  <div class="today-part">
+                    <span>Precision</span>
+                    <span class="today-part-val">
+                      {precisPct === null ? "—" : `${fmt1(precisPct)}%`}
+                    </span>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
 
           {#if progressDays.length >= 2}
             <section class="block">
-              <h2 class="block-title">Last 7 days</h2>
+              <h2 class="block-title">Words — last 7 days</h2>
               <div class="bars">
                 {#each last7 as d}
                   <div class="bar-col">
@@ -738,10 +798,15 @@
             </section>
           {/if}
 
+          <!-- What the slip rate is made of — the two parts, now on the DECAYED
+               motor-map values (the same source the keyboard paints), so a row's
+               % and its per-key keyboard agree. The trend line stays the weekly
+               history from the daily snapshots. -->
           <section class="block">
             <h2 class="block-title">What the slip rate is made of</h2>
-            {#if slipPct === null}
-              <p class="quiet-line">No typing yet today.</p>
+            <p class="block-caption">Based mostly on your last few weeks of typing.</p>
+            {#if coordDecayedPct === null && precisDecayedPct === null}
+              <p class="quiet-line">Not enough typing yet to show this.</p>
             {:else}
               {#each compRows as row}
                 {@const pts = trendPoints(row.series)}
@@ -774,10 +839,9 @@
                   </svg>
                 </button>
               {/each}
-              <p class="comp-hint">Tap a row to see your keyboard, key by key.</p>
-              <p class="comp-sum">
-                {fmt1(coordPct ?? 0)}% coordination + {fmt1(precisPct ?? 0)}% precision =
-                your {fmt1(slipPct)}% slip rate.
+              <p class="comp-hint">
+                Tap a row to see your keyboard, key by key. Trend line: since we
+                started, week by week.
               </p>
             {/if}
           </section>
@@ -794,8 +858,8 @@
             Nothing to show yet — the corrections you make as you type will gather here.
           </p>
         {:else}
-          <!-- Tell the user this is a subset before they read the rows. -->
-          <p class="t5">Your top 5 of each.</p>
+          <!-- Tell the user this is a subset (and its time window) before the rows. -->
+          <p class="t5">Based mostly on your last few weeks of typing. Your top 5 of each.</p>
           {#if topCoord.length > 0}
             <div class="grp">
               <div class="grp-head">
@@ -806,7 +870,9 @@
                 {#each topCoord as p}
                   <li class="crow">
                     <CorrectionPair typed={p.typed} target={p.target} highlight={p.highlight} />
-                    <span class="count">{obsCount(p.obs)}×</span>
+                    <span class="wbar-zone" aria-hidden="true">
+                      <span class="wbar" style="width: {barWidth(p.obs)}%"></span>
+                    </span>
                   </li>
                 {/each}
               </ul>
@@ -823,14 +889,16 @@
                 {#each topPrecis as p}
                   <li class="crow">
                     <CorrectionPair typed={p.typed} target={p.target} highlight={p.highlight} />
-                    <span class="count">{obsCount(p.obs)}×</span>
+                    <span class="wbar-zone" aria-hidden="true">
+                      <span class="wbar" style="width: {barWidth(p.obs)}%"></span>
+                    </span>
                   </li>
                 {/each}
               </ul>
             </div>
           {/if}
 
-          <p class="impact-note">The five you correct most often, in each.</p>
+          <p class="impact-note">Longer bar = comes up more often. Not an exact count.</p>
           <button class="impact-link" on:click={openFullList}>
             See the full list in the app →
           </button>
@@ -1009,9 +1077,13 @@
     border: 1px solid var(--hairline);
     border-radius: 12px;
   }
+  /* Headline labels ("Words", "Slip rate") — primary-label treatment: a step
+     larger + brighter than secondary text, so they read as the headline while
+     the Coordination/Precision parts below stay supporting detail. */
   .card-label {
-    color: var(--text-secondary);
-    font-size: 0.9rem;
+    color: canvastext;
+    font-size: 1rem;
+    font-weight: 600;
     margin-bottom: 0.35rem;
   }
   .card-value {
@@ -1021,10 +1093,63 @@
     font-variant-numeric: tabular-nums;
   }
 
+  /* ---- Today area: small muted label above a 1/3 : 2/3 pair of boxes ---- */
+  .area-label {
+    margin-bottom: 0.4rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+  .today-cards {
+    grid-template-columns: 1fr 2fr;
+  }
+  /* Right box: "Slip rate" + today's % on top, its two parts stacked beneath. */
+  .today-slip {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+  .today-slip-top {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  .today-slip-value {
+    font-size: 1.9rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+  .today-parts {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+  }
+  .today-part {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+  }
+  .today-part-val {
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+
   .block-title {
     margin: 0 0 0.7rem;
     font-size: 0.9rem;
     font-weight: 600;
+    color: var(--text-secondary);
+  }
+  /* Caption sits directly under a block title (pulled up under its baseline). */
+  .block-caption {
+    margin: -0.5rem 0 0.8rem;
+    font-size: 0.8rem;
     color: var(--text-secondary);
   }
 
@@ -1069,7 +1194,10 @@
     align-items: center;
     gap: 0.9rem;
     padding: 0.6rem 0.4rem;
-    margin: 0 -0.4rem;
+    /* No negative bleed: a row that overhangs the scroll region's clip box had
+       its focus ring cut off on the left. Sitting flush inside the clip lets the
+       inset ring below draw on all four sides. */
+    margin: 0;
     border: none;
     border-bottom: 1px solid var(--hairline);
     border-radius: 8px;
@@ -1084,7 +1212,9 @@
   }
   .comp-row:focus {
     outline: 3px solid var(--focus-ring);
-    outline-offset: -1px;
+    /* Inset by the full ring width so the ring lands just inside the clip box
+       (not painted outward past it, where the scroll region would clip it). */
+    outline-offset: -3px;
   }
   .comp-chevron {
     color: var(--text-secondary);
@@ -1115,12 +1245,6 @@
     font-variant-numeric: tabular-nums;
     min-width: 3.5rem;
     text-align: right;
-  }
-  .comp-sum {
-    margin: 0.7rem 0 0;
-    color: var(--text-secondary);
-    font-size: 0.88rem;
-    line-height: 1.45;
   }
   .quiet-line {
     margin: 0;
@@ -1323,11 +1447,19 @@
     padding: 0.3rem 0;
     border-bottom: 1px solid color-mix(in srgb, var(--hairline) 60%, transparent);
   }
-  .count {
+  /* Proportional weight bar (replaces the ×N count). Fixed ~90px zone, the bar
+     fills a fraction of it; same muted tone as the 7-day chart bars. */
+  .wbar-zone {
     flex-shrink: 0;
-    font-size: 0.84rem;
-    font-variant-numeric: tabular-nums;
-    color: var(--text-secondary);
+    width: 90px;
+    display: flex;
+    align-items: center;
+  }
+  .wbar {
+    height: 4px;
+    border-radius: 2px;
+    background: color-mix(in srgb, canvastext 22%, canvas);
+    min-width: 0;
   }
   .impact-note {
     margin: 0.7rem 0 0;
@@ -1338,7 +1470,9 @@
   .impact-link {
     align-self: flex-start;
     margin-top: 0.4rem;
-    padding: 0.2rem 0.1rem;
+    /* Room for the inset focus ring (below) to sit around the text without
+       reaching the text. */
+    padding: 0.35rem 0.4rem;
     font: inherit;
     font-size: 0.85rem;
     font-weight: 500;
@@ -1352,7 +1486,9 @@
   }
   .impact-link:focus {
     outline: 3px solid var(--focus-ring);
-    outline-offset: 2px;
+    /* Inset (not outward): at the scroll region's bottom/left edge an outward
+       ring was clipped. Drawing inside the padding keeps the full ring visible. */
+    outline-offset: -3px;
     border-radius: 5px;
   }
 

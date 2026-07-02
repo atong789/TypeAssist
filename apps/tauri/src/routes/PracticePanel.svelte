@@ -417,12 +417,9 @@
     <div class="stage snapshot">
       <h1 class="title">{copy.snapshot.title}</h1>
       <div class="readout">
-        <p class="keys">{copy.snapshot.keysLine(practicedKeys)}</p>
-        {#if copy.snapshot.observationsLine(observationsAdded)}
-          <p class="meta">{copy.snapshot.observationsLine(observationsAdded)}</p>
-        {/if}
-        {#if copy.snapshot.sentencesLine(sentencesDone)}
-          <p class="meta quiet">{copy.snapshot.sentencesLine(sentencesDone)}</p>
+        <p class="keys">{copy.snapshot.line}</p>
+        {#if copy.snapshot.subLine(observationsAdded, sentencesDone)}
+          <p class="meta quiet">{copy.snapshot.subLine(observationsAdded, sentencesDone)}</p>
         {/if}
       </div>
       {#if trendKeys.length > 0}

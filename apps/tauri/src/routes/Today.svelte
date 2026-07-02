@@ -152,8 +152,8 @@
   <div class="card card-hero">
     <div class="card-label">Warm-up</div>
     <p class="card-text">
-      Get your fingers moving with a minute or two of typing, tailored to your hands. No scores, no
-      pressure.
+      Get your fingers moving with a minute or two of typing, tailored to the keys you slip on most. No
+      scores, no pressure.
     </p>
     <button class="btn-primary" on:click={startWarmup}>Start warm-up</button>
   </div>
