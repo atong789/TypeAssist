@@ -14,12 +14,16 @@
   import { userName } from "../lib/previewSettings";
   import { modalOpen } from "../lib/modal";
   import RestoreDialog from "../lib/RestoreDialog.svelte";
+  import { pickAndPreviewBackup, type RestoreSummary } from "../lib/dataActions";
 
   const dispatch = createEventDispatcher<{ done: void }>();
 
   let step = 1;
   let name = ""; // starts empty on a true first run; kept across Back/Next
   let restoreOpen = false;
+  let restorePath = "";
+  let restoreSummary: RestoreSummary | null = null;
+  let restoreError = "";
   // Capture needs TWO macOS grants — Accessibility (AX: focus + injection) AND
   // Input Monitoring (the keystroke CGEventTap). Two signals drive step 2:
   //  • `engine://permission-status` gives each grant's OWN read-only state
@@ -145,9 +149,19 @@
     dispatch("done");
   }
 
-  // ---- Restore from a backup (step 3) — the SAME guarded dialog as Settings.
-  function openRestore(e: MouseEvent) {
+  // ---- Restore from a backup (step 3) — the SAME reordered flow as Settings:
+  // pick the file → preview (read-only) → the guarded confirm describes it.
+  async function openRestore(e: MouseEvent) {
     (e.currentTarget as HTMLElement | null)?.focus();
+    restoreError = "";
+    const r = await pickAndPreviewBackup();
+    if (r.status === "cancelled") return;
+    if (r.status === "error") {
+      restoreError = r.message;
+      return;
+    }
+    restorePath = r.path;
+    restoreSummary = r.summary;
     restoreOpen = true;
   }
   function onRestored() {
@@ -344,11 +358,19 @@
 
   {#if step === 3}
     <button class="ob-restore" on:click={openRestore}>Restore from a backup</button>
+    {#if restoreError}
+      <p class="ob-restore-error" role="alert">{restoreError}</p>
+    {/if}
   {/if}
 </div>
 
-{#if restoreOpen}
-  <RestoreDialog on:close={() => (restoreOpen = false)} on:restored={onRestored} />
+{#if restoreOpen && restoreSummary}
+  <RestoreDialog
+    path={restorePath}
+    summary={restoreSummary}
+    on:close={() => (restoreOpen = false)}
+    on:restored={onRestored}
+  />
 {/if}
 
 <style>
@@ -633,5 +655,15 @@
     outline: 3px solid var(--focus-ring);
     outline-offset: 2px;
     border-radius: 5px;
+  }
+  .ob-restore-error {
+    position: absolute;
+    right: 1.5rem;
+    bottom: 0.4rem;
+    margin: 0;
+    max-width: 22rem;
+    font-size: 0.8rem;
+    text-align: right;
+    color: #d23f3f;
   }
 </style>

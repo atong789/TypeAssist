@@ -1,14 +1,16 @@
 <!-- Progress — ONE integrated screen (main-window tab): the per-key keyboard map
      shows WHERE you slip, and the detail panel below shows the WORDS behind the
      shading. The map reuses read_key_scores (per-key precision / coordination
-     rates, well_sampled); the panel reads read_word_patterns (the corrections,
+     rates, gated only by `productions > 0` — NOT `well_sampled`; the menu-bar
+     Progress popover uses the same `isSeen` gate so a key reads identically on
+     both surfaces); the panel reads read_word_patterns (the corrections,
      each tagged coord/precis, with the soft-blue corrected letter and the keys
      it involves). Selecting a key links the two: it highlights AND filters the
      panel to corrections touching that key; "← Show all corrections" clears it.
 
      Heat = the blue accent, deeper = more slips for the active lens (never red),
      scaled relative to the user's own worst live key. The map fills CONTINUOUSLY
-     as data accrues — sampled keys shade in, under-sampled keys stay faint/dashed
+     as data accrues — seen keys shade in, never-typed keys stay faint/dashed
      (we never force a key to "seen"); no per-state variants. Observe-only; reads
      nothing it shouldn't. Colours: app blue + soft blue only — never green/red. -->
 <script lang="ts">
@@ -45,7 +47,9 @@
 
   let keyScores: KeyScore[] = [];
   let patterns: ImpactPattern[] = [];
-  let lens: Lens = "precision";
+  // Coordination leads (matches the menu-bar Progress popover's order), so it's
+  // the default-selected lens too.
+  let lens: Lens = "coordination";
 
   // DEV-ONLY override (Cmd+Shift+P overlay): force the day-one / no-data state on
   // a Mac that already has data. Folds to false in release builds (the guard),
@@ -77,7 +81,15 @@
   $: activeCap = lens === "precision" ? "right key, clean hit" : "right keys, right order";
   $: activeRows = scopedPatterns.filter((p) => p.class === activeClass);
   $: hasShown = activeRows.length > 0;
-  const obsCount = (o: number) => Math.round(o);
+
+  // Each row shows a proportional weight BAR instead of a raw ×N count — the
+  // same treatment as the menu-bar Impact list. Width is relative to the largest
+  // decayed weight in the VISIBLE list (the active lens's rows, already sorted
+  // desc), so "longer = comes up more often". A nonzero slip keeps a sliver.
+  $: maxImpactObs = Math.max(0, ...activeRows.map((p) => p.obs));
+  const IMPACT_BAR_MIN = 8; // % of the bar zone — a nonzero slip still reads
+  $: barWidth = (obs: number) =>
+    maxImpactObs > 0 ? Math.max(IMPACT_BAR_MIN, (obs / maxImpactObs) * 100) : 0;
 
   const SPACE = "space";
   // The board: three letter rows + a real space-bar row.
@@ -138,7 +150,8 @@
   // dashed (e.g. q pressed 141× with no swaps is "seen", not "unknown"). We never
   // hold a key faint for a low count and never synthesize a shade. The space bar
   // follows the same rule (no entry → never pressed → faint).
-  const isSeen = (k: KeyScore | undefined): boolean => !!k && k.productions > 0;
+  const isSeen = (k: KeyScore | undefined): k is KeyScore =>
+    !!k && k.productions > 0;
   function isLive(key: string): boolean {
     return isSeen(scoreByKey.get(key));
   }
@@ -203,22 +216,35 @@
 
   const keyLabel = (key: string) => (key === SPACE ? "space" : key);
 
-  // No-corrections message for a selected key — tells the SAME "seen but clean"
-  // story as the menu-bar popover's per-key readout ("… 0.0% of presses · 141
-  // presses seen"), instead of implying the key is under-observed. A genuinely
-  // unseen key says so plainly. Reactive (refs lens + scoreByKey) so it updates
-  // when the lens flips or scores load.
-  $: selectedEmpty = ((_l, _sbk) => {
+  // Per-key summary HEADLINE for the detail panel — the SAME line the menu-bar
+  // Progress popover shows on tap ("k · 3.9% of presses mis-hit · 51 presses
+  // seen"), so the two surfaces match word-for-word and number-for-number. Same
+  // wording, same source: rawOf(k, lens) for the rate, k.productions for the
+  // count, the popover's exact `fmt1`/`<0.1` formatting. Sits above the
+  // itemized corrections. Reactive (refs lens + scoreByKey) so it tracks the
+  // lens flip and the async score load.
+  const fmt1 = (x: number) => x.toFixed(1);
+  $: keySummary = ((_l, _sbk) => {
     if (!selectedKey) return "";
     const label = keyLabel(selectedKey);
     const k = scoreByKey.get(selectedKey);
-    const noun = lens === "precision" ? "mis-hits" : "letter-order slips";
-    if (!k || k.productions <= 0) {
-      return `I haven’t seen you type the ${label} key yet.`;
+    if (!isSeen(k)) {
+      return `${label} · too few presses yet to read`;
     }
+    const pct = rawOf(k, lens) * 100;
+    const pctStr = pct === 0 ? "0.0" : pct < 0.1 ? "<0.1" : fmt1(pct);
     const presses = Math.round(k.productions).toLocaleString();
-    return `No ${noun} recorded on the ${label} key yet — seen on ${presses} presses.`;
+    const what =
+      lens === "precision"
+        ? `${pctStr}% of presses mis-hit`
+        : `letter-order slips on ${pctStr}% of presses`;
+    return `${label} · ${what} · ${presses} presses seen`;
   })(lens, scoreByKey);
+
+  // (The former `selectedEmpty` per-key "No … recorded" line was retired — the
+  // per-key headline above the list now states the rate + press count, so a
+  // second line saying the same thing was pure redundancy. The full, no-key
+  // empty message stays inline in the markup.)
 
   // Has the user typed at all yet? Drives the Progress day-one / no-data state
   // (v41): before the first keystroke there's nothing on the map. The moment any
@@ -286,7 +312,10 @@
   // Lens toggle keyboard model (app-wide convention): one Tab stop via roving
   // tabindex; Left/Right (and Home/End) switch WITHIN the control. Tab moves
   // BETWEEN controls (to the keyboard map), never lapping through this toggle.
-  const LENSES: Lens[] = ["precision", "coordination"];
+  // Coordination leads, Precision second — same order as the menu-bar Progress
+  // popover, so both surfaces read "Coordination | Precision". The arrow-nav
+  // order matches the visual button order (Left/Right cycle).
+  const LENSES: Lens[] = ["coordination", "precision"];
   let lensEls: Partial<Record<Lens, HTMLButtonElement>> = {};
   function onLensKeydown(event: KeyboardEvent) {
     const i = LENSES.indexOf(lens);
@@ -333,16 +362,6 @@
   <div class="lens-toggle" role="radiogroup" aria-label="Score lens">
     <button
       class="lens-btn"
-      class:on={lens === "precision"}
-      role="radio"
-      aria-checked={lens === "precision"}
-      tabindex={lens === "precision" ? 0 : -1}
-      bind:this={lensEls.precision}
-      on:click={() => (lens = "precision")}
-      on:keydown={onLensKeydown}>Precision</button
-    >
-    <button
-      class="lens-btn"
       class:on={lens === "coordination"}
       role="radio"
       aria-checked={lens === "coordination"}
@@ -350,6 +369,16 @@
       bind:this={lensEls.coordination}
       on:click={() => (lens = "coordination")}
       on:keydown={onLensKeydown}>Coordination</button
+    >
+    <button
+      class="lens-btn"
+      class:on={lens === "precision"}
+      role="radio"
+      aria-checked={lens === "precision"}
+      tabindex={lens === "precision" ? 0 : -1}
+      bind:this={lensEls.precision}
+      on:click={() => (lens = "precision")}
+      on:keydown={onLensKeydown}>Precision</button
     >
   </div>
   <p class="lens-desc">{lensDesc}</p>
@@ -397,21 +426,28 @@
       </button>
     </div>
   {:else}
-    <h2 class="impact-title">The corrections behind your slip rate</h2>
+    <h2 class="impact-title">What’s behind your slip rate</h2>
     <p class="impact-sub">
       Each one is a fix you made as you typed. Noticing them is how your keyboard map and
       percentages take shape.
     </p>
   {/if}
 
+  <!-- Per-key headline — mirrors the menu-bar popover's tap readout, above the
+       itemized corrections. Only when a key is selected. -->
+  {#if selectedKey}
+    <p class="key-summary">{keySummary}</p>
+  {/if}
+
   {#if !hasShown}
-    <p class="impact-empty">
-      {#if selectedKey}
-        {selectedEmpty}
-      {:else}
+    <!-- When a key is selected the headline above is the single per-key summary
+         (it already states the rate + press count), so no second "No … recorded"
+         line. The empty message is only for the full, no-key-selected list. -->
+    {#if !selectedKey}
+      <p class="impact-empty">
         No {activeName} corrections yet — they’ll gather here as you type.
-      {/if}
-    </p>
+      </p>
+    {/if}
   {:else}
     <!-- Only the active lens's group — never both stacked. -->
     <div class="grp">
@@ -423,11 +459,14 @@
         {#each activeRows as p}
           <li class="crow">
             <CorrectionPair typed={p.typed} target={p.target} highlight={p.highlight} />
-            <span class="count">{obsCount(p.obs)}×</span>
+            <span class="wbar-zone" aria-hidden="true">
+              <span class="wbar" style="width: {barWidth(p.obs)}%"></span>
+            </span>
           </li>
         {/each}
       </ul>
     </div>
+    <p class="impact-note">Longer bar = comes up more often. Not an exact count.</p>
   {/if}
 </section>
 
@@ -486,6 +525,16 @@
     line-height: 1.5;
     color: var(--text-secondary);
   }
+  /* Per-key headline — the popover's tap readout, shown above the corrections.
+     Slightly emphasised (primary text, medium weight) so it reads as a summary
+     of the key, not body copy. */
+  .key-summary {
+    margin: 0.1rem 0 0.2rem;
+    font-size: 0.95rem;
+    line-height: 1.5;
+    font-weight: 500;
+    /* No explicit colour — inherits the panel's primary text, like .impact-title. */
+  }
   .grp {
     margin-top: 0.9rem;
   }
@@ -517,10 +566,24 @@
     padding: 0.5rem 0;
     border-bottom: 1px solid color-mix(in srgb, var(--hairline) 60%, transparent);
   }
-  .count {
+  /* Proportional weight bar (replaces the ×N count) — same treatment as the
+     menu-bar Impact list: fixed ~90px zone, the bar fills a fraction of it, in
+     the same muted neutral tone as the 7-day chart bars. */
+  .wbar-zone {
     flex-shrink: 0;
-    font-size: 0.86rem;
-    font-variant-numeric: tabular-nums;
+    width: 90px;
+    display: flex;
+    align-items: center;
+  }
+  .wbar {
+    height: 4px;
+    border-radius: 2px;
+    background: color-mix(in srgb, canvastext 22%, canvas);
+    min-width: 0;
+  }
+  .impact-note {
+    margin: 0.7rem 0 0;
+    font-size: 0.82rem;
     color: var(--text-secondary);
   }
 

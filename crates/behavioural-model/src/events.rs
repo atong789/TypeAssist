@@ -73,6 +73,16 @@ pub enum InputEvent {
     /// timing. (Backspace is exempt — the adapter forwards every backspace
     /// keyDown, so held-backspace deletions are not dropped.)
     AutorepeatDropped,
+    /// **Space keyDown observed at the tap (capture-integrity probe, QA-15).**
+    /// Emitted on every deliberate (non-auto-repeat) space keyDown the L1 tap
+    /// sees, carrying the adapter's cumulative count of such presses. The tap
+    /// observes the keyDown reliably even when the matching text key (emitted
+    /// later, on keyUp) is lost — so reconciling this running total against the
+    /// spaces the engine actually receives makes an intermittent space DROP
+    /// visible (the Google-Docs weld). **Observe-only** — drives no behaviour.
+    /// Content-free (Principle #8/#9): a count, never the character, its timing,
+    /// or the focused app.
+    SpaceObserved { total: u64 },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -229,6 +239,17 @@ mod tests {
         let e = InputEvent::AutorepeatDropped;
         let json = serde_json::to_string(&e).unwrap();
         assert_eq!(json, r#"{"type":"autorepeat_dropped"}"#);
+        let back: InputEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn space_observed_event_round_trips() {
+        // The Swift sidecar emits this on each deliberate space keyDown, carrying
+        // its running count. snake_case tag + `total` field must match the bridge.
+        let e = InputEvent::SpaceObserved { total: 42 };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(json, r#"{"type":"space_observed","total":42}"#);
         let back: InputEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
     }

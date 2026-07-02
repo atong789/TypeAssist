@@ -12,6 +12,7 @@
 // sentences are favoured without the selection ever becoming deterministic.
 
 import raw from "./sentences.txt?raw";
+import { findUnpairedBritishWords } from "./locale";
 
 /** `[character, slip_rate]`, slip_rate in [0,1]. Matches StabilityReport.weakest. */
 export type WeakKey = [string, number];
@@ -33,6 +34,23 @@ export const SENTENCES: readonly string[] = Object.freeze(
       return ok;
     }),
 );
+
+// Dev guard (Principle #9 — the warm-up must match the user's spelling): the bank
+// is stored British and americanized via locale `PAIRS`. If a British word slips
+// into the bank without a pair, it would render British on a US locale (the
+// `harbour` bug). Hard-fail in dev so it's caught before shipping; no-op in the
+// production bundle. Grow `BRITISH_REFERENCE` + `PAIRS` together when adding one.
+if (import.meta.env.DEV) {
+  const unpaired = findUnpairedBritishWords(SENTENCES);
+  if (unpaired.length > 0) {
+    throw new Error(
+      `[sentenceBank] British-spelled bank words have no US/UK pair in ` +
+        `lib/locale.ts PAIRS: ${unpaired.join(", ")}. Add each pair so ` +
+        `localizeSentence() can americanize it (the bank is stored British; an ` +
+        `unpaired word leaks through unchanged on a US locale).`,
+    );
+  }
+}
 
 /** char -> slip_rate, clamped to [0,1]. Only single printable chars are kept. */
 function weightsFrom(weakest: WeakKey[]): Map<string, number> {

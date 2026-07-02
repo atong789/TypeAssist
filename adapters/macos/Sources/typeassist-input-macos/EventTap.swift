@@ -8,6 +8,21 @@ final class EventTap {
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var keyDownTimestamps: [Int64: UInt64] = [:]
+    /// Character captured at key-DOWN, keyed by keycode, consumed at key-UP.
+    /// **Case fix (read-side mirror of the QA-21 injection Shift-flag fix).** The
+    /// glyph is read at PRESS time — where the Shift/CapsLock modifier is reliably
+    /// still in effect — so a Shift-typed capital ("T") isn't lost when the
+    /// letter's key-UP fires after Shift has already been released (the
+    /// release-time glyph translates to "t"). `keyboardGetUnicodeString` is passive
+    /// (it returns the glyph the WindowServer baked into the event at creation, not
+    /// a re-translation of live flags), so the case is fixed by WHEN we read, not by
+    /// any flag we set. Timing/dwell semantics are unchanged — text keys still EMIT
+    /// on key-UP; only the character's case SOURCE moves to key-DOWN.
+    private var keyDownChars: [Int64: String] = [:]
+    /// Cumulative count of deliberate (non-auto-repeat) space keyDowns observed,
+    /// shipped to the engine via `.spaceObserved` for the QA-15 space-drop
+    /// reconciliation. Observe-only; content-free.
+    private var spaceDownCount: UInt64 = 0
 
     /// True while a Shift is held with nothing else pressed since — the window in
     /// which an isolated Shift TAP (the correction-accept gesture) can complete.
@@ -226,6 +241,10 @@ final class EventTap {
                 bridge.emit(.backspace(timestampMs: timestampMs))
             } else {
                 keyDownTimestamps[keycode] = timestampNs
+                // Case-accurate capture: record the glyph NOW, while Shift/CapsLock
+                // is applied at press. Consumed on key-UP below (see `keyDownChars`).
+                // Overwriting on an auto-repeat keyDown is harmless — same glyph.
+                keyDownChars[keycode] = Self.keyString(for: event)
                 // Any OTHER key on auto-repeat is still emitted once on keyUp, so
                 // its repeats are dropped. Emit a content-free marker (Principle
                 // #7: capture must see its own loss) — it also reveals whether
@@ -233,6 +252,16 @@ final class EventTap {
                 // justify moving every key onto keyDown later.
                 if isRepeat {
                     bridge.emit(.autorepeatDropped)
+                } else if keycode == 49 {
+                    // **Space-drop detector (QA-15, observe-only).** Keycode 49 =
+                    // space bar. The text key for this space is emitted later, on
+                    // keyUp (the lossy path); the keyDown here is observed
+                    // reliably. Count deliberate (non-repeat) space presses and
+                    // ship the running total so the engine can reconcile it
+                    // against the spaces it actually receives and flag a dropped
+                    // one. Content-free: a count, never the character.
+                    spaceDownCount += 1
+                    bridge.emit(.spaceObserved(total: spaceDownCount))
                 }
             }
         case .keyUp:
@@ -247,6 +276,9 @@ final class EventTap {
             } else {
                 dwellMs = 0
             }
+            // Consume the glyph captured at key-DOWN (case-accurate). Removed for
+            // EVERY key-up (both branches below) so the map never leaks a stale entry.
+            let downChar = keyDownChars.removeValue(forKey: keycode)
 
             if keycode == 53 {
                 // Keycode 53 = Escape. `keyboardGetUnicodeString` returns an
@@ -262,7 +294,17 @@ final class EventTap {
                     dwellMs: dwellMs
                 ))
             } else {
-                let key = Self.keyString(for: event)
+                // Case fix: prefer the glyph captured at key-DOWN (Shift/CapsLock
+                // reliably applied at press). Fall back to the key-UP glyph only if
+                // we never saw the key-down (e.g. the key was already held when the
+                // tap installed) — never lose a key. Only the CASE source changes;
+                // timing (dwell) and modifiers are still read from the key-UP event.
+                let key: String
+                if let dc = downChar, !dc.isEmpty {
+                    key = dc
+                } else {
+                    key = Self.keyString(for: event)
+                }
                 bridge.emit(.key(
                     key: key,
                     timestampMs: timestampMs,

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "TypeAssist",
+  "productName": "TenCalmDigits",
   "version": "0.1.0",
   "identifier": "app.typeassist",
   "build": {
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "TypeAssist",
+        "title": "TenCalmDigits",
         "width": 780,
         "height": 620,
         "minWidth": 780,

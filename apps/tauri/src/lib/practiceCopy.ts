@@ -21,7 +21,7 @@ export const copy = {
     /** aria label on the typing surface */
     surfaceLabel:
       "Warm-up sentence. Type the words shown; a slip is marked but never scored — backspace to redo.",
-    reassurance: "a slip just shows, gently — backspace to redo, nothing is scored",
+    reassurance: "If you slip, it just shows — backspace to redo. Nothing is scored.",
   },
 
   cont: {
@@ -38,26 +38,24 @@ export const copy = {
     done: "Done",
     doneLabel: "Close warm-up",
 
-    /** "what happened": which weak keys the round leaned into. Capability
-     *  framing — these are keys the user *worked*, never keys they "failed". */
-    keysLine(keys: string[]): string {
-      if (keys.length === 0) return "a few calm sentences — that all counts.";
-      const shown = keys.slice(0, 4).join("  ");
-      return `you leaned into ${shown}`;
-    },
+    /** Reassurance line — capability framing (the round warmed the user's
+     *  weak keys), never a score or target. Static; the numbers live in
+     *  `subLine` below. */
+    line: "That warmed up the keys you slip on most — a little easier next time.",
 
-    /** fresh observations folded into the motor map this round. Reflective —
-     *  it's what the app *noticed*, not a target hit. Null while unknown. */
-    observationsLine(added: number | null): string | null {
-      if (added === null || added <= 0) return null;
-      const noun = added === 1 ? "observation" : "observations";
-      return `${added} fresh ${noun} added`;
-    },
-
-    /** sentences-completed line — a gentle volume note, never a goal/streak. */
-    sentencesLine(n: number): string {
-      if (n <= 0) return "";
-      return n === 1 ? "one sentence" : `${n} sentences`;
+    /** Volume sub-line: an approximate word count (the motor observations
+     *  folded in this round) + the sentence count. "around" keeps it a soft,
+     *  reflective note, never a precise score/goal. Words null/0 → sentences
+     *  only; neither → empty (hidden). */
+    subLine(words: number | null, sentences: number): string {
+      const parts: string[] = [];
+      if (words !== null && words > 0) {
+        parts.push(`around ${words} ${words === 1 ? "word" : "words"} in`);
+      }
+      if (sentences > 0) {
+        parts.push(sentences === 1 ? "one sentence" : `${sentences} sentences`);
+      }
+      return parts.join(" · ");
     },
 
     /** Trend section header (Phase 3). Capability voice. */
@@ -67,5 +65,5 @@ export const copy = {
   },
 
   /** Honest empty state if the panel opens before the engine has any signal. */
-  coldStart: "we'll start with some everyday words while TypeAssist gets to know your hands.",
+  coldStart: "we'll start with some everyday words while TenCalmDigits gets to know your hands.",
 } as const;
