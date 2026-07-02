@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Hardened-runtime entitlements for the RELEASE (Developer ID) build.
+         TenCalmDigits is a Developer ID app (NOT Mac App Store), so it is NOT
+         sandboxed — there is deliberately no com.apple.security.app-sandbox key.
+
+         Accessibility and Input Monitoring are NOT entitlements: they are
+         user-granted TCC permissions requested at runtime (AXIsProcessTrusted /
+         the CGEventTap Input-Monitoring prompt). No entitlement enables them, and
+         none is needed here — the hardened runtime does not block a CGEventTap
+         listener. What makes the grants PERSIST is a stable Developer ID
+         signature (see justfile note), which this build provides.
+
+         The two keys below are the WKWebView (JavaScriptCore JIT) requirements
+         under the hardened runtime — without them the webview fails to start once
+         the runtime is enforced. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>
