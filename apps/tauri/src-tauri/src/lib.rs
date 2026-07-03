@@ -1279,6 +1279,18 @@ pub fn run() {
                     }
                 }
             }
+            // Menu-bar model (Grammarly): re-assert the accessory (no-Dock)
+            // policy whenever the main window takes focus. LSUIElement + the
+            // setup call should hold it, but a window becoming key can, on some
+            // launch-timing paths, leave the app promoted to Regular with a Dock
+            // tile — re-asserting here demotes it back. Cheap no-op when already
+            // accessory. See also the RunEvent::Ready re-assert below.
+            #[cfg(target_os = "macos")]
+            WindowEvent::Focused(true) if window.label() == "main" => {
+                let _ = window
+                    .app_handle()
+                    .set_activation_policy(ActivationPolicy::Accessory);
+            }
             // Remember where the user puts the main window, across restarts.
             WindowEvent::Moved(pos) if window.label() == "main" => {
                 save_main_position(window.app_handle(), pos.x, pos.y);
@@ -1375,6 +1387,24 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Re-assert the accessory (no-Dock) policy once Tauri has finished
+            // launching. `set_activation_policy(Accessory)` in `setup` runs
+            // BEFORE Tauri's own post-setup app activation; on the deferred
+            // first-run path, setup returns early (no sidecar spawn to block on),
+            // so that activation can win the race and promote the app to Regular —
+            // a Dock icon + launch bounce even though LSUIElement is set. Doing it
+            // again on Ready lands AFTER the activation, so the app settles as
+            // accessory in every path. No-op when already accessory.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Ready = event {
+                let _ = app_handle.set_activation_policy(ActivationPolicy::Accessory);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (app_handle, event);
+            }
+        });
 }
