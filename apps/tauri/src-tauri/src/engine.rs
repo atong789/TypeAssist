@@ -266,12 +266,26 @@ struct PermissionStatusEvent {
     input_monitoring: bool,
 }
 
+/// The settled, menu-bar-facing capture state. Three states, deliberately — the
+/// tray must never *assume* health (Principle #7). `NotStarted` is distinct from
+/// `Stopped`: nothing has broken, capture simply hasn't been observed Live yet
+/// (engine still booting, or — on a first run — deferred until onboarding grants
+/// permission). Only an observed Live heartbeat promotes to `Active`; only a
+/// settled outage demotes to `Stopped` (which alone carries a recovery action).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureUiState {
+    NotStarted,
+    Active,
+    Stopped,
+}
+
 /// Payload for [`EVT_CAPTURE_UI`] — the debounced, menu-bar-facing view of
-/// capture. `active` is the settled state (see the event's doc); when it's
-/// false, `permission_revoked` chooses the recovery action.
+/// capture. When `state` is `Stopped`, `permission_revoked` chooses the recovery
+/// action; it is meaningless (and always false) for the other two states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 struct CaptureUiEvent {
-    active: bool,
+    state: CaptureUiState,
     permission_revoked: bool,
 }
 
@@ -3249,7 +3263,10 @@ pub fn spawn<R: Runtime>(
         // effect) — and chooses the recovery action. `last_ui_emit` dedupes the
         // EVT_CAPTURE_UI emit.
         let mut non_live_since: Option<Instant> = None;
-        let mut ui_not_active = false;
+        // `ever_live` latches true on the first Live heartbeat. Until then the
+        // menu-bar state is `NotStarted`, never `Active` — the tray must derive
+        // "active" from an OBSERVED probe, not assume it (Principle #7).
+        let mut ever_live = false;
         let mut permission_ok = true;
         let mut last_ui_emit: Option<CaptureUiEvent> = None;
 
@@ -5024,27 +5041,44 @@ pub fn spawn<R: Runtime>(
                     // past NOT_ACTIVE_DEBOUNCE_MS (the self-heal window). Going
                     // back to Live flips active true immediately — good news
                     // isn't debounced.
-                    if matches!(current_capture_health, CaptureHealth::Live) {
+                    let live_now = matches!(current_capture_health, CaptureHealth::Live);
+                    if live_now {
                         non_live_since = None;
+                        ever_live = true;
                     } else if non_live_since.is_none() {
                         non_live_since = Some(Instant::now());
                     }
-                    ui_not_active = non_live_since.is_some_and(|since| {
+                    let settled_stopped = non_live_since.is_some_and(|since| {
                         Instant::now().duration_since(since).as_millis() >= NOT_ACTIVE_DEBOUNCE_MS
                     });
+                    // Active only from an observed Live (or a transient drop still
+                    // inside the anti-strobe debounce). Never-Live-yet is
+                    // NotStarted, not Active; a settled outage is Stopped.
+                    let ui_state = if live_now || (ever_live && !settled_stopped) {
+                        CaptureUiState::Active
+                    } else if settled_stopped {
+                        CaptureUiState::Stopped
+                    } else {
+                        CaptureUiState::NotStarted
+                    };
 
-                    // Push the menu-bar icon (On vs. capture-stopped Off);
-                    // no-op when unchanged.
-                    apply_tray_icon(&app_handle, ui_not_active, &mut last_tray_icon);
+                    // Push the menu-bar icon: the capture-stopped slash ONLY for a
+                    // settled Stop. NotStarted keeps the neutral hand (no slash
+                    // flicker while a normal boot is still reaching its first
+                    // heartbeat). No-op when unchanged.
+                    apply_tray_icon(
+                        &app_handle,
+                        matches!(ui_state, CaptureUiState::Stopped),
+                        &mut last_tray_icon,
+                    );
 
                     // Emit the settled UI state on change, and periodically so a
                     // freshly-registered listener (the tray) converges. The
-                    // recovery action only matters while not active, so pin
-                    // permission_revoked to false when active (avoids a spurious
-                    // change emit from a stale flag).
+                    // recovery action only matters while Stopped.
                     let ui = CaptureUiEvent {
-                        active: !ui_not_active,
-                        permission_revoked: ui_not_active && !permission_ok,
+                        state: ui_state,
+                        permission_revoked: matches!(ui_state, CaptureUiState::Stopped)
+                            && !permission_ok,
                     };
                     if last_ui_emit != Some(ui) || watchdog_ticks % HEALTH_REPEAT_TICKS == 0 {
                         let _ = app_handle.emit(EVT_CAPTURE_UI, ui);

@@ -35,7 +35,12 @@
   let firstRunResolved = false;
   onMount(async () => {
     try {
-      if (!(await invoke<boolean>("is_first_run"))) onboarded.set(true);
+      // TWO-WAY reconciliation — the backend `is_first_run` is authoritative.
+      // `ta.onboarded` lives in the WebKit data store, which survives app
+      // deletion AND a `~/.typeassist` wipe, so a stale `true` would otherwise
+      // suppress onboarding forever on a genuine first run. So first-run true ⇒
+      // CLEAR the flag and show onboarding; false ⇒ set it and skip.
+      onboarded.set(!(await invoke<boolean>("is_first_run")));
     } catch {
       // If the check fails, fall back to the stored flag as-is.
     }

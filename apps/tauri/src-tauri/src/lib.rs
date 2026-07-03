@@ -147,11 +147,14 @@ fn request_motor_stability(sender: tauri::State<EngineControlSender>) -> Result<
 /// coloured dot can only be an image, not a text glyph. Active = the calm
 /// "is active"; stopped = the plain, unambiguous "has stopped" (the menu-bar
 /// icon, not the wording, carries the alarm — see the design note).
-fn status_text(active: bool) -> &'static str {
-    if active {
-        "Jordan is active"
-    } else {
-        "Jordan has stopped"
+fn status_text(state: engine::CaptureUiState) -> &'static str {
+    use engine::CaptureUiState::*;
+    match state {
+        Active => "Jordan is active",
+        // Never observed capturing yet — booting, or (first run) waiting on
+        // onboarding to grant permission. Distinct from a stop: nothing broke.
+        NotStarted => "Jordan hasn’t started yet",
+        Stopped => "Jordan has stopped",
     }
 }
 
@@ -314,12 +317,16 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
     // fires); its text + dot are updated live by the debounced capture-UI
     // listener below. Active = a small filled blue dot; stopped = a small hollow
     // grey ring (see `status_dot`).
+    // Default is NotStarted, NOT Active — the tray must never claim health it
+    // hasn't observed (Principle #7). It stays NotStarted until the engine emits
+    // its first Live-derived EVT_CAPTURE_UI; on a first run the engine is deferred
+    // until onboarding, so this honest "hasn’t started yet" is what shows.
     let status = IconMenuItem::with_id(
         app,
         "status",
-        status_text(true),
+        status_text(engine::CaptureUiState::NotStarted),
         false,
-        Some(status_dot(true)),
+        Some(status_dot(false)),
         None::<&str>,
     )?;
     let practice = MenuItem::with_id(app, "practice", "Warm-up", true, None::<&str>)?;
@@ -436,22 +443,30 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
         let restart = restart_item.clone();
         let reconnect = reconnect_item.clone();
         app.listen(engine::EVT_CAPTURE_UI, move |event| {
+            use engine::CaptureUiState;
             let v = serde_json::from_str::<serde_json::Value>(event.payload()).ok();
-            let active = v
+            let state = match v
                 .as_ref()
-                .and_then(|v| v.get("active").and_then(|b| b.as_bool()))
-                .unwrap_or(true);
+                .and_then(|v| v.get("state").and_then(|s| s.as_str()))
+            {
+                Some("active") => CaptureUiState::Active,
+                Some("stopped") => CaptureUiState::Stopped,
+                // Unknown/absent → NotStarted: the honest default, never Active.
+                _ => CaptureUiState::NotStarted,
+            };
             let permission_revoked = v
                 .as_ref()
                 .and_then(|v| v.get("permission_revoked").and_then(|b| b.as_bool()))
                 .unwrap_or(false);
-            let _ = status_item.set_text(status_text(active));
-            let _ = status_item.set_icon(Some(status_dot(active)));
+            let _ = status_item.set_text(status_text(state));
+            let _ = status_item.set_icon(Some(status_dot(matches!(state, CaptureUiState::Active))));
             // Reconcile the recovery item. remove() on an absent item is a
-            // harmless Err, so clearing both first keeps this idempotent.
+            // harmless Err, so clearing both first keeps this idempotent. The
+            // recovery action belongs to a settled Stop only — NotStarted is a
+            // boot/onboarding state, not something to "Restart" or "Reconnect".
             let _ = menu_ref.remove(&restart);
             let _ = menu_ref.remove(&reconnect);
-            if !active {
+            if matches!(state, CaptureUiState::Stopped) {
                 let item: &dyn IsMenuItem<R> = if permission_revoked {
                     &reconnect
                 } else {
