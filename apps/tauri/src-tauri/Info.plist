@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Menu-bar-only app (Grammarly model): launch as a UI agent so NO Dock
+         icon ever appears. This is the DECLARATIVE half of the accessory policy —
+         macOS reads it at launch, before any code runs, so the app starts as an
+         agent and the Dock icon never flashes. The runtime
+         `set_activation_policy(Accessory)` in lib.rs is the belt-and-suspenders
+         half (and is what `tauri dev`'s unbundled binary relies on, since it has
+         no bundle Info.plist). Without this key the bundled release launched as a
+         Regular app and kept a persistent Dock icon even with all windows closed;
+         dev never reproduced it because it runs unbundled.
+
+         Tauri 2.x auto-merges this file into the generated bundle Info.plist for
+         macOS builds; it does NOT affect `tauri dev`. Windows still open normally
+         under agent policy. -->
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>
