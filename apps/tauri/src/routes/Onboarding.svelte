@@ -257,13 +257,21 @@
           <span>Everything stays on your Mac</span>
         </div>
         <p class="ob-lede">
-          Jordan works entirely on this Mac — but macOS still needs your OK. Turn on both below and
-          Jordan starts learning right away.
+          Jordan works entirely on this Mac — but macOS still needs your OK below. The moment it’s
+          granted, Jordan starts learning.
         </p>
 
-        <!-- Each row reflects its OWN grant (`axOn` / `imOn` from the per-grant
-             permission-status snapshot), so a half-granted state shows exactly
-             which one is still pending. Blue check on grant — never green/red. -->
+        <!-- Accessibility is the primary grant. On macOS 13–26 an Accessibility
+             grant ALSO satisfies the keystroke tap's Input-Monitoring
+             (ListenEvent) requirement — undocumented but consistent Catalina-era
+             behaviour (Karabiner relies on it; see docs/macos-signing.md). So we
+             DON'T list Input Monitoring as an upfront step: the row appears ONLY
+             if, after Accessibility is granted, capture still isn't satisfied
+             (`axOn && !imOn`) — i.e. only if a future macOS decouples the two, or
+             a machine genuinely needs the separate grant. `imOn` folds capture
+             health (`imGranted || captureLive`), so it flips true the instant the
+             subsumption resolves — the row never flashes in the common case.
+             Blue check on grant — never green/red. -->
         <div class="ob-perms">
           <div class="ob-perm" class:granted={axOn}>
             <span class="ob-perm-status" aria-hidden="true">
@@ -288,31 +296,26 @@
             </div>
           </div>
 
-          <div class="ob-perm" class:granted={imOn}>
-            <span class="ob-perm-status" aria-hidden="true">
-              {#if imOn}
-                <i class="ti ti-circle-check"></i>
-              {:else}
+          <!-- Conditional: only when Accessibility is granted but capture still
+               isn't satisfied (subsumption absent). Never rendered in the common
+               case, so it's always the pending state — no "Allowed" branch. -->
+          {#if axOn && !imOn}
+            <div class="ob-perm">
+              <span class="ob-perm-status" aria-hidden="true">
                 <span class="ob-perm-ring"></span>
-              {/if}
-            </span>
-            <div class="ob-perm-body">
-              <span class="ob-perm-label">Input Monitoring</span>
-              <span class="ob-perm-sub">Lets Jordan see the keys as you press them.</span>
-              {#if imOn}
-                <span class="ob-perm-allowed">
-                  <i class="ti ti-check" aria-hidden="true"></i>Allowed
-                </span>
-              {:else}
+              </span>
+              <div class="ob-perm-body">
+                <span class="ob-perm-label">Input Monitoring</span>
+                <span class="ob-perm-sub">This Mac also needs this one so Jordan can see the keys as you press them.</span>
                 <button class="ob-perm-btn" bind:this={openImBtn} on:click={openInputMonitoring}>
                   Open Input Monitoring Settings
                 </button>
-              {/if}
+              </div>
             </div>
-          </div>
+          {/if}
         </div>
 
-        <p class="ob-fine">Jordan moves on the moment both are on.</p>
+        <p class="ob-fine">Jordan moves on the moment capture starts.</p>
       {:else}
         <h1 class="ob-hi">{name.trim() ? `All set, ${name.trim()}.` : "All set."}</h1>
         <p class="ob-lede">

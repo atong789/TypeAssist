@@ -90,3 +90,30 @@ open -R "/Applications/TenCalmDigits.app/Contents/MacOS/typeassist-input-macos"
 
 > If a grant ever does get into a bad state, reset and re-grant:
 > `tccutil reset Accessibility app.tencalmdigits && tccutil reset ListenEvent app.tencalmdigits`
+
+## Accessibility vs Input Monitoring — one grant, not two
+
+The keystroke tap is a **session-level, listen-only `CGEventTap`**. In theory that
+needs the **Input Monitoring** (ListenEvent) grant, separate from **Accessibility**.
+In practice, on **macOS 13–26**, an **Accessibility** grant *also* satisfies
+Input Monitoring for this tap type: `CGPreflightListenEventAccess()` /
+`IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)` return granted once the process
+is Accessibility-trusted, and the app never appears in the Input Monitoring pane.
+
+This subsumption is **undocumented** — Apple has never confirmed it (see
+[developer.apple.com/forums/thread/122492](https://developer.apple.com/forums/thread/122492),
+where it goes unanswered) — but it is **consistent since Catalina (10.15)** and
+production tools rely on it (Karabiner-Elements:
+["usually unnecessary … covered by the Accessibility setting"](https://karabiner-elements.pqrs.org/docs/manual/misc/required-macos-settings/)).
+It is NOT Tahoe-specific.
+
+Because it's undocumented, we don't *assume* it — we **derive** from runtime state:
+- The sidecar still preflights + gates on Input Monitoring (`main.swift`), so if a
+  future macOS ever decouples the two, capture fails **closed** with
+  `permission_required` (routed to Reconnect), never silently.
+- Onboarding lists **only Accessibility**. The Input Monitoring row is
+  **conditional** — it appears solely when Accessibility is granted but capture is
+  still unsatisfied (`axOn && !imOn` in `Onboarding.svelte`). Today that condition
+  is never met, so the row never shows; if the rules change, it reappears
+  automatically and the user grants IM through it. `imOn` folds capture-health
+  (`imGranted || captureLive`), so the common (subsumed) case never flashes the row.
