@@ -318,6 +318,9 @@
            the Privacy wrapper/typography. Version is the app's actual 0.1.0. -->
       <header class="screen-header"><h1>{activeLabel}</h1></header>
       <div class="privacy about-stack">
+        <!-- The TenCalmDigits hand mark (Noto 🖐, credited below). Decorative —
+             the heading carries the name, so it's aria-hidden. -->
+        <img class="about-mark" src="/hand.svg" alt="" aria-hidden="true" />
         <p class="about-lead">Hi, I’m Jordan.</p>
         <p class="privacy-p">
           I’m the quiet helper inside TenCalmDigits. I was made for hands that don’t always land where
@@ -682,6 +685,12 @@
     flex-direction: column;
     gap: 0.9rem;
     margin-top: 0.2rem;
+  }
+  .about-mark {
+    width: 56px;
+    height: 56px;
+    margin: 0 0 0.1rem;
+    /* SVG has its own transparent padding; no background/rounding needed. */
   }
   .about-lead {
     margin: 0;

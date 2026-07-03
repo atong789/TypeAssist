@@ -2728,12 +2728,20 @@ const HEALTH_REPEAT_TICKS: u64 = 5;
 /// the icon never strobes; only a genuine, persistent stop trips it.
 const NOT_ACTIVE_DEBOUNCE_MS: u128 = 16_000;
 
-/// Spawn (or respawn) the Swift sidecar — `app.shell().sidecar()` plus
-/// the `TYPEASSIST_AX_PROMPT=1` env that opts into the macOS
-/// Accessibility dialog when the permission is missing. Factored out
-/// so commit O's hard-restart path uses the SAME spawn shape as the
-/// initial boot — divergence here would be a fertile source of "works
-/// the first time, then dies on restart" bugs.
+/// Spawn (or respawn) the Swift sidecar via `app.shell().sidecar()`. Factored
+/// out so commit O's hard-restart path uses the SAME spawn shape as the initial
+/// boot — divergence here would be a fertile source of "works the first time,
+/// then dies on restart" bugs.
+///
+/// We deliberately DO NOT set `TYPEASSIST_AX_PROMPT=1` here. Production must keep
+/// the system Accessibility modal suppressed — the onboarding / Reconnect UI
+/// owns that conversation and opens the Settings pane directly (see
+/// `Accessibility.isTrusted(prompt:)` and `main.swift`). Forcing the prompt on
+/// meant every respawn (the onboarding 3s `restart_capture` poll, the watchdog
+/// auto-respawn) re-ran `AXIsProcessTrustedWithOptions(prompt: true)` and popped
+/// a fresh modal — turning a single failed trust read into an endless prompt
+/// loop. The `TYPEASSIST_AX_PROMPT` env still exists for the headless
+/// walking-skeleton (no UI to drive the grant); the app just never sets it.
 fn spawn_sidecar<R: Runtime>(
     app: &AppHandle<R>,
 ) -> Result<
@@ -2743,10 +2751,7 @@ fn spawn_sidecar<R: Runtime>(
     ),
     Box<dyn std::error::Error>,
 > {
-    let mut cmd = app
-        .shell()
-        .sidecar("typeassist-input-macos")?
-        .env("TYPEASSIST_AX_PROMPT", "1");
+    let mut cmd = app.shell().sidecar("typeassist-input-macos")?;
     // Phase 0 / M3 debug: propagate the AX-geometry probe flag to the
     // sidecar so it runs the feasibility probe under the app's *working*
     // Accessibility grant (a Terminal launch of the same binary hits
