@@ -86,3 +86,50 @@ tccutil reset Accessibility app.typeassist
 tccutil reset ListenEvent   app.typeassist
 rm -rf /Applications/TenCalmDigits.app
 ```
+
+## Test-Mac gotchas (repeated installs)
+
+Cycling many DMGs of the **same** bundle id / volume name on one Mac leaves two
+kinds of stale cache that produce confusing symptoms. Neither is a bug in the
+build — both are macOS caches keyed to a name that every version shares.
+
+### A Dock icon appears despite `LSUIElement=true`
+
+The app is a menu-bar agent (`LSUIElement` in the bundle plist + a runtime
+`set_activation_policy(Accessory)` re-asserted on `RunEvent::Ready` and main-window
+focus). If a Dock icon still shows, it's almost always a **stale LaunchServices
+registration** from an earlier install (repeated same-id installs accumulate
+registrations; a pre-`LSUIElement` one can win the launch). Diagnose and clear:
+
+```sh
+# How many registrations claim the id? (many = stale ones present)
+/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister \
+  -dump | grep -c 'app.tencalmdigits'
+
+# With the app running, is it actually promoted, or just a stale Dock tile?
+lsappinfo info -app app.tencalmdigits | grep -o 'type="[^"]*"'
+#   type="UIElement"  → accessory (correct); the tile is a stale registration
+#   type="Foreground" → a real runtime promotion (report it)
+
+# Rebuild the LaunchServices DB, then reinstall the notarized DMG:
+/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister \
+  -kill -r -domain local -domain user
+rm -rf /Applications/TenCalmDigits.app
+```
+
+### The DMG volume icon is the wrong hand (e.g. brown, not yellow)
+
+The DMG's volume icon (`.VolumeIcon.icns`) is **byte-identical** to the app icon
+(the yellow Noto hand) — there is nothing to regenerate. Finder caches volume
+icons by **volume name**, and every DMG mounts as "TenCalmDigits", so it reuses
+an older mount's cached icon. Clear it:
+
+```sh
+sudo rm -rf /Library/Caches/com.apple.iconservices.store
+qlmanage -r cache
+killall Finder Dock
+```
+
+A Mac that never mounted an earlier DMG renders it correctly. To sidestep the
+cache for testers entirely, give each release a version-stamped DMG **volume
+name** (so Finder never reuses a stale icon) — not yet done.
