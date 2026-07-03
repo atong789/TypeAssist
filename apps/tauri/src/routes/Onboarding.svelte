@@ -111,8 +111,14 @@
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   function ensurePolling() {
     if (pollTimer) return;
-    invoke("restart_capture").catch(() => {}); // probe immediately
-    pollTimer = setInterval(() => invoke("restart_capture").catch(() => {}), POLL_MS);
+    // `start_capture` (not `restart_capture`): on a first run the engine is
+    // deferred, so this is what lazily spawns the sidecar the moment the user
+    // reaches the permission step — Accessibility is requested first, in context.
+    // It's idempotent: the first call spawns; later calls (and existing users
+    // replaying onboarding) just re-probe, so a just-granted permission flips
+    // capture live within a poll cycle.
+    invoke("start_capture").catch(() => {}); // spawn/probe immediately
+    pollTimer = setInterval(() => invoke("start_capture").catch(() => {}), POLL_MS);
   }
   function stopPolling() {
     if (pollTimer) {

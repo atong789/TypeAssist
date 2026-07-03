@@ -80,6 +80,55 @@ fn restart_capture(sender: tauri::State<EngineControlSender>) -> Result<(), Stri
         .map_err(|e| format!("engine control channel closed: {e}"))
 }
 
+/// Guards the one-time lazy engine start on the **first-run** path. `false` until
+/// the engine (Swift sidecar + watchdog) has been spawned. On a fresh install we
+/// deliberately do NOT start capture at launch — the sidecar would fire an
+/// Input-Monitoring prompt with zero context before onboarding could explain it.
+/// Instead onboarding calls [`start_capture`] when the user reaches the
+/// permission step, which spawns exactly once (flag flipped under the mutex so
+/// concurrent 3s poll calls don't double-spawn). Existing users start in `setup`
+/// with the flag already `true`.
+struct EngineStarted(std::sync::Mutex<bool>);
+
+/// Whether this launch is a first run (no learning data, no Accessibility grant).
+/// The webview reads this on mount to decide whether to show onboarding — the
+/// SAME predicate `setup` uses to decide whether to defer the engine, so the
+/// "show onboarding" and "defer capture" decisions can never diverge.
+#[tauri::command]
+fn is_first_run() -> bool {
+    engine::is_first_run()
+}
+
+/// Lazily start capture on the first-run path (onboarding's permission step),
+/// then re-probe. Spawns the engine exactly once; subsequent calls just forward
+/// [`EngineControl::RestartCapture`] (the same re-arm the onboarding poll used to
+/// send via `restart_capture`). Idempotent and race-safe under the mutex.
+#[tauri::command]
+fn start_capture(app: AppHandle) -> Result<(), String> {
+    let started = app.state::<EngineStarted>();
+    let mut guard = started
+        .0
+        .lock()
+        .map_err(|_| "engine-start lock poisoned".to_string())?;
+    if !*guard {
+        // First reach of the permission step: bring the engine (sidecar +
+        // watchdog) to life. The fresh spawn IS the start — no restart needed.
+        let control_tx =
+            engine::spawn(&app).map_err(|e| format!("failed to spawn engine: {e}"))?;
+        app.manage(control_tx);
+        *guard = true;
+        tracing::info!("engine lazily started at onboarding permission step");
+        return Ok(());
+    }
+    drop(guard);
+    // Already running (a later poll, or an existing user replaying onboarding) —
+    // re-probe so a just-granted permission flips capture live.
+    app.try_state::<EngineControlSender>()
+        .ok_or_else(|| "engine started but control sender missing".to_string())?
+        .send(EngineControl::RestartCapture)
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
 /// Tauri command: ask the engine to emit the current C5c motor
 /// [`StabilityReport`] on `engine://motor-stability` — the weakest-keys
 /// preview Practice mode builds its curriculum from, plus the kill-switch
@@ -1156,6 +1205,8 @@ pub fn run() {
             set_learning_paused,
             set_input_paused,
             restart_capture,
+            start_capture,
+            is_first_run,
             request_motor_stability,
             request_practice_trend,
             open_practice,
@@ -1282,16 +1333,29 @@ pub fn run() {
                     .listen(engine::EVT_CORRECTION_APPLIED, move |_| show_cue(&h_app));
             }
 
-            match engine::spawn(&app.handle()) {
-                Ok(control_tx) => {
-                    // Hand the control sender to Tauri's managed
-                    // state so #[tauri::command] handlers can fetch
-                    // it via `tauri::State`. The receiver is owned
-                    // by the engine task.
-                    app.manage(control_tx);
-                }
-                Err(e) => {
-                    tracing::error!("failed to spawn engine: {e}");
+            // First-run gate: on a fresh install (no learning data, no
+            // Accessibility grant) do NOT start capture at launch — the sidecar
+            // would fire a context-free Input-Monitoring prompt before onboarding
+            // could explain it. Onboarding calls `start_capture` at its permission
+            // step instead. Existing users start immediately, exactly as before.
+            // Because the engine (and thus its watchdog) never starts here on a
+            // first run, nothing can auto-respawn the sidecar during onboarding.
+            let first_run = engine::is_first_run();
+            app.manage(EngineStarted(std::sync::Mutex::new(!first_run)));
+            if first_run {
+                tracing::info!("first run — deferring capture until onboarding grants permission");
+            } else {
+                match engine::spawn(&app.handle()) {
+                    Ok(control_tx) => {
+                        // Hand the control sender to Tauri's managed
+                        // state so #[tauri::command] handlers can fetch
+                        // it via `tauri::State`. The receiver is owned
+                        // by the engine task.
+                        app.manage(control_tx);
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to spawn engine: {e}");
+                    }
                 }
             }
             Ok(())

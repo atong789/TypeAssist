@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick, type ComponentType } from "svelte";
   import { listen } from "@tauri-apps/api/event";
+  import { invoke } from "@tauri-apps/api/core";
   import DebugPanel from "./routes/DebugPanel.svelte";
   import Today from "./routes/Today.svelte";
   import Progress from "./routes/Progress.svelte";
@@ -22,6 +23,31 @@
   // First-run onboarding ("DayOne") gates the shell. On "Get started" (or a
   // restore), it completes and drops the user onto Today — observe-only, NOT a
   // warm-up — so the first day breathes. Onboarding never recurs once done.
+  //
+  // `onboarded` is webview localStorage, which the app's bundle-id change reset —
+  // so an EXISTING user could otherwise be shown onboarding again. The backend
+  // `is_first_run` (learning data OR Accessibility grant) is the real signal: if
+  // it says "not a first run", force `onboarded` true so an existing user skips
+  // onboarding regardless of the reset. `firstRunResolved` gates the initial
+  // render on this check so onboarding never flashes before it resolves. (Dev
+  // "Replay onboarding" sets the flag false AFTER mount, within a session, so
+  // this one-shot mount reconciliation doesn't undo it.)
+  let firstRunResolved = false;
+  onMount(async () => {
+    try {
+      if (!(await invoke<boolean>("is_first_run"))) onboarded.set(true);
+    } catch {
+      // If the check fails, fall back to the stored flag as-is.
+    }
+    firstRunResolved = true;
+    if ($onboarded) {
+      // Existing-user shell just mounted — land the focus ring as the normal
+      // launch path would (the sibling onMount's focus call ran before the gate).
+      await tick();
+      focusSelectedTab();
+    }
+  });
+
   async function completeOnboarding() {
     route = "today";
     onboarded.set(true);
@@ -275,7 +301,11 @@
 <!-- Focus trap: keeps keyboard focus within the app's interactive controls. -->
 <svelte:window on:keydown={onWindowKeydown} />
 
-{#if !$onboarded}
+{#if !firstRunResolved}
+  <!-- Deciding onboarding vs shell (a fast local IPC). Rendering nothing for this
+       tick avoids flashing onboarding at an existing user whose webview
+       localStorage was reset by the bundle-id change. -->
+{:else if !$onboarded}
   <Onboarding on:done={completeOnboarding} />
 {:else}
   <main bind:this={rootEl}>

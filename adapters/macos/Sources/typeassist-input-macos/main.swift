@@ -49,30 +49,27 @@ emitPermissionStatus()
 // that can never recover. Surfacing permission_required instead routes the menu
 // to "Reconnect…", which guides the user to the right pane.
 //
-// REGISTER BOTH PANES BEFORE EITHER GATE EXITS. A gate that exits the instant
-// its own grant is missing hides the OTHER pane's entry: if we bailed on
-// Accessibility first, CGRequestListenEventAccess() below never ran, so the app
-// never appeared in the Input Monitoring list and the user could never grant it
-// (the reported "IM never requested, app absent from that list" symptom). We
-// touch both TCC services up front so each lists the app regardless of which is
-// granted first, THEN gate.
-//   • AXIsProcessTrusted (even prompt-suppressed) lists us in Accessibility.
-//   • CGRequestListenEventAccess() (a) prompts once on a first, undetermined
-//     launch and (b) registers us in the Input Monitoring list; once decided it
-//     just returns the current state without re-prompting.
-//     CGPreflightListenEventAccess() is the pure, never-prompt check.
-let accessibilityTrusted = Accessibility.isTrusted(prompt: promptForAccessibility)
+// ACCESSIBILITY FIRST — gate on it BEFORE touching Input Monitoring. On macOS
+// 13–26 an Accessibility grant also satisfies the listen-only tap's Input
+// Monitoring requirement (undocumented but consistent Catalina-era subsumption;
+// see docs/macos-signing.md), so once AX is granted, CGPreflightListenEventAccess
+// returns true on its own and IM never has to prompt. If we requested IM first
+// (as an earlier revision did), the IM prompt fired before AX was granted — a
+// keystroke prompt with no context. Requesting IM only *after* AX is trusted
+// means: pre-AX we exit clean with no IM prompt at all; post-AX IM is already
+// satisfied by subsumption; and only on a machine where subsumption is absent do
+// we reach CGRequestListenEventAccess() — by then AX is granted, so the request
+// is in-context AND it registers the app in the IM pane (driving the onboarding
+// conditional row). CGPreflightListenEventAccess() is the pure, never-prompt
+// check; CGRequestListenEventAccess() registers + prompts once when undetermined.
+guard Accessibility.isTrusted(prompt: promptForAccessibility) else {
+    exitNeedingPermission()
+}
 
 var inputMonitoringGranted = CGPreflightListenEventAccess()
 if !inputMonitoringGranted {
     _ = CGRequestListenEventAccess()
     inputMonitoringGranted = CGPreflightListenEventAccess()
-}
-
-// Both panes now list the app; gate on each grant (surfacing permission_required
-// so the UI routes to Reconnect for whichever is still missing).
-guard accessibilityTrusted else {
-    exitNeedingPermission()
 }
 guard inputMonitoringGranted else {
     FileHandle.standardError.write(

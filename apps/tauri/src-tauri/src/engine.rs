@@ -1029,6 +1029,39 @@ fn motor_map_path() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("motor_map.json"))
 }
 
+/// macOS Accessibility trust — a pure, no-prompt read of `AXIsProcessTrusted()`.
+/// The main app process is its OWN responsible process, so this reflects the
+/// same app-level grant the spawned sidecar inherits. Used only for the
+/// first-run decision; the sidecar remains the authoritative capture-time check.
+#[cfg(target_os = "macos")]
+pub fn accessibility_granted() -> bool {
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXIsProcessTrusted() -> bool;
+    }
+    // SAFETY: AXIsProcessTrusted takes no args, has no side effects, and never
+    // prompts (unlike AXIsProcessTrustedWithOptions with the prompt option).
+    unsafe { AXIsProcessTrusted() }
+}
+#[cfg(not(target_os = "macos"))]
+pub fn accessibility_granted() -> bool {
+    false
+}
+
+/// First run = a fresh install with nothing to resume: **no learning data**
+/// (`motor_map.json` absent) **and no Accessibility grant**. Either one present
+/// ⇒ an existing user, so capture starts immediately and onboarding is skipped.
+///
+/// Deliberately narrow (product decision): `motor_map.json` OR
+/// `AXIsProcessTrusted()`, NOT "any file under `~/.typeassist`" — a stray empty
+/// dir or a lone config file must not suppress a genuine first-run onboarding.
+/// This is the single source of truth for both the setup spawn-defer decision
+/// and the `is_first_run` command the webview reads, so the two can't disagree.
+pub fn is_first_run() -> bool {
+    let has_learning_data = motor_map_path().map(|p| p.exists()).unwrap_or(false);
+    !has_learning_data && !accessibility_granted()
+}
+
 /// `~/.typeassist/word_patterns.json` — the live word-pattern store (C5d),
 /// its OWN file beside the motor map. Deliberately NOT under `snapshots/`:
 /// the Practice-trend reader loads every file there as a `MotorMap`, so a
