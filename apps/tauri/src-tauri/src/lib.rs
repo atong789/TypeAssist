@@ -80,6 +80,55 @@ fn restart_capture(sender: tauri::State<EngineControlSender>) -> Result<(), Stri
         .map_err(|e| format!("engine control channel closed: {e}"))
 }
 
+/// Guards the one-time lazy engine start on the **first-run** path. `false` until
+/// the engine (Swift sidecar + watchdog) has been spawned. On a fresh install we
+/// deliberately do NOT start capture at launch — the sidecar would fire an
+/// Input-Monitoring prompt with zero context before onboarding could explain it.
+/// Instead onboarding calls [`start_capture`] when the user reaches the
+/// permission step, which spawns exactly once (flag flipped under the mutex so
+/// concurrent 3s poll calls don't double-spawn). Existing users start in `setup`
+/// with the flag already `true`.
+struct EngineStarted(std::sync::Mutex<bool>);
+
+/// Whether this launch is a first run (no learning data, no Accessibility grant).
+/// The webview reads this on mount to decide whether to show onboarding — the
+/// SAME predicate `setup` uses to decide whether to defer the engine, so the
+/// "show onboarding" and "defer capture" decisions can never diverge.
+#[tauri::command]
+fn is_first_run() -> bool {
+    engine::is_first_run()
+}
+
+/// Lazily start capture on the first-run path (onboarding's permission step),
+/// then re-probe. Spawns the engine exactly once; subsequent calls just forward
+/// [`EngineControl::RestartCapture`] (the same re-arm the onboarding poll used to
+/// send via `restart_capture`). Idempotent and race-safe under the mutex.
+#[tauri::command]
+fn start_capture(app: AppHandle) -> Result<(), String> {
+    let started = app.state::<EngineStarted>();
+    let mut guard = started
+        .0
+        .lock()
+        .map_err(|_| "engine-start lock poisoned".to_string())?;
+    if !*guard {
+        // First reach of the permission step: bring the engine (sidecar +
+        // watchdog) to life. The fresh spawn IS the start — no restart needed.
+        let control_tx =
+            engine::spawn(&app).map_err(|e| format!("failed to spawn engine: {e}"))?;
+        app.manage(control_tx);
+        *guard = true;
+        tracing::info!("engine lazily started at onboarding permission step");
+        return Ok(());
+    }
+    drop(guard);
+    // Already running (a later poll, or an existing user replaying onboarding) —
+    // re-probe so a just-granted permission flips capture live.
+    app.try_state::<EngineControlSender>()
+        .ok_or_else(|| "engine started but control sender missing".to_string())?
+        .send(EngineControl::RestartCapture)
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
 /// Tauri command: ask the engine to emit the current C5c motor
 /// [`StabilityReport`] on `engine://motor-stability` — the weakest-keys
 /// preview Practice mode builds its curriculum from, plus the kill-switch
@@ -98,11 +147,14 @@ fn request_motor_stability(sender: tauri::State<EngineControlSender>) -> Result<
 /// coloured dot can only be an image, not a text glyph. Active = the calm
 /// "is active"; stopped = the plain, unambiguous "has stopped" (the menu-bar
 /// icon, not the wording, carries the alarm — see the design note).
-fn status_text(active: bool) -> &'static str {
-    if active {
-        "Jordan is active"
-    } else {
-        "Jordan has stopped"
+fn status_text(state: engine::CaptureUiState) -> &'static str {
+    use engine::CaptureUiState::*;
+    match state {
+        Active => "Jordan is active",
+        // Never observed capturing yet — booting, or (first run) waiting on
+        // onboarding to grant permission. Distinct from a stop: nothing broke.
+        NotStarted => "Jordan hasn’t started yet",
+        Stopped => "Jordan has stopped",
     }
 }
 
@@ -265,12 +317,16 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
     // fires); its text + dot are updated live by the debounced capture-UI
     // listener below. Active = a small filled blue dot; stopped = a small hollow
     // grey ring (see `status_dot`).
+    // Default is NotStarted, NOT Active — the tray must never claim health it
+    // hasn't observed (Principle #7). It stays NotStarted until the engine emits
+    // its first Live-derived EVT_CAPTURE_UI; on a first run the engine is deferred
+    // until onboarding, so this honest "hasn’t started yet" is what shows.
     let status = IconMenuItem::with_id(
         app,
         "status",
-        status_text(true),
+        status_text(engine::CaptureUiState::NotStarted),
         false,
-        Some(status_dot(true)),
+        Some(status_dot(false)),
         None::<&str>,
     )?;
     let practice = MenuItem::with_id(app, "practice", "Warm-up", true, None::<&str>)?;
@@ -387,22 +443,30 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<CheckMenuItem<R>>
         let restart = restart_item.clone();
         let reconnect = reconnect_item.clone();
         app.listen(engine::EVT_CAPTURE_UI, move |event| {
+            use engine::CaptureUiState;
             let v = serde_json::from_str::<serde_json::Value>(event.payload()).ok();
-            let active = v
+            let state = match v
                 .as_ref()
-                .and_then(|v| v.get("active").and_then(|b| b.as_bool()))
-                .unwrap_or(true);
+                .and_then(|v| v.get("state").and_then(|s| s.as_str()))
+            {
+                Some("active") => CaptureUiState::Active,
+                Some("stopped") => CaptureUiState::Stopped,
+                // Unknown/absent → NotStarted: the honest default, never Active.
+                _ => CaptureUiState::NotStarted,
+            };
             let permission_revoked = v
                 .as_ref()
                 .and_then(|v| v.get("permission_revoked").and_then(|b| b.as_bool()))
                 .unwrap_or(false);
-            let _ = status_item.set_text(status_text(active));
-            let _ = status_item.set_icon(Some(status_dot(active)));
+            let _ = status_item.set_text(status_text(state));
+            let _ = status_item.set_icon(Some(status_dot(matches!(state, CaptureUiState::Active))));
             // Reconcile the recovery item. remove() on an absent item is a
-            // harmless Err, so clearing both first keeps this idempotent.
+            // harmless Err, so clearing both first keeps this idempotent. The
+            // recovery action belongs to a settled Stop only — NotStarted is a
+            // boot/onboarding state, not something to "Restart" or "Reconnect".
             let _ = menu_ref.remove(&restart);
             let _ = menu_ref.remove(&reconnect);
-            if !active {
+            if matches!(state, CaptureUiState::Stopped) {
                 let item: &dyn IsMenuItem<R> = if permission_revoked {
                     &reconnect
                 } else {
@@ -1156,6 +1220,8 @@ pub fn run() {
             set_learning_paused,
             set_input_paused,
             restart_capture,
+            start_capture,
+            is_first_run,
             request_motor_stability,
             request_practice_trend,
             open_practice,
@@ -1212,6 +1278,18 @@ pub fn run() {
                         let _ = sender.send(EngineControl::SetPromptedCaptureActive(false));
                     }
                 }
+            }
+            // Menu-bar model (Grammarly): re-assert the accessory (no-Dock)
+            // policy whenever the main window takes focus. LSUIElement + the
+            // setup call should hold it, but a window becoming key can, on some
+            // launch-timing paths, leave the app promoted to Regular with a Dock
+            // tile — re-asserting here demotes it back. Cheap no-op when already
+            // accessory. See also the RunEvent::Ready re-assert below.
+            #[cfg(target_os = "macos")]
+            WindowEvent::Focused(true) if window.label() == "main" => {
+                let _ = window
+                    .app_handle()
+                    .set_activation_policy(ActivationPolicy::Accessory);
             }
             // Remember where the user puts the main window, across restarts.
             WindowEvent::Moved(pos) if window.label() == "main" => {
@@ -1282,20 +1360,51 @@ pub fn run() {
                     .listen(engine::EVT_CORRECTION_APPLIED, move |_| show_cue(&h_app));
             }
 
-            match engine::spawn(&app.handle()) {
-                Ok(control_tx) => {
-                    // Hand the control sender to Tauri's managed
-                    // state so #[tauri::command] handlers can fetch
-                    // it via `tauri::State`. The receiver is owned
-                    // by the engine task.
-                    app.manage(control_tx);
-                }
-                Err(e) => {
-                    tracing::error!("failed to spawn engine: {e}");
+            // First-run gate: on a fresh install (no learning data, no
+            // Accessibility grant) do NOT start capture at launch — the sidecar
+            // would fire a context-free Input-Monitoring prompt before onboarding
+            // could explain it. Onboarding calls `start_capture` at its permission
+            // step instead. Existing users start immediately, exactly as before.
+            // Because the engine (and thus its watchdog) never starts here on a
+            // first run, nothing can auto-respawn the sidecar during onboarding.
+            let first_run = engine::is_first_run();
+            app.manage(EngineStarted(std::sync::Mutex::new(!first_run)));
+            if first_run {
+                tracing::info!("first run — deferring capture until onboarding grants permission");
+            } else {
+                match engine::spawn(&app.handle()) {
+                    Ok(control_tx) => {
+                        // Hand the control sender to Tauri's managed
+                        // state so #[tauri::command] handlers can fetch
+                        // it via `tauri::State`. The receiver is owned
+                        // by the engine task.
+                        app.manage(control_tx);
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to spawn engine: {e}");
+                    }
                 }
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Re-assert the accessory (no-Dock) policy once Tauri has finished
+            // launching. `set_activation_policy(Accessory)` in `setup` runs
+            // BEFORE Tauri's own post-setup app activation; on the deferred
+            // first-run path, setup returns early (no sidecar spawn to block on),
+            // so that activation can win the race and promote the app to Regular —
+            // a Dock icon + launch bounce even though LSUIElement is set. Doing it
+            // again on Ready lands AFTER the activation, so the app settles as
+            // accessory in every path. No-op when already accessory.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Ready = event {
+                let _ = app_handle.set_activation_policy(ActivationPolicy::Accessory);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (app_handle, event);
+            }
+        });
 }

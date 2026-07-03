@@ -1,5 +1,10 @@
 # macOS code signing (local)
 
+> **This page is the LOCAL dev build** (self-signed `TypeAssist Local Signing`,
+> not notarized). For the distributed **Developer ID + notarized beta DMG**, see
+> [`releasing-beta.md`](releasing-beta.md). The distributed bundle id is
+> `app.tencalmdigits`; the local dev config below still uses the same id.
+
 TypeAssist's keystroke capture runs in a Swift **sidecar** (`typeassist-input-macos`)
 that needs **Accessibility** (and **Input Monitoring**) permission. macOS ties
 that grant to the binary's **code signature**:
@@ -67,9 +72,9 @@ instead (no stable grant), override: `just signing_identity=- build-sidecar`.
 ## Granting the permission (one time)
 
 The sidecar calls `AXIsProcessTrusted()`, but macOS attributes that check to its
-**responsible process — the `TypeAssist` app**. So grant **the app**:
+**responsible process — the `TenCalmDigits` app**. So grant **the app**:
 
-System Settings → Privacy & Security → **Accessibility** → add **`TypeAssist`**
+System Settings → Privacy & Security → **Accessibility** → add **`TenCalmDigits`**
 and toggle it **ON**. That's the entry that matters; once both the app and the
 sidecar are stably cert-signed, the app-level grant covers the sidecar. (Under
 the old ad-hoc signing this attribution didn't hold — granting the app alone
@@ -80,8 +85,35 @@ Adding the sidecar binary itself is a harmless extra, not required. If you ever
 want to (e.g. debugging), reveal it and drag it onto the list:
 
 ```sh
-open -R "/Applications/TypeAssist.app/Contents/MacOS/typeassist-input-macos"
+open -R "/Applications/TenCalmDigits.app/Contents/MacOS/typeassist-input-macos"
 ```
 
 > If a grant ever does get into a bad state, reset and re-grant:
-> `tccutil reset Accessibility app.typeassist && tccutil reset ListenEvent app.typeassist`
+> `tccutil reset Accessibility app.tencalmdigits && tccutil reset ListenEvent app.tencalmdigits`
+
+## Accessibility vs Input Monitoring — one grant, not two
+
+The keystroke tap is a **session-level, listen-only `CGEventTap`**. In theory that
+needs the **Input Monitoring** (ListenEvent) grant, separate from **Accessibility**.
+In practice, on **macOS 13–26**, an **Accessibility** grant *also* satisfies
+Input Monitoring for this tap type: `CGPreflightListenEventAccess()` /
+`IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)` return granted once the process
+is Accessibility-trusted, and the app never appears in the Input Monitoring pane.
+
+This subsumption is **undocumented** — Apple has never confirmed it (see
+[developer.apple.com/forums/thread/122492](https://developer.apple.com/forums/thread/122492),
+where it goes unanswered) — but it is **consistent since Catalina (10.15)** and
+production tools rely on it (Karabiner-Elements:
+["usually unnecessary … covered by the Accessibility setting"](https://karabiner-elements.pqrs.org/docs/manual/misc/required-macos-settings/)).
+It is NOT Tahoe-specific.
+
+Because it's undocumented, we don't *assume* it — we **derive** from runtime state:
+- The sidecar still preflights + gates on Input Monitoring (`main.swift`), so if a
+  future macOS ever decouples the two, capture fails **closed** with
+  `permission_required` (routed to Reconnect), never silently.
+- Onboarding lists **only Accessibility**. The Input Monitoring row is
+  **conditional** — it appears solely when Accessibility is granted but capture is
+  still unsatisfied (`axOn && !imOn` in `Onboarding.svelte`). Today that condition
+  is never met, so the row never shows; if the rules change, it reappears
+  automatically and the user grants IM through it. `imOn` folds capture-health
+  (`imGranted || captureLive`), so the common (subsumed) case never flashes the row.

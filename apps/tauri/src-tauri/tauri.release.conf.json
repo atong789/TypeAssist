@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "macOS": {
+      "signingIdentity": "Developer ID Application: Soumyo Sinha (XV484C8C6K)",
+      "entitlements": "entitlements.plist",
+      "minimumSystemVersion": "13.0"
+    }
+  }
+}

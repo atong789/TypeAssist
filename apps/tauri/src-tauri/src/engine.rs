@@ -266,12 +266,26 @@ struct PermissionStatusEvent {
     input_monitoring: bool,
 }
 
+/// The settled, menu-bar-facing capture state. Three states, deliberately — the
+/// tray must never *assume* health (Principle #7). `NotStarted` is distinct from
+/// `Stopped`: nothing has broken, capture simply hasn't been observed Live yet
+/// (engine still booting, or — on a first run — deferred until onboarding grants
+/// permission). Only an observed Live heartbeat promotes to `Active`; only a
+/// settled outage demotes to `Stopped` (which alone carries a recovery action).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureUiState {
+    NotStarted,
+    Active,
+    Stopped,
+}
+
 /// Payload for [`EVT_CAPTURE_UI`] — the debounced, menu-bar-facing view of
-/// capture. `active` is the settled state (see the event's doc); when it's
-/// false, `permission_revoked` chooses the recovery action.
+/// capture. When `state` is `Stopped`, `permission_revoked` chooses the recovery
+/// action; it is meaningless (and always false) for the other two states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 struct CaptureUiEvent {
-    active: bool,
+    state: CaptureUiState,
     permission_revoked: bool,
 }
 
@@ -1027,6 +1041,39 @@ fn typeassist_dir() -> Option<PathBuf> {
 /// `~/.typeassist/motor_map.json` — the live, periodically-saved map.
 fn motor_map_path() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("motor_map.json"))
+}
+
+/// macOS Accessibility trust — a pure, no-prompt read of `AXIsProcessTrusted()`.
+/// The main app process is its OWN responsible process, so this reflects the
+/// same app-level grant the spawned sidecar inherits. Used only for the
+/// first-run decision; the sidecar remains the authoritative capture-time check.
+#[cfg(target_os = "macos")]
+pub fn accessibility_granted() -> bool {
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXIsProcessTrusted() -> bool;
+    }
+    // SAFETY: AXIsProcessTrusted takes no args, has no side effects, and never
+    // prompts (unlike AXIsProcessTrustedWithOptions with the prompt option).
+    unsafe { AXIsProcessTrusted() }
+}
+#[cfg(not(target_os = "macos"))]
+pub fn accessibility_granted() -> bool {
+    false
+}
+
+/// First run = a fresh install with nothing to resume: **no learning data**
+/// (`motor_map.json` absent) **and no Accessibility grant**. Either one present
+/// ⇒ an existing user, so capture starts immediately and onboarding is skipped.
+///
+/// Deliberately narrow (product decision): `motor_map.json` OR
+/// `AXIsProcessTrusted()`, NOT "any file under `~/.typeassist`" — a stray empty
+/// dir or a lone config file must not suppress a genuine first-run onboarding.
+/// This is the single source of truth for both the setup spawn-defer decision
+/// and the `is_first_run` command the webview reads, so the two can't disagree.
+pub fn is_first_run() -> bool {
+    let has_learning_data = motor_map_path().map(|p| p.exists()).unwrap_or(false);
+    !has_learning_data && !accessibility_granted()
 }
 
 /// `~/.typeassist/word_patterns.json` — the live word-pattern store (C5d),
@@ -2728,12 +2775,20 @@ const HEALTH_REPEAT_TICKS: u64 = 5;
 /// the icon never strobes; only a genuine, persistent stop trips it.
 const NOT_ACTIVE_DEBOUNCE_MS: u128 = 16_000;
 
-/// Spawn (or respawn) the Swift sidecar — `app.shell().sidecar()` plus
-/// the `TYPEASSIST_AX_PROMPT=1` env that opts into the macOS
-/// Accessibility dialog when the permission is missing. Factored out
-/// so commit O's hard-restart path uses the SAME spawn shape as the
-/// initial boot — divergence here would be a fertile source of "works
-/// the first time, then dies on restart" bugs.
+/// Spawn (or respawn) the Swift sidecar via `app.shell().sidecar()`. Factored
+/// out so commit O's hard-restart path uses the SAME spawn shape as the initial
+/// boot — divergence here would be a fertile source of "works the first time,
+/// then dies on restart" bugs.
+///
+/// We deliberately DO NOT set `TYPEASSIST_AX_PROMPT=1` here. Production must keep
+/// the system Accessibility modal suppressed — the onboarding / Reconnect UI
+/// owns that conversation and opens the Settings pane directly (see
+/// `Accessibility.isTrusted(prompt:)` and `main.swift`). Forcing the prompt on
+/// meant every respawn (the onboarding 3s `restart_capture` poll, the watchdog
+/// auto-respawn) re-ran `AXIsProcessTrustedWithOptions(prompt: true)` and popped
+/// a fresh modal — turning a single failed trust read into an endless prompt
+/// loop. The `TYPEASSIST_AX_PROMPT` env still exists for the headless
+/// walking-skeleton (no UI to drive the grant); the app just never sets it.
 fn spawn_sidecar<R: Runtime>(
     app: &AppHandle<R>,
 ) -> Result<
@@ -2743,10 +2798,7 @@ fn spawn_sidecar<R: Runtime>(
     ),
     Box<dyn std::error::Error>,
 > {
-    let mut cmd = app
-        .shell()
-        .sidecar("typeassist-input-macos")?
-        .env("TYPEASSIST_AX_PROMPT", "1");
+    let mut cmd = app.shell().sidecar("typeassist-input-macos")?;
     // Phase 0 / M3 debug: propagate the AX-geometry probe flag to the
     // sidecar so it runs the feasibility probe under the app's *working*
     // Accessibility grant (a Terminal launch of the same binary hits
@@ -3211,7 +3263,10 @@ pub fn spawn<R: Runtime>(
         // effect) — and chooses the recovery action. `last_ui_emit` dedupes the
         // EVT_CAPTURE_UI emit.
         let mut non_live_since: Option<Instant> = None;
-        let mut ui_not_active = false;
+        // `ever_live` latches true on the first Live heartbeat. Until then the
+        // menu-bar state is `NotStarted`, never `Active` — the tray must derive
+        // "active" from an OBSERVED probe, not assume it (Principle #7).
+        let mut ever_live = false;
         let mut permission_ok = true;
         let mut last_ui_emit: Option<CaptureUiEvent> = None;
 
@@ -4986,27 +5041,44 @@ pub fn spawn<R: Runtime>(
                     // past NOT_ACTIVE_DEBOUNCE_MS (the self-heal window). Going
                     // back to Live flips active true immediately — good news
                     // isn't debounced.
-                    if matches!(current_capture_health, CaptureHealth::Live) {
+                    let live_now = matches!(current_capture_health, CaptureHealth::Live);
+                    if live_now {
                         non_live_since = None;
+                        ever_live = true;
                     } else if non_live_since.is_none() {
                         non_live_since = Some(Instant::now());
                     }
-                    ui_not_active = non_live_since.is_some_and(|since| {
+                    let settled_stopped = non_live_since.is_some_and(|since| {
                         Instant::now().duration_since(since).as_millis() >= NOT_ACTIVE_DEBOUNCE_MS
                     });
+                    // Active only from an observed Live (or a transient drop still
+                    // inside the anti-strobe debounce). Never-Live-yet is
+                    // NotStarted, not Active; a settled outage is Stopped.
+                    let ui_state = if live_now || (ever_live && !settled_stopped) {
+                        CaptureUiState::Active
+                    } else if settled_stopped {
+                        CaptureUiState::Stopped
+                    } else {
+                        CaptureUiState::NotStarted
+                    };
 
-                    // Push the menu-bar icon (On vs. capture-stopped Off);
-                    // no-op when unchanged.
-                    apply_tray_icon(&app_handle, ui_not_active, &mut last_tray_icon);
+                    // Push the menu-bar icon: the capture-stopped slash ONLY for a
+                    // settled Stop. NotStarted keeps the neutral hand (no slash
+                    // flicker while a normal boot is still reaching its first
+                    // heartbeat). No-op when unchanged.
+                    apply_tray_icon(
+                        &app_handle,
+                        matches!(ui_state, CaptureUiState::Stopped),
+                        &mut last_tray_icon,
+                    );
 
                     // Emit the settled UI state on change, and periodically so a
                     // freshly-registered listener (the tray) converges. The
-                    // recovery action only matters while not active, so pin
-                    // permission_revoked to false when active (avoids a spurious
-                    // change emit from a stale flag).
+                    // recovery action only matters while Stopped.
                     let ui = CaptureUiEvent {
-                        active: !ui_not_active,
-                        permission_revoked: ui_not_active && !permission_ok,
+                        state: ui_state,
+                        permission_revoked: matches!(ui_state, CaptureUiState::Stopped)
+                            && !permission_ok,
                     };
                     if last_ui_emit != Some(ui) || watchdog_ticks % HEALTH_REPEAT_TICKS == 0 {
                         let _ = app_handle.emit(EVT_CAPTURE_UI, ui);

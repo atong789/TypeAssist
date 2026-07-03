@@ -39,34 +39,42 @@ func emitPermissionStatus() {
 }
 emitPermissionStatus()
 
+// Capture needs TWO independent TCC grants on macOS 10.15+, revoked separately
+// (an app update can drop Input Monitoring while leaving Accessibility intact):
+//   • Accessibility — the AX API (secure-field focus, correction injection).
+//   • Input Monitoring ("Listen Events") — the CGEventTap that CAPTURES keys.
+// Re-granting one does NOT restore the other. Without the IM gate a missing IM
+// grant makes the tap fail to install (exit 3) with no permission signal — so
+// the engine thinks permission is fine and offers a useless "Restart capture"
+// that can never recover. Surfacing permission_required instead routes the menu
+// to "Reconnect…", which guides the user to the right pane.
+//
+// ACCESSIBILITY FIRST — gate on it BEFORE touching Input Monitoring. On macOS
+// 13–26 an Accessibility grant also satisfies the listen-only tap's Input
+// Monitoring requirement (undocumented but consistent Catalina-era subsumption;
+// see docs/macos-signing.md), so once AX is granted, CGPreflightListenEventAccess
+// returns true on its own and IM never has to prompt. If we requested IM first
+// (as an earlier revision did), the IM prompt fired before AX was granted — a
+// keystroke prompt with no context. Requesting IM only *after* AX is trusted
+// means: pre-AX we exit clean with no IM prompt at all; post-AX IM is already
+// satisfied by subsumption; and only on a machine where subsumption is absent do
+// we reach CGRequestListenEventAccess() — by then AX is granted, so the request
+// is in-context AND it registers the app in the IM pane (driving the onboarding
+// conditional row). CGPreflightListenEventAccess() is the pure, never-prompt
+// check; CGRequestListenEventAccess() registers + prompts once when undetermined.
 guard Accessibility.isTrusted(prompt: promptForAccessibility) else {
     exitNeedingPermission()
 }
 
-// Input Monitoring ("Listen Events") is a SEPARATE TCC grant from Accessibility
-// on macOS 10.15+, and the two are revoked independently — notably an app update
-// can drop Input Monitoring while leaving Accessibility intact. The split is by
-// API: the AX API (secure-field focus, correction injection) needs
-// Accessibility, but the CGEventTap that actually CAPTURES keystrokes needs
-// Input Monitoring. Re-granting Accessibility alone does NOT restore capture.
-//
-// Without this gate, a missing Input Monitoring grant makes the tap below fail
-// to install (exit 3) with no permission signal — so the engine thinks
-// permission is fine and the not-active menu offers a useless "Restart capture"
-// that can never recover. Surfacing permission_required instead routes the menu
-// to "Reconnect…", whose panel guides the user to the Input Monitoring pane.
-//
-// CGRequestListenEventAccess() both (a) prompts on a first, undetermined launch
-// and (b) registers TypeAssist in the Input Monitoring list so the user has a
-// toggle to flip when they get there; once decided it just returns the current
-// state without re-prompting. CGPreflightListenEventAccess() is the pure check.
-if !CGPreflightListenEventAccess() {
+var inputMonitoringGranted = CGPreflightListenEventAccess()
+if !inputMonitoringGranted {
     _ = CGRequestListenEventAccess()
-    if !CGPreflightListenEventAccess() {
-        FileHandle.standardError.write(
-            Data("Input Monitoring permission missing — grant in System Settings › Privacy & Security › Input Monitoring\n".utf8))
-        exitNeedingPermission()
-    }
+    inputMonitoringGranted = CGPreflightListenEventAccess()
+}
+guard inputMonitoringGranted else {
+    FileHandle.standardError.write(
+        Data("Input Monitoring permission missing — grant in System Settings › Privacy & Security › Input Monitoring\n".utf8))
+    exitNeedingPermission()
 }
 
 // Secure-field gate (Layer 2 cache): start tracking focus BEFORE the tap so

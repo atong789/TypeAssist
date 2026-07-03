@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick, type ComponentType } from "svelte";
   import { listen } from "@tauri-apps/api/event";
+  import { invoke } from "@tauri-apps/api/core";
   import DebugPanel from "./routes/DebugPanel.svelte";
   import Today from "./routes/Today.svelte";
   import Progress from "./routes/Progress.svelte";
@@ -22,6 +23,36 @@
   // First-run onboarding ("DayOne") gates the shell. On "Get started" (or a
   // restore), it completes and drops the user onto Today — observe-only, NOT a
   // warm-up — so the first day breathes. Onboarding never recurs once done.
+  //
+  // `onboarded` is webview localStorage, which the app's bundle-id change reset —
+  // so an EXISTING user could otherwise be shown onboarding again. The backend
+  // `is_first_run` (learning data OR Accessibility grant) is the real signal: if
+  // it says "not a first run", force `onboarded` true so an existing user skips
+  // onboarding regardless of the reset. `firstRunResolved` gates the initial
+  // render on this check so onboarding never flashes before it resolves. (Dev
+  // "Replay onboarding" sets the flag false AFTER mount, within a session, so
+  // this one-shot mount reconciliation doesn't undo it.)
+  let firstRunResolved = false;
+  onMount(async () => {
+    try {
+      // TWO-WAY reconciliation — the backend `is_first_run` is authoritative.
+      // `ta.onboarded` lives in the WebKit data store, which survives app
+      // deletion AND a `~/.typeassist` wipe, so a stale `true` would otherwise
+      // suppress onboarding forever on a genuine first run. So first-run true ⇒
+      // CLEAR the flag and show onboarding; false ⇒ set it and skip.
+      onboarded.set(!(await invoke<boolean>("is_first_run")));
+    } catch {
+      // If the check fails, fall back to the stored flag as-is.
+    }
+    firstRunResolved = true;
+    if ($onboarded) {
+      // Existing-user shell just mounted — land the focus ring as the normal
+      // launch path would (the sibling onMount's focus call ran before the gate).
+      await tick();
+      focusSelectedTab();
+    }
+  });
+
   async function completeOnboarding() {
     route = "today";
     onboarded.set(true);
@@ -275,7 +306,11 @@
 <!-- Focus trap: keeps keyboard focus within the app's interactive controls. -->
 <svelte:window on:keydown={onWindowKeydown} />
 
-{#if !$onboarded}
+{#if !firstRunResolved}
+  <!-- Deciding onboarding vs shell (a fast local IPC). Rendering nothing for this
+       tick avoids flashing onboarding at an existing user whose webview
+       localStorage was reset by the bundle-id change. -->
+{:else if !$onboarded}
   <Onboarding on:done={completeOnboarding} />
 {:else}
   <main bind:this={rootEl}>
@@ -318,6 +353,9 @@
            the Privacy wrapper/typography. Version is the app's actual 0.1.0. -->
       <header class="screen-header"><h1>{activeLabel}</h1></header>
       <div class="privacy about-stack">
+        <!-- The TenCalmDigits hand mark (Noto 🖐, credited below). Decorative —
+             the heading carries the name, so it's aria-hidden. -->
+        <img class="about-mark" src="/hand.svg" alt="" aria-hidden="true" />
         <p class="about-lead">Hi, I’m Jordan.</p>
         <p class="privacy-p">
           I’m the quiet helper inside TenCalmDigits. I was made for hands that don’t always land where
@@ -682,6 +720,12 @@
     flex-direction: column;
     gap: 0.9rem;
     margin-top: 0.2rem;
+  }
+  .about-mark {
+    width: 56px;
+    height: 56px;
+    margin: 0 0 0.1rem;
+    /* SVG has its own transparent padding; no background/rounding needed. */
   }
   .about-lead {
     margin: 0;

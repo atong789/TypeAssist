@@ -14,6 +14,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { correctionsOfferDismissed, devTodayState } from "../lib/previewSettings";
+  import CorrectionPair from "../lib/CorrectionPair.svelte";
 
   const dispatch = createEventDispatcher<{ navigate: string }>();
 
@@ -171,6 +172,27 @@
         word — accept it with a tap of Shift, or press Esc to undo. Some words I’m still
         learning; those join in over time. You’re always the one typing.
       </p>
+
+      <!-- Static, truthful miniature of the correction bubble (Cue.svelte) in its
+           early full form, shown where it appears on screen. Illustration only:
+           aria-hidden, not interactive, no focus stop, no logic. -->
+      <div class="corr-preview" aria-hidden="true">
+        <div class="corr-screen">
+          <span class="corr-screen-label">your screen</span>
+          <div class="corr-mini-bubble">
+            <span class="corr-mini-brand"></span>
+            <div class="corr-mini-body">
+              <CorrectionPair typed="waht" target="what" highlight={[1, 2]} />
+              <span class="corr-shift-chip">⇧ Shift</span>
+            </div>
+          </div>
+        </div>
+        <p class="corr-preview-cap">
+          It looks like this, in the top-right corner of your screen. Your text never
+          changes unless you accept.
+        </p>
+      </div>
+
       <div class="offer-actions">
         <button class="btn-primary" on:click={turnOnCorrections}>Turn on Corrections</button>
         <button class="offer-dismiss" on:click={dismissOffer}>Not now</button>
@@ -208,14 +230,17 @@
     flex-direction: column;
   }
   .today-live .lede {
-    margin-bottom: 0.55rem;
+    margin-bottom: 0.4rem;
     font-size: 1.05rem;
     line-height: 1.5;
   }
+  /* Tightened a step further so the Corrections-off state — which now carries the
+     bubble preview — still fits the 620px window with no scroll (verified: the
+     full card + both buttons + the Open Progress link are all above the fold). */
   .today-live .card,
   .today-live .offer {
-    margin: 0.25rem 0 0.6rem;
-    padding: 0.8rem 1.05rem;
+    margin: 0.2rem 0 0.4rem;
+    padding: 0.62rem 1.05rem;
   }
   .today-live .card-label,
   .today-live .offer-head {
@@ -223,7 +248,7 @@
   }
   .today-live .card-text,
   .today-live .offer-copy {
-    margin-bottom: 0.7rem;
+    margin-bottom: 0.5rem;
     line-height: 1.5;
   }
   .today-live .corr-read {
@@ -352,6 +377,86 @@
     font-size: 0.95rem;
     line-height: 1.55;
     color: canvastext;
+  }
+
+  /* ---- Corrections-off: static bubble preview (illustration only) ---- */
+  .corr-preview {
+    margin: 0 0 0.5rem;
+    padding: 0.4rem;
+    border-radius: 10px;
+    /* Inset "well" over the offer card's blue tint. */
+    background: canvas;
+    border: 1px solid var(--hairline);
+  }
+  .corr-screen {
+    position: relative;
+    /* Compact: this is the ONLY viewport-scaled height on the page, so it's the
+       first thing to give if the card is tight — shrink the outline before
+       anything else. Capped at 56px; never below a legible floor. */
+    height: clamp(34px, 6vh, 56px);
+    border: 1px dashed var(--hairline);
+    border-radius: 8px;
+    /* Slightly darker fill so the bubble reads as floating above the screen. */
+    background: color-mix(in srgb, canvastext 5%, canvas);
+    overflow: hidden;
+  }
+  .corr-screen-label {
+    position: absolute;
+    left: 8px;
+    bottom: 5px;
+    font-size: 0.68rem;
+    color: var(--text-secondary);
+  }
+  /* Miniature of the real bubble — same tokens as Cue.svelte's .bubble. A single
+     row (pair + chip), anchored 6px from the outline's top/right so it always
+     sits fully inside. */
+  .corr-mini-bubble {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.25rem 0.45rem;
+    border-radius: 9px;
+    background: canvas;
+    border: 1px solid var(--hairline);
+    box-shadow: 0 3px 12px rgb(0 0 0 / 0.16);
+  }
+  /* Jordan accent dot — same blue as the real bubble's .brand. */
+  .corr-mini-brand {
+    flex-shrink: 0;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--focus-ring);
+  }
+  .corr-mini-body {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-width: 0;
+  }
+  /* Scale the shared CorrectionPair down so it reads as a miniature (its palette
+     — soft-blue changed letters, monospace — is preserved). */
+  .corr-mini-body :global(.pair) {
+    font-size: 0.75rem;
+  }
+  /* ⇧ Shift — the accept gesture, as a muted blue pill. */
+  .corr-shift-chip {
+    padding: 0.05rem 0.4rem;
+    border-radius: 999px;
+    font-size: 0.68rem;
+    font-weight: 600;
+    white-space: nowrap;
+    color: var(--focus-ring);
+    background: color-mix(in srgb, var(--focus-ring) 14%, canvas);
+  }
+  .corr-preview-cap {
+    margin: 0.3rem 0 0;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    color: var(--text-secondary);
   }
   .offer-actions {
     display: flex;
