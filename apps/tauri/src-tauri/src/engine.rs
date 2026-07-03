@@ -1073,7 +1073,17 @@ pub fn accessibility_granted() -> bool {
 /// and the `is_first_run` command the webview reads, so the two can't disagree.
 pub fn is_first_run() -> bool {
     let has_learning_data = motor_map_path().map(|p| p.exists()).unwrap_or(false);
-    !has_learning_data && !accessibility_granted()
+    let ax = accessibility_granted();
+    let first_run = !has_learning_data && !ax;
+    // Beta diagnostic (visible in Console.app or a Terminal launch): first_run is
+    // false if EITHER learning data exists OR Accessibility is granted. If
+    // onboarding is unexpectedly skipped, this line says why — a sticky/residual
+    // Accessibility grant (ax_granted=true) is the usual culprit. Remove once the
+    // first-run flow is settled.
+    tracing::info!(
+        "FIRST_RUN has_learning_data={has_learning_data} ax_granted={ax} => first_run={first_run}"
+    );
+    first_run
 }
 
 /// `~/.typeassist/word_patterns.json` — the live word-pattern store (C5d),
