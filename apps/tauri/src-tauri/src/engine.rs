@@ -2803,23 +2803,30 @@ const RESPAWN_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 /// so 6s = 3 missed heartbeats — meaningful staleness without
 /// false-flagging brief stalls.
 const HEARTBEAT_STALE_MS: u128 = 6_000;
-/// Heartbeat ≥ this many ms old → Stopped + auto-respawn. 15s = 7
-/// missed heartbeats; if we haven't heard from the sidecar in that
-/// long it's not coming back on its own.
-const HEARTBEAT_STOPPED_MS: u128 = 15_000;
+/// Heartbeat ≥ this many ms old → Stopped + auto-respawn. 8s = 4
+/// missed heartbeats (was 15s / 7): respawn sooner so a genuine stop
+/// surfaces faster — paired with [`NOT_ACTIVE_DEBOUNCE_MS`] below (v1.5
+/// health-latency cut). Tradeoff: slightly eager respawns on a long
+/// stall that might have self-cleared, accepted because a respawn is
+/// cheap and idempotent (same spawn shape as boot — see `spawn_sidecar`).
+const HEARTBEAT_STOPPED_MS: u128 = 8_000;
 /// How often the watchdog re-emits the current health state even
 /// when nothing has changed — so a panel that just mounted converges
 /// to truth without waiting for a transition.
 const HEALTH_REPEAT_TICKS: u64 = 5;
 /// How long capture must stay continuously non-`Live` before the menu-bar UI
 /// declares it not-active (drives [`EVT_CAPTURE_UI`]). Measured from the moment
-/// health *left* `Live`. Sized to clear the whole self-heal window: a disabled
-/// tap re-arms in the sidecar within ~2s, and a dead sidecar is auto-respawned
-/// at [`HEARTBEAT_STOPPED_MS`] (15s) with its first fresh heartbeat ~2s later —
-/// so 16s gives that one automatic respawn time to land before we alarm. A
-/// transient blip recovers to `Live` (clearing the timer) long before this, so
-/// the icon never strobes; only a genuine, persistent stop trips it.
-const NOT_ACTIVE_DEBOUNCE_MS: u128 = 16_000;
+/// health *left* `Live` (~[`HEARTBEAT_STALE_MS`], 6s into an outage). Sized to
+/// clear the self-heal window: a disabled tap re-arms in the sidecar within ~2s,
+/// and a dead sidecar is auto-respawned at [`HEARTBEAT_STOPPED_MS`] (8s) with its
+/// first fresh heartbeat ~2s later — so recovery lands ~10s into the outage. This
+/// 9s debounce alarms at ~15s (leave-Live + 9s), keeping a ~5s margin past the
+/// self-heal window so a recovering blip never strobes the icon, while a genuine
+/// stop now surfaces ~7s sooner than the old 16s (v1.5 health-latency cut).
+/// NOTE (v1.5): watch dogfooding — if a respawn ever briefly flashes not-active,
+/// the respawn heartbeat is landing slower than ~2s and this must grow back
+/// toward the [`HEARTBEAT_STOPPED_MS`] + heartbeat-interval sum.
+const NOT_ACTIVE_DEBOUNCE_MS: u128 = 9_000;
 
 /// Spawn (or respawn) the Swift sidecar via `app.shell().sidecar()`. Factored
 /// out so commit O's hard-restart path uses the SAME spawn shape as the initial
