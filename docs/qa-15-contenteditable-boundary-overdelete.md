@@ -259,3 +259,51 @@ Neither is a fix; both are diagnostics to settle the mechanism:
 
 **No fix re-spec.** PM (Alice) will decide scope (and whether to pursue 1/2) after
 more real-use testing.
+
+---
+
+## Step (d) — Case 3: quoted + capitalised, post-QA-17 (2026-07-04)
+
+**First case with surrounding punctuation, and the first since the QA-17 (item 5)
+trailing-quote accept path landed.** In Google Docs, typing `"Appplication"`
+(leading capital, wrapped in double quotes) and Shift-accepting the
+`Appplication → Application` fix produced **`"Aapplication"`** — the capital
+stranded at the boundary, the same **doubled-capital face** as Case 1
+(`Pperseverance`). **Notes was clean on the identical word.**
+
+**Three hypotheses tested (the PM's ask), and where they land:**
+
+- **Casing bug in our code? NO.** `match_source_case("Appplication","application")`
+  → `"Application"` (leading-cap branch; unit-tested), and Notes applied it
+  cleanly. Our computed replacement is correct. The "doubled capital" is the
+  **symptom** of a misaligned delete (a left char surviving), per Step (c) — not a
+  casing-computation error. Where Docs auto-cap layers on top, it also routes to
+  QA-14, exactly as Case 1.
+- **New QA-17 trailing-quote path? CONTRIBUTORY, not causal.** The trailing-quote
+  geometry is provably correct (Notes clean on the same quoted word; the
+  `pending_survives` / `immediate_accept_injection` math sends
+  `delete_count = word_len + outer_trail_len + 1`). But it **lengthens the delete
+  window** (the `"` adds one) and introduces a **leading `"` left-boundary char** —
+  more surface for the Step (c) capture-drift to misalign around, which is plausibly
+  why the surviving-left-char face stranded the capital right after the quote.
+- **Known Docs weld mechanism? YES — this is the root.** Same Step (c) capture-drift
+  family: our dead-reckoned line model drifts from Docs' contenteditable buffer, so
+  the delete burst lands misaligned. Consistent with Notes-clean / Docs-broken and
+  with the doubled-capital face.
+
+**Confirmation still needs the terminal line.** `CORRECTION_APPLIED` is
+`tracing::info` (stdout, not persisted — Principle #8), so the accept's
+`delete_count` / `after_len` can't be pulled after the fact. To pin the off-by-N,
+capture from the dev terminal during a Docs repro:
+
+```
+CORRECTION_APPLIED typed="Appplication" target="Application" delete_count=14 boundary=' ' after_len=2
+```
+
+`delete_count=14` (= `word_len 12` + `outer_trail_len 1` + `1`) and `after_len=2`
+(the trailing `"` + boundary) would confirm our side sent the correct count and
+Docs mis-applied it — same content-blind wall as Steps (a)/(c).
+
+**Not a commit blocker** (Docs is documented best-effort; the QA-17 fixes are
+correct in native fields, verified in Notes). Logged for the record; folds into
+the same host-scoped-suppression decision parked in Step (b)/(c).

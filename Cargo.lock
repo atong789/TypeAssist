@@ -3900,6 +3900,7 @@ dependencies = [
  "behavioural-model",
  "block2",
  "correction-engine",
+ "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

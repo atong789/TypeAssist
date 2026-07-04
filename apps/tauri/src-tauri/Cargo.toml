@@ -47,6 +47,11 @@ correction-engine = { path = "../../../crates/correction-engine" }
 # we reach the menu via the public NSMenuDidBeginTracking notification. Versions
 # pinned to what tauri/muda already resolve, so the NSMenu types are identical.
 [target.'cfg(target_os = "macos")'.dependencies]
+# Local-timezone offset (`localtime_r` → `tm_gmtoff`) for deriving the Today
+# tally's calendar day at the user's LOCAL midnight, not UTC (v1.5 item 3).
+# Foundational libc bindings only — already resolved transitively via tokio/
+# tauri; nothing network/analytics-related (Principle #8 is unaffected).
+libc = "0.2"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSNotification", "NSString", "NSArray", "NSOperation", "NSGeometry"] }
 objc2-app-kit = { version = "0.3", features = ["NSMenu", "NSMenuItem", "NSEvent", "NSApplication", "NSResponder", "NSGraphicsContext"] }
