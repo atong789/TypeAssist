@@ -65,6 +65,15 @@ VOL="TenCalmDigits 0.1.0"   # ← must match tauri.conf.json "version" each rele
 hdiutil convert "$DMG" -format UDRW -o /tmp/tcd-rw.dmg
 hdiutil attach /tmp/tcd-rw.dmg -nobrowse -noverify -mountpoint /tmp/tcd-mnt
 diskutil rename /tmp/tcd-mnt "$VOL"
+# Hide the volume-icon file so the DMG window is a clean two items (the .app +
+# Applications). It's already a dotfile, but bundle_dmg.sh flags .DS_Store hidden
+# and leaves .VolumeIcon.icns unflagged — match them (UF_HIDDEN + the Finder
+# invisible bit). NOTE: this keeps it out of a DEFAULT Finder window (what testers
+# have); a Finder with "Show hidden files" (Cmd+Shift+.) ON still reveals it — no
+# root volume-icon file can hide from that, so verify a clean window with hidden
+# files OFF.
+chflags hidden /tmp/tcd-mnt/.VolumeIcon.icns
+SetFile -a V /tmp/tcd-mnt/.VolumeIcon.icns 2>/dev/null || true
 hdiutil detach /tmp/tcd-mnt
 rm -f "$DMG"
 hdiutil convert /tmp/tcd-rw.dmg -format UDZO -o "$DMG"
