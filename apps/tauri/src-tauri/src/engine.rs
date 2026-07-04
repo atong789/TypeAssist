@@ -594,14 +594,30 @@ struct CorrectionSuggestedEvent {
 /// positional replace once the caret has moved on.
 #[derive(Debug, Clone)]
 struct PendingSuggestion {
+    /// The word to correct, with any surrounding quotes/punctuation STRIPPED
+    /// (QA-17): a matched straight-quote pair peeled off the core (5a) — so this
+    /// is what the bubble shows and what matched a lane (`waht`, not `'waht'`).
     typed: String,
     target: String,
     boundary: char,
+    /// Full core length at seal (= `tok.end - tok.start`) — includes any matched
+    /// straight-quotes that were part of the core, so the delete covers them.
     word_len: usize,
     /// The word's end position in the line buffer at seal (= `tok.end`). Fixed
     /// while pending (it dismisses if anything edits at/before it), so the accept
     /// can compute how far the caret has moved on.
     word_end: usize,
+    /// QA-17 re-attach: punctuation to retype AROUND the corrected word so quotes
+    /// survive the fix. `lead` = the straight-quote run stripped from the core's
+    /// front (retyped before `target`); `trail` = the core's stripped trailing
+    /// straight-quotes PLUS the tokenizer's closing punct (`tok.trailing`, e.g. a
+    /// double-quote), retyped after `target`, before `boundary`.
+    lead: String,
+    trail: String,
+    /// Char count of `tok.trailing` alone — the closing punct that sits BEYOND
+    /// `word_end` (between the word and the boundary). Drives the caret-at-rest
+    /// `immediate` check (`after_len == outer_trail_len + 1`) and the extra delete.
+    outer_trail_len: usize,
     armed_at_ms: u64,
 }
 
@@ -659,13 +675,70 @@ struct LastCorrection {
     typed: String,
     target: String,
     boundary: char,
-    /// `after_len` from the accept: 1 = immediate (caret at the boundary), >1 =
-    /// the caret had moved on (anchored accept). The revert mirrors the accept —
-    /// caret-relative for the immediate case, anchored (arrow-keyed) otherwise.
-    /// Safe because `last_correction` disarms on ANY non-Esc keystroke, so an Esc
+    /// QA-17 re-attach — mirror of [`PendingSuggestion::lead`] / `trail`, so the
+    /// revert restores the ORIGINAL word with its surrounding quotes intact
+    /// (`'what' ` → `'waht' `, `believe" ` → `beleive" `).
+    lead: String,
+    trail: String,
+    /// Whether the accept took the IMMEDIATE (caret-at-rest) path — the only
+    /// enabled one. The revert is caret-relative when true. (Replaces the old
+    /// `after_len == 1` test, which broke once a trailing quote made the rest
+    /// position `outer_trail_len + 1 > 1`.)
+    immediate: bool,
+    /// `after_len` from the accept, retained for the (still-gated-off) anchored
+    /// revert path. `last_correction` disarms on ANY non-Esc keystroke, so an Esc
     /// undo only ever fires with the caret exactly where the accept left it.
     after_len: usize,
     fired_at_ms: u64,
+}
+
+/// QA-17 (5a) — peel a MATCHED leading+trailing run of straight ASCII single
+/// quotes off a token core. Returns `(inner, lead, trail)` where `lead`/`trail`
+/// are the stripped quote runs (empty when nothing is stripped). Only strips
+/// when BOTH sides carry ≥1 quote (a wrapping pair) and at least one non-quote
+/// char remains — so a one-sided apostrophe is untouched:
+///   * `'waht'` → (`waht`, `'`, `'`)   — a straight-quoted typo, now matchable
+///   * `dogs'`  → (`dogs'`, ``, ``)     — trailing possessive, kept
+///   * `'em`    → (`'em`, ``, ``)       — leading contraction, kept
+///   * `don't` / `it's` → unchanged     — internal apostrophe, kept
+/// Straight `'` is the only ambiguous case (it doubles as the apostrophe); curly
+/// ‘…’ and "…" are already stripped as punctuation by the tokenizer. The rare
+/// fully-quoted contraction `'twas'` → `twas` is the accepted tradeoff.
+fn strip_matched_quotes(core: &str) -> (String, String, String) {
+    let chars: Vec<char> = core.chars().collect();
+    let lead_n = chars.iter().take_while(|&&c| c == '\'').count();
+    let trail_n = chars.iter().rev().take_while(|&&c| c == '\'').count();
+    if lead_n == 0 || trail_n == 0 || lead_n + trail_n >= chars.len() {
+        return (core.to_string(), String::new(), String::new());
+    }
+    let inner: String = chars[lead_n..chars.len() - trail_n].iter().collect();
+    let lead: String = chars[..lead_n].iter().collect();
+    let trail: String = chars[chars.len() - trail_n..].iter().collect();
+    (inner, lead, trail)
+}
+
+/// Immediate-accept injection geometry (QA-17). Delete the whole core + the
+/// closing punct beyond it + the boundary, then retype the surrounding punct
+/// re-wrapped around `target`. Reduces to the old `word_len + 1` / `target +
+/// boundary` when there is no surrounding punctuation. Pure + tested so the
+/// geometry is verifiable without driving the engine loop.
+fn immediate_accept_injection(ps: &PendingSuggestion) -> (u32, String) {
+    let delete_count = (ps.word_len + ps.outer_trail_len + 1) as u32;
+    let replacement = format!("{}{}{}{}", ps.lead, ps.target, ps.trail, ps.boundary);
+    (delete_count, replacement)
+}
+
+/// Immediate-revert geometry (QA-17) — the exact inverse of
+/// [`immediate_accept_injection`]: delete the injected `lead+target+trail+
+/// boundary` and retype the original `lead+typed+trail+boundary`, restoring the
+/// surrounding quotes. Pure + tested.
+fn immediate_revert_injection(lc: &LastCorrection) -> (u32, String) {
+    let delete_count = (lc.lead.chars().count()
+        + lc.target.chars().count()
+        + lc.trail.chars().count()
+        + 1) as u32;
+    let replacement = format!("{}{}{}{}", lc.lead, lc.typed, lc.trail, lc.boundary);
+    (delete_count, replacement)
 }
 
 /// How long after a correction an Escape still reverts it. Sized for slow /
@@ -3692,10 +3765,17 @@ pub fn spawn<R: Runtime>(
                                 //     dead-reckoned caret doubled a word); see
                                 //     ANCHORED_ACCEPT_ENABLED / word_at_anchor.
                                 // Anything else dismisses — a missed accept is fine.
-                                let immediate = after_len == 1;
+                                // QA-17: the caret-at-rest distance is the boundary
+                                // PLUS any closing punct beyond the word (a trailing
+                                // `"` makes it 2, not 1) — so `immediate` keys off
+                                // `outer_trail_len + 1`, not a bare 1. Without this a
+                                // quoted word read as "anchored" and (anchored being
+                                // off) was silently declined.
+                                let rest_after_len = ps.outer_trail_len + 1;
+                                let immediate = after_len == rest_after_len;
                                 let anchored_ok = ANCHORED_ACCEPT_ENABLED
                                     && caret > ps.word_end
-                                    && after_len > 1
+                                    && after_len > rest_after_len
                                     && after_len <= MAX_ANCHOR_CHARS
                                     && word_at_anchor(
                                         &line_buf,
@@ -3732,12 +3812,15 @@ pub fn spawn<R: Runtime>(
                                     // before the CORRECTION_APPLIED read — no seed value.
                                     let delete_count_emitted: u32;
                                     let applied = if immediate {
-                                        // Immediate accept — caret at the boundary.
-                                        // Proven no-arrow path: delete word + boundary,
-                                        // retype target + boundary.
-                                        let delete_count = (ps.word_len + 1) as u32;
+                                        // Immediate accept — caret at rest just past the
+                                        // word (+ any trailing punct). Proven no-arrow
+                                        // path: delete word + closing punct + boundary,
+                                        // retype the punctuation re-wrapped around target
+                                        // (QA-17). Reduces to word+boundary / target+
+                                        // boundary when there is no surrounding punct.
+                                        let (delete_count, replacement) =
+                                            immediate_accept_injection(&ps);
                                         delete_count_emitted = delete_count;
-                                        let replacement = format!("{}{}", ps.target, ps.boundary);
                                         let echo_len =
                                             delete_count + replacement.chars().count() as u32;
                                         if send_inject_correction(
@@ -3796,12 +3879,16 @@ pub fn spawn<R: Runtime>(
                                                 undo: false,
                                             },
                                         );
-                                        // Arm the 6s Esc-undo (revert only). Carry
-                                        // after_len so the revert mirrors the accept.
+                                        // Arm the 6s Esc-undo (revert only). Carry the
+                                        // punct (QA-17) + immediate flag so the revert
+                                        // mirrors the accept and restores the quotes.
                                         last_correction = Some(LastCorrection {
                                             typed: ps.typed,
                                             target: ps.target,
                                             boundary: ps.boundary,
+                                            lead: ps.lead,
+                                            trail: ps.trail,
+                                            immediate,
                                             after_len,
                                             fired_at_ms: now_ms(),
                                         });
@@ -4014,13 +4101,13 @@ pub fn spawn<R: Runtime>(
                                     // Revert, mirroring the accept. `last_correction`
                                     // disarms on any non-Esc key, so the caret is
                                     // exactly where the accept left it.
-                                    let target_len = lc.target.chars().count() as u32;
-                                    let reverted = if lc.after_len == 1 {
-                                        // Immediate accept → caret at the boundary:
-                                        // delete target + boundary, retype typed +
-                                        // boundary.
-                                        let delete_count = target_len + 1;
-                                        let replacement = format!("{}{}", lc.typed, lc.boundary);
+                                    let reverted = if lc.immediate {
+                                        // Immediate accept → caret at rest: delete the
+                                        // injected target (+ re-wrapped punct + boundary),
+                                        // retype the original word with its punctuation
+                                        // (QA-17). Exact inverse of the accept geometry.
+                                        let (delete_count, replacement) =
+                                            immediate_revert_injection(&lc);
                                         let echo_len =
                                             delete_count + replacement.chars().count() as u32;
                                         if send_inject_correction(
@@ -4037,7 +4124,9 @@ pub fn spawn<R: Runtime>(
                                         // Anchored accept → caret moved on: anchored
                                         // revert. Left × after_len, Backspace ×
                                         // target_len, type typed (no boundary), Right
-                                        // × after_len.
+                                        // × after_len. (Gated off; QA-17 punct re-wrap
+                                        // not threaded here — see ANCHORED_ACCEPT_ENABLED.)
+                                        let target_len = lc.target.chars().count() as u32;
                                         let left = lc.after_len as u32;
                                         let right = lc.after_len as u32;
                                         let echo_len = left
@@ -4274,13 +4363,22 @@ pub fn spawn<R: Runtime>(
                                                     // (its per-pattern enable was retired, so it's always empty). The master
                                                     // gate (`correction_enabled`) still arms the whole feature. Capture what
                                                     // the bubble needs BEFORE `tok` moves into emit_sealed_token.
-                                                    let mut fire: Option<(String, String, usize, usize)> = None;
+                                                    let mut fire: Option<PendingSuggestion> = None;
                                                     // FIRE_TIMING t1 — set at the fire decision below; hoisted here
                                                     // so it stays in scope for the t2 emit log (measurement only).
                                                     let mut t1: u64 = 0;
                                                     if matches!(tok.kind, TokenKind::Word) {
                                                         let word_len = tok.end - tok.start;
                                                         let word_end = tok.end;
+                                                        // QA-17: match on the word with any surrounding punctuation
+                                                        // stripped, then re-attach it on inject. `inner`/`q_lead`/
+                                                        // `q_trail` peel a matched straight-quote pair off the core
+                                                        // (5a: `'waht'` → `waht` + `'`/`'`); `outer_trail` is the
+                                                        // tokenizer's closing punct beyond the core (5b: the `"` in
+                                                        // `"beleive"`), captured before `tok` moves into the seal.
+                                                        let (inner, q_lead, q_trail) =
+                                                            strip_matched_quotes(&tok.core);
+                                                        let outer_trail = tok.trailing.clone();
                                                         // Lever 2 — LEARNED lane first. `shadow_suggestion` is a
                                                         // cheap lookup over the user's own confirmed `typed → target`
                                                         // patterns; only when it has nothing do we run the dictionary
@@ -4290,28 +4388,28 @@ pub fn spawn<R: Runtime>(
                                                         // dictionary convergence. (Before, convergence won the tie;
                                                         // for the same word both lanes almost always agree on the
                                                         // target — where they differ, the learned pattern is the more
-                                                        // personal signal.) Raw suggestion: typed as the user typed it
-                                                        // (tok.core keeps their case), target lowercase.
+                                                        // personal signal.) Raw suggestion: `inner` keeps the user's
+                                                        // case (punctuation stripped, QA-17), target lowercase.
                                                         let raw: Option<(String, String)> = if let Some(sh) =
-                                                            shadow_suggestion(&tok.core, &word_patterns, lexicon, &motor_map)
+                                                            shadow_suggestion(&inner, &word_patterns, lexicon, &motor_map)
                                                         {
                                                             if let Some(p) = shadow_log_path() {
                                                                 append_shadow_log(&p, now_ms(), &sh);
                                                             }
-                                                            Some((tok.core.clone(), sh.target.clone()))
+                                                            Some((inner.clone(), sh.target.clone()))
                                                         } else {
                                                             let scan = correction_engine::shadow_convergence_scan(
-                                                                &tok.core,
+                                                                &inner,
                                                                 lexicon,
                                                                 &motor_map,
                                                             );
                                                             if scan.convergent {
                                                                 if let Some(p) = shadow_log_path() {
-                                                                    append_shadow_bold_log(&p, now_ms(), &tok.core, &scan);
+                                                                    append_shadow_bold_log(&p, now_ms(), &inner, &scan);
                                                                 }
                                                                 // convergent ⇒ exactly one fire target (the lone
                                                                 // candidate, or the frequency-dominant one).
-                                                                scan.target.as_ref().map(|t| (tok.core.clone(), t.clone()))
+                                                                scan.target.as_ref().map(|t| (inner.clone(), t.clone()))
                                                             } else {
                                                                 None
                                                             }
@@ -4363,10 +4461,25 @@ pub fn spawn<R: Runtime>(
                                                                 funnel.competitor_deferred += 1;
                                                             } else {
                                                                 // Preserve the user's capitalisation in the
-                                                                // target — never change their casing.
+                                                                // target — never change their casing. Build the
+                                                                // full pending here (QA-17 punct carried through
+                                                                // `lead`/`trail`/`outer_trail_len`) while the
+                                                                // stripped-off quotes are still in scope.
                                                                 fire = suggestion.map(|(t, g)| {
                                                                     let g = match_source_case(&t, &g);
-                                                                    (t, g, word_len, word_end)
+                                                                    PendingSuggestion {
+                                                                        typed: t,
+                                                                        target: g,
+                                                                        boundary: c,
+                                                                        word_len,
+                                                                        word_end,
+                                                                        lead: q_lead.clone(),
+                                                                        trail: format!("{q_trail}{outer_trail}"),
+                                                                        outer_trail_len: outer_trail
+                                                                            .chars()
+                                                                            .count(),
+                                                                        armed_at_ms: now_ms(),
+                                                                    }
                                                                 });
                                                             }
                                                         }
@@ -4383,7 +4496,7 @@ pub fn spawn<R: Runtime>(
                                                         &mut proposer,
                                                         &mut funnel,
                                                     );
-                                                    if let Some((typed, target, word_len, word_end)) = fire {
+                                                    if let Some(ps) = fire {
                                                         // M3 bubble: do NOT inject at seal — SUGGEST. The bubble shows
                                                         // `typed → target`; nothing changes on screen until the user
                                                         // accepts with an isolated Shift tap. Armed against the current
@@ -4395,14 +4508,14 @@ pub fn spawn<R: Runtime>(
                                                         // lowercased forms so a leading capital doesn't
                                                         // throw the alignment off.
                                                         let highlight = correction_engine::corrected_target_indices(
-                                                            &typed.to_lowercase(),
-                                                            &target.to_lowercase(),
+                                                            &ps.typed.to_lowercase(),
+                                                            &ps.target.to_lowercase(),
                                                         );
                                                         let _ = app_handle.emit(
                                                             EVT_CORRECTION_SUGGESTED,
                                                             CorrectionSuggestedEvent {
-                                                                typed: typed.clone(),
-                                                                target: target.clone(),
+                                                                typed: ps.typed.clone(),
+                                                                target: ps.target.clone(),
                                                                 highlight,
                                                             },
                                                         );
@@ -4416,9 +4529,9 @@ pub fn spawn<R: Runtime>(
                                                         let t2 = now_ms();
                                                         tracing::info!(
                                                             "FIRE_TIMING typed={:?} target={:?} word_len={} t0_recv={} t1_decision={} t2_emit={} d_t0_t2_ms={} dwell_ms={} os_ts={}",
-                                                            typed,
-                                                            target,
-                                                            word_len,
+                                                            ps.typed,
+                                                            ps.target,
+                                                            ps.word_len,
                                                             t_recv,
                                                             t1,
                                                             t2,
@@ -4426,14 +4539,7 @@ pub fn spawn<R: Runtime>(
                                                             dwell_ms,
                                                             timestamp_ms,
                                                         );
-                                                        pending_suggestion = Some(PendingSuggestion {
-                                                            typed,
-                                                            target,
-                                                            boundary: c,
-                                                            word_len,
-                                                            word_end,
-                                                            armed_at_ms: now_ms(),
-                                                        });
+                                                        pending_suggestion = Some(ps);
                                                     }
                                                 }
                                             } else {
@@ -5289,6 +5395,139 @@ pub fn spawn<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- QA-17: quote/punctuation strip + re-attach --------------------------
+
+    /// Straight-quote matched-pair stripping (5a). Only a WRAPPING pair peels;
+    /// one-sided apostrophes (contractions, possessives) stay put.
+    #[test]
+    fn strip_matched_quotes_only_peels_wrapping_pairs() {
+        // Wrapping straight-quote pair → strip, remember both runs.
+        assert_eq!(
+            strip_matched_quotes("'waht'"),
+            ("waht".into(), "'".into(), "'".into())
+        );
+        // One-sided → kept verbatim (possessive, leading contraction).
+        assert_eq!(
+            strip_matched_quotes("dogs'"),
+            ("dogs'".into(), String::new(), String::new())
+        );
+        assert_eq!(
+            strip_matched_quotes("'em"),
+            ("'em".into(), String::new(), String::new())
+        );
+        assert_eq!(
+            strip_matched_quotes("parents'"),
+            ("parents'".into(), String::new(), String::new())
+        );
+        // Internal apostrophe → untouched (the core QA-17 promise).
+        for w in ["don't", "it's", "user's", "well-known"] {
+            assert_eq!(
+                strip_matched_quotes(w),
+                (w.into(), String::new(), String::new()),
+                "internal apostrophe/hyphen must be preserved: {w}"
+            );
+        }
+        // Accepted tradeoff: a fully-quoted contraction loses its outer quotes.
+        assert_eq!(
+            strip_matched_quotes("'twas'"),
+            ("twas".into(), "'".into(), "'".into())
+        );
+        // Degenerate all-quote token → never strip to empty.
+        assert_eq!(
+            strip_matched_quotes("''"),
+            ("''".into(), String::new(), String::new())
+        );
+    }
+
+    /// Apply an injection (delete N from the caret, then type `replacement`) to
+    /// the text-before-caret — the field model the accept/revert operate on.
+    fn apply_inject(before_caret: &str, delete_count: u32, replacement: &str) -> String {
+        let mut chars: Vec<char> = before_caret.chars().collect();
+        for _ in 0..delete_count {
+            chars.pop();
+        }
+        chars.extend(replacement.chars());
+        chars.into_iter().collect()
+    }
+
+    /// Build the pending exactly as the fire path does (strip + re-attach), so a
+    /// geometry test exercises the same assembly the loop uses.
+    fn pending_for(core: &str, outer_trail: &str, target: &str, boundary: char) -> PendingSuggestion {
+        let (inner, q_lead, q_trail) = strip_matched_quotes(core);
+        PendingSuggestion {
+            typed: inner,
+            target: target.into(),
+            boundary,
+            word_len: core.chars().count(),
+            word_end: core.chars().count(),
+            lead: q_lead,
+            trail: format!("{q_trail}{outer_trail}"),
+            outer_trail_len: outer_trail.chars().count(),
+            armed_at_ms: 0,
+        }
+    }
+
+    fn last_correction_for(ps: &PendingSuggestion) -> LastCorrection {
+        LastCorrection {
+            typed: ps.typed.clone(),
+            target: ps.target.clone(),
+            boundary: ps.boundary,
+            lead: ps.lead.clone(),
+            trail: ps.trail.clone(),
+            immediate: true,
+            after_len: ps.outer_trail_len + 1,
+            fired_at_ms: 0,
+        }
+    }
+
+    /// Accept then revert restores the original — for every QA-17 shape. `field`
+    /// is the text before the caret at accept time (word + closing punct +
+    /// boundary; any LEADING punct sits further back and is never touched).
+    #[track_caller]
+    fn assert_accept_revert(core: &str, outer_trail: &str, target: &str, field: &str, fixed: &str) {
+        let ps = pending_for(core, outer_trail, target, ' ');
+        let (dc, repl) = immediate_accept_injection(&ps);
+        let after = apply_inject(field, dc, &repl);
+        assert_eq!(after, fixed, "accept: {core:?}+{outer_trail:?} → {target:?}");
+        let lc = last_correction_for(&ps);
+        let (dc2, repl2) = immediate_revert_injection(&lc);
+        let restored = apply_inject(&after, dc2, &repl2);
+        assert_eq!(restored, field, "revert must restore the original: {core:?}");
+    }
+
+    #[test]
+    fn accept_revert_plain_word_unchanged_geometry() {
+        // No surrounding punctuation → old word+boundary / target+boundary.
+        assert_accept_revert("teh", "", "the", "teh ", "the ");
+    }
+
+    #[test]
+    fn accept_revert_single_quoted_typo_rewraps() {
+        // 5a: straight quotes glued into the core → deleted with it, re-typed
+        // around the target. (Without the fix this never fired at all.)
+        assert_accept_revert("'waht'", "", "what", "'waht' ", "'what' ");
+    }
+
+    #[test]
+    fn accept_revert_double_quoted_typo_keeps_trailing_quote() {
+        // 5b: the trailing `"` sits beyond word_end (in tok.trailing). The
+        // leading `"` is never in the delete window, so it survives untouched.
+        assert_accept_revert("beleive", "\"", "believe", "\"beleive\" ", "\"believe\" ");
+    }
+
+    #[test]
+    fn quoted_word_rest_position_is_immediate() {
+        // Regression for the real 5b bug: a trailing quote makes the caret rest
+        // at outer_trail_len + 1 (= 2), which MUST read as immediate — not as an
+        // "anchored" accept that the disabled path silently declines.
+        let ps = pending_for("beleive", "\"", "believe", ' ');
+        let rest_after_len = ps.outer_trail_len + 1;
+        assert_eq!(rest_after_len, 2, "word + trailing quote rests two past word_end");
+        // Plain word still rests at 1.
+        let plain = pending_for("teh", "", "the", ' ');
+        assert_eq!(plain.outer_trail_len + 1, 1);
+    }
 
     // ---- QA-15 space-drop detector (Step 1, observe-only) ----------------
 
