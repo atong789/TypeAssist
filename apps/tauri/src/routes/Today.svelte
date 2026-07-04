@@ -18,12 +18,18 @@
 
   const dispatch = createEventDispatcher<{ navigate: string }>();
 
-  // Dateline date, e.g. "Saturday, June 7" (locale-aware).
-  const dateStr = new Date().toLocaleDateString(undefined, {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-  });
+  // Dateline date, e.g. "Saturday, June 7" (locale-aware). `let` + recomputed
+  // when the window is (re)shown (item 7): the main window is reused (show/hide,
+  // never recreated), so a `const` fixed at mount froze the dateline on the
+  // launch day — a session left running past midnight showed yesterday. This is
+  // date-only; the offer data stays "checked on mount, never mid-session".
+  const buildDateStr = () =>
+    new Date().toLocaleDateString(undefined, {
+      weekday: "long",
+      month: "long",
+      day: "numeric",
+    });
+  let dateStr = buildDateStr();
 
   // One warm-up, two doors: this opens the canonical round — the menu-bar
   // Practice panel — the same flow the tray "Warm-up" item opens.
@@ -87,7 +93,16 @@
     const off = listen<AllowListState>("corrections://state", (e) => {
       correctionEnabled = !!e.payload?.correction_enabled;
     });
-    return () => off.then((f) => f());
+    // Roll the dateline over when the window is re-shown (item 7). `show_main`
+    // emits `app://route` on every open; the component stays mounted across a
+    // hide, so this — not a remount — is the refresh point. Date only.
+    const offRoute = listen("app://route", () => {
+      dateStr = buildDateStr();
+    });
+    return () => {
+      off.then((f) => f());
+      offRoute.then((f) => f());
+    };
   });
 </script>
 

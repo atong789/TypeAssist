@@ -45,8 +45,9 @@
   // The Impact tab is a glance: the top few corrections in each group, by count.
   const TOP_N = 5;
 
-  // One calendar day's typing rollup, as the engine persists it (UTC-dated, to
-  // match the dated motor snapshots). coord + precis === slips always.
+  // One calendar day's typing rollup, as the engine persists it (LOCAL-dated —
+  // rolls at the user's local midnight, v1.5 item 3; the dated motor snapshots
+  // stay UTC, an accepted near-midnight divergence). coord + precis === slips.
   interface ProgressDay {
     date: string;
     words: number;
@@ -117,16 +118,25 @@
 
   // ---- Statistics derivations -------------------------------------------
   //
-  // Match the engine's UTC civil date for "today" (its rows are UTC-dated), so
-  // the right entry is picked regardless of timezone. The two metric cards and
-  // the two composition %s are all TODAY's live numbers — and because the
-  // engine guarantees coord + precis === slips, coord% + precis% === slip rate
-  // exactly. The trend sparklines are the historical shape (weekly rollup).
+  // Match the engine's LOCAL civil date for "today" — its rows roll at the
+  // user's local midnight (v1.5 item 3), so "today" must use the same local
+  // calendar, not UTC (a UTC key would pick the wrong row for the offset window
+  // either side of local midnight). The two metric cards and the two
+  // composition %s are all TODAY's live numbers — and because the engine
+  // guarantees coord + precis === slips, coord% + precis% === slip rate exactly.
+  // The trend sparklines are the historical shape (weekly rollup).
+  //
+  // `todayKey`/`dateLabel` are `let`, recomputed on every `progress://open`
+  // (item 7): the panel window is reused (show/hide, never recreated), so a
+  // `const` fixed at mount froze "today" on the day the app launched — a tester
+  // running overnight saw yesterday until quit+relaunch.
   const pad2 = (n: number) => String(n).padStart(2, "0");
-  const todayKey = (() => {
-    const d = new Date();
-    return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
-  })();
+  const localDayKey = (d: Date) =>
+    `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  // "Tuesday, 3 June" — day-before-month, locale-stable (not en-US "June 3").
+  const buildDateLabel = (d: Date) =>
+    `${d.toLocaleDateString(undefined, { weekday: "long" })}, ${d.getDate()} ${d.toLocaleDateString(undefined, { month: "long" })}`;
+  let todayKey = localDayKey(new Date());
 
   const round1 = (x: number) => Math.round(x * 10) / 10;
   const fmt1 = (x: number) => x.toFixed(1);
@@ -142,8 +152,12 @@
   $: slipPct =
     coordPct !== null && precisPct !== null ? round1(coordPct + precisPct) : null;
 
-  // Last 7 calendar days ending today (UTC), absent days drawn as empty bars.
-  // The block is hidden until ≥2 days of data exist (brief).
+  // Last 7 calendar days ending today (local), absent days drawn as empty bars.
+  // The block is hidden until ≥2 days of data exist (brief). The arithmetic is
+  // pure date-string math anchored on the local `todayKey`: parsing it as a UTC
+  // midnight and stepping back in whole days round-trips the same YYYY-MM-DD
+  // strings the engine writes, so no timezone skew — it just needs `todayKey`
+  // itself to be the local day (above). Re-runs whenever `todayKey` changes.
   $: last7 = (() => {
     const map = new Map(progressDays.map((d) => [d.date, d]));
     const base = Date.parse(`${todayKey}T00:00:00Z`);
@@ -258,12 +272,10 @@
     return { x: parseFloat(last[0]), y: parseFloat(last[1]) };
   }
 
-  // Today's date, e.g. "Tuesday, 3 June". Built from parts so the day-before-
-  // month order is locale-stable (matches the mockup), not en-US's "June 3".
-  const now = new Date();
-  const dateLabel = `${now.toLocaleDateString(undefined, {
-    weekday: "long",
-  })}, ${now.getDate()} ${now.toLocaleDateString(undefined, { month: "long" })}`;
+  // Today's date, e.g. "Tuesday, 3 June" (see buildDateLabel). `let` +
+  // recomputed on each `progress://open` (item 7) so the header never freezes on
+  // the launch day.
+  let dateLabel = buildDateLabel(new Date());
 
   // Focus anchors. The scroll region is focusable so a no-mouse user can scroll
   // the Impact ledger with ↑/↓/space (it shows a ring when focused).
@@ -591,6 +603,12 @@
     const offOpen = listen("progress://open", () => {
       activeTab = "statistics";
       view = "main";
+      // Item 7: recompute the day on every open so "today" and the header roll
+      // over for a session left running past (local) midnight. The window is
+      // reused, so this listener — not a remount — is the refresh point.
+      const now = new Date();
+      todayKey = localDayKey(now);
+      dateLabel = buildDateLabel(now);
       loadPatterns();
       loadProgress();
       loadKeyScores();
