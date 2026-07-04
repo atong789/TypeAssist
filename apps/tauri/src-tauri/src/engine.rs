@@ -666,6 +666,38 @@ fn word_at_anchor(line_buf: &[char], word_end: usize, word_len: usize, typed: &s
     }
 }
 
+/// Whether an armed [`PendingSuggestion`] survives a forward keystroke (the
+/// end-of-arm retention gate). Kept only when the keystroke was a clean forward
+/// append (`keep_pending`), the caret is still PAST the word, and it hasn't moved
+/// beyond the accept-reachable distance.
+///
+/// That distance is the caret's AT-REST position: the boundary PLUS any closing
+/// punctuation beyond the word (`outer_trail_len + 1`), NOT a bare `1` (QA-17
+/// 5b). A hardcoded `1` here dropped a word wrapped in a trailing `"` the instant
+/// it sealed — the fire armed the pending, then this gate saw `dist == 2 > 1` and
+/// nuked it (emitting `DISMISSED`) on the SAME keystroke, so the bubble never
+/// rendered. This is the twin of the accept-side `immediate` check
+/// (`after_len == outer_trail_len + 1`); both must agree on the rest position.
+/// With the anchored accept enabled the reach extends to the full distance cap.
+fn pending_survives(
+    keep_pending: bool,
+    caret: usize,
+    word_end: usize,
+    outer_trail_len: usize,
+    anchored_enabled: bool,
+) -> bool {
+    if !keep_pending || caret <= word_end {
+        return false;
+    }
+    let dist = caret - word_end;
+    let cap = if anchored_enabled {
+        MAX_ANCHOR_CHARS
+    } else {
+        outer_trail_len + 1
+    };
+    dist <= cap
+}
+
 /// The just-fired correction, retained so a single Escape can revert it within
 /// [`UNDO_WINDOW_MS`]. `typed`/`target` are normalized (allow-list form);
 /// `boundary` is the terminator char that sealed the word (re-typed verbatim on
@@ -4682,14 +4714,19 @@ pub fn spawn<R: Runtime>(
                             // dismiss — a missed accept is fine, a wrong-place edit
                             // is not.
                             if let Some(ps) = &pending_suggestion {
-                                let dist = caret.saturating_sub(ps.word_end);
-                                // While the anchored accept is OFF, an accept is
-                                // possible ONLY at the immediate boundary (dist == 1),
-                                // so drop the bubble the moment the caret types past it
-                                // — a visible bubble must always mean Shift will work.
-                                // With anchored ON, keep it up to the distance cap.
-                                let cap = if ANCHORED_ACCEPT_ENABLED { MAX_ANCHOR_CHARS } else { 1 };
-                                if !keep_pending || caret <= ps.word_end || dist > cap {
+                                // Drop the bubble the moment the caret leaves the
+                                // accept-reachable rest position — a visible bubble
+                                // must always mean Shift will work. The rest position
+                                // is `outer_trail_len + 1` (boundary + any closing
+                                // punct), so a trailing-quoted word (QA-17 5b) is not
+                                // dropped the instant it seals. See `pending_survives`.
+                                if !pending_survives(
+                                    keep_pending,
+                                    caret,
+                                    ps.word_end,
+                                    ps.outer_trail_len,
+                                    ANCHORED_ACCEPT_ENABLED,
+                                ) {
                                     pending_suggestion = None;
                                     let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
                                 }
@@ -5561,6 +5598,28 @@ mod tests {
         // 5b: the trailing `"` sits beyond word_end (in tok.trailing). The
         // leading `"` is never in the delete window, so it survives untouched.
         assert_accept_revert("beleive", "\"", "believe", "\"beleive\" ", "\"believe\" ");
+    }
+
+    #[test]
+    fn pending_survives_the_seal_of_a_trailing_quoted_word() {
+        // QA-17 5b regression: the end-of-arm retention gate must keep a bubble
+        // whose word carries a trailing `"` (caret rests 2 past word_end), not
+        // just a bare word (rests 1 past). Anchored OFF for all of these.
+        let anchored = false;
+        // Plain word: caret one past the word → survives.
+        assert!(pending_survives(true, 11, 10, 0, anchored));
+        // Trailing double-quote: caret two past (word + `"` + boundary) → survives
+        // (this is the exact case that regressed to "no bubble at all").
+        assert!(pending_survives(true, 12, 10, 1, anchored));
+        // Caret typed genuinely PAST the rest position → dropped (a plain word,
+        // caret 2 past with no trailing punct, is a real move-on).
+        assert!(!pending_survives(true, 12, 10, 0, anchored));
+        // Not a clean forward keystroke (nav/edit) → dropped regardless.
+        assert!(!pending_survives(false, 11, 10, 0, anchored));
+        // Caret at or before the word → dropped.
+        assert!(!pending_survives(true, 10, 10, 0, anchored));
+        // Anchored ON keeps it up to the full cap, well past the rest position.
+        assert!(pending_survives(true, 15, 10, 0, true));
     }
 
     #[test]
