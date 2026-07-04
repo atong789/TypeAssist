@@ -3394,6 +3394,13 @@ pub fn spawn<R: Runtime>(
         // "active" from an OBSERVED probe, not assume it (Principle #7).
         let mut ever_live = false;
         let mut permission_ok = true;
+        // (a) QA-20: the sidecar's per-heartbeat Accessibility grant (from
+        // `PermissionStatus`), tracked SEPARATELY from `permission_ok`. Revoking
+        // Accessibility at runtime does NOT stop the already-built tap (it rides
+        // on Input Monitoring), so heartbeats keep arriving and `permission_ok`
+        // stays true — but corrections can no longer inject. This authoritative
+        // per-grant read is what surfaces that degraded state to the tray.
+        let mut accessibility_ok = true;
         let mut last_ui_emit: Option<CaptureUiEvent> = None;
 
         // The receive loop selects between the sidecar event stream,
@@ -3694,6 +3701,11 @@ pub fn spawn<R: Runtime>(
                                     input_monitoring,
                                 },
                             );
+                            // (a) QA-20: latch the authoritative Accessibility grant
+                            // so the capture-UI can surface a runtime revoke even
+                            // while heartbeats (and thus `permission_ok`) stay healthy
+                            // on the surviving Input-Monitoring tap.
+                            accessibility_ok = accessibility;
                         }
                         InputEvent::Shutdown => break 'engine_loop,
                         InputEvent::CaretMoved { reason } => {
@@ -3783,7 +3795,26 @@ pub fn spawn<R: Runtime>(
                                         ps.word_len,
                                         &ps.typed,
                                     );
-                                if !immediate && !anchored_ok {
+                                // (c) QA-20: verify Accessibility is still granted
+                                // BEFORE confirming. Injection posts synthetic
+                                // CGEvents, which require Accessibility; if it was
+                                // revoked at runtime the post silently no-ops while
+                                // the pipe write "succeeds", so we'd falsely report
+                                // "Fixed" over an unchanged field (the trust-breaker).
+                                // A no-prompt `AXIsProcessTrusted` read (content-free,
+                                // Principle #8) is the honest proxy — a field read-back
+                                // would violate content-blindness. On loss: abort, hide
+                                // the bubble (never claim success), and let the
+                                // capture-UI permission-revoked path surface Reconnect.
+                                let ax_ok = accessibility_granted();
+                                if !ax_ok {
+                                    tracing::warn!(
+                                        "CORRECTION_ACCEPT_ABORTED reason=accessibility_revoked typed={:?} target={:?}",
+                                        ps.typed,
+                                        ps.target
+                                    );
+                                    let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                                } else if !immediate && !anchored_ok {
                                     // Stale / beyond-cap / anchored-disabled / model
                                     // mismatch — NEVER inject. A wrong-place edit is
                                     // the one outcome we refuse.
@@ -5210,10 +5241,22 @@ pub fn spawn<R: Runtime>(
                     let settled_stopped = non_live_since.is_some_and(|since| {
                         Instant::now().duration_since(since).as_millis() >= NOT_ACTIVE_DEBOUNCE_MS
                     });
+                    // (a) QA-20: a runtime Accessibility revoke leaves capture
+                    // reading (Input Monitoring keeps the tap alive → health stays
+                    // Live) but corrections can no longer inject. Surface it as a
+                    // settled Stop so the tray slashes and the menu offers Reconnect
+                    // (re-granting is the only recovery) — no debounce, since an AX
+                    // revoke is a deliberate Settings action, not a transient blip.
+                    // Only once capture has actually started (`ever_live`), so a
+                    // pre-grant boot still reads as NotStarted, not a false alarm.
+                    let ax_revoked = ever_live && !accessibility_ok;
                     // Active only from an observed Live (or a transient drop still
                     // inside the anti-strobe debounce). Never-Live-yet is
-                    // NotStarted, not Active; a settled outage is Stopped.
-                    let ui_state = if live_now || (ever_live && !settled_stopped) {
+                    // NotStarted, not Active; a settled outage — or an AX revoke — is
+                    // Stopped.
+                    let ui_state = if ax_revoked {
+                        CaptureUiState::Stopped
+                    } else if live_now || (ever_live && !settled_stopped) {
                         CaptureUiState::Active
                     } else if settled_stopped {
                         CaptureUiState::Stopped
@@ -5236,8 +5279,12 @@ pub fn spawn<R: Runtime>(
                     // recovery action only matters while Stopped.
                     let ui = CaptureUiEvent {
                         state: ui_state,
+                        // Reconnect (not Restart) whenever a required grant is gone:
+                        // the tap-dead case (`!permission_ok`) OR a runtime AX revoke
+                        // that left the tap alive (`ax_revoked`, where permission_ok
+                        // is still true). (a) QA-20.
                         permission_revoked: matches!(ui_state, CaptureUiState::Stopped)
-                            && !permission_ok,
+                            && (!permission_ok || ax_revoked),
                     };
                     if last_ui_emit != Some(ui) || watchdog_ticks % HEALTH_REPEAT_TICKS == 0 {
                         let _ = app_handle.emit(EVT_CAPTURE_UI, ui);
