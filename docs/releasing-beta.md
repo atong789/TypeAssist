@@ -45,6 +45,33 @@ Outputs:
 - `target/release/bundle/macos/TenCalmDigits.app`
 - `target/release/bundle/dmg/TenCalmDigits_0.1.0_aarch64.dmg`
 
+### Version-stamp the DMG volume name (do this BEFORE notarize/staple)
+
+Tauri names the DMG **volume** after `productName` alone ("TenCalmDigits") — every
+release mounts under the same name, so Finder reuses an earlier mount's cached
+volume icon (the wrong-hand gotcha below) and testers can't tell versions apart.
+There is no Tauri config for the volume name, so re-stamp it post-build. Bump
+`VOL` to match this release's version; run before notarizing so notarization
+covers the final artifact:
+
+```sh
+DMG="target/release/bundle/dmg/TenCalmDigits_0.1.0_aarch64.dmg"
+VOL="TenCalmDigits 0.1.0"   # ← must match tauri.conf.json "version" each release
+
+# Convert the read-only build DMG to read-write, rename its volume, convert back
+# to compressed (UDZO) at the SAME path so the notarize/staple commands below are
+# unchanged. The volume's .VolumeIcon.icns rides along, now cached under the new
+# name — which also clears the stale volume-icon symptom for good.
+hdiutil convert "$DMG" -format UDRW -o /tmp/tcd-rw.dmg
+hdiutil attach /tmp/tcd-rw.dmg -nobrowse -noverify -mountpoint /tmp/tcd-mnt
+diskutil rename /tmp/tcd-mnt "$VOL"
+hdiutil detach /tmp/tcd-mnt
+rm -f "$DMG"
+hdiutil convert /tmp/tcd-rw.dmg -format UDZO -o "$DMG"
+rm -f /tmp/tcd-rw.dmg
+# Confirm: mounting the DMG now shows the volume as "TenCalmDigits 0.1.0".
+```
+
 Verify before notarizing:
 ```sh
 codesign --verify --deep --strict --verbose=2 \
@@ -116,6 +143,15 @@ lsappinfo info -app app.tencalmdigits | grep -o 'type="[^"]*"'
   -kill -r -domain local -domain user
 rm -rf /Applications/TenCalmDigits.app
 ```
+
+**Confirmed not a code regression (2026-07-04, v1.5).** On the reporting Mac
+`lsappinfo info -app app.tencalmdigits` returned `type="UIElement"` while the Dock
+tile was showing — i.e. the activation policy is correct and the tile is a stale
+LaunchServices registration, not a runtime `Foreground` promotion. The fix is the
+cache rebuild above (plus the version-stamped volume name, which stops new stale
+registrations accumulating under one shared name). Re-open **only** if a future
+`lsappinfo` reads `type="Foreground"` — that would be a real runtime promotion to
+fix in `set_activation_policy`.
 
 ### The DMG volume icon is the wrong hand (e.g. brown, not yellow)
 
