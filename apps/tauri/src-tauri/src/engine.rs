@@ -1197,6 +1197,47 @@ fn snapshot_date(ms: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// The machine's LOCAL UTC offset in seconds (east positive) for the instant
+/// `epoch_ms`, via libc `localtime_r` → `tm_gmtoff`. DST-correct because the
+/// offset is resolved *for that instant*. Falls back to `0` (UTC) if the clock
+/// read fails — never panics on a date derivation. macOS-only (L5 app shell —
+/// L2–L4 stay OS-agnostic); the non-macOS fallback keeps the workspace building.
+#[cfg(target_os = "macos")]
+fn local_utc_offset_secs(epoch_ms: u64) -> i64 {
+    let t = (epoch_ms / 1000) as libc::time_t;
+    // SAFETY: `localtime_r` writes the broken-down time into our stack `tm` and
+    // returns a pointer to it (or null on failure). Both pointers are valid for
+    // the call; we read `tm_gmtoff` only on the non-null (success) path.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let res = unsafe { libc::localtime_r(&t, &mut tm) };
+    if res.is_null() {
+        0
+    } else {
+        tm.tm_gmtoff as i64
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn local_utc_offset_secs(_epoch_ms: u64) -> i64 {
+    0
+}
+
+/// LOCAL civil date `(year, month, day)` for an epoch-ms instant — the same
+/// Hinnant math as [`ymd_from_epoch_ms`], but on the instant shifted into local
+/// time so the day rolls at the user's **local midnight**, not UTC's. This is
+/// the Today Words/Slip-rate tally boundary (v1.5 item 3).
+///
+/// Deliberately scoped to the display/tally path ONLY: the dated motor snapshots
+/// ([`snapshot_date`], Principle #6 durable history) stay on UTC, so within a few
+/// hours of midnight the Progress tally date and a motor-snapshot filename for
+/// the "same" wall-clock day can differ by one. Accepted divergence — the two
+/// serve different jobs (live daily rollup vs immutable history) and are never
+/// joined on date.
+fn local_ymd_from_epoch_ms(ms: u64) -> (i64, u32, u32) {
+    let offset_ms = local_utc_offset_secs(ms) * 1000;
+    let shifted = (ms as i64 + offset_ms).max(0) as u64;
+    ymd_from_epoch_ms(shifted)
+}
+
 /// Parse a `YYYY-MM-DD.json` snapshot filename back to a civil date, or
 /// `None` if it isn't one. Lets the cadence survive app restarts (seeded
 /// from the newest file on disk rather than an in-memory-only timestamp).
@@ -1233,9 +1274,14 @@ fn progress_snapshots_path() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("progress_snapshots.json"))
 }
 
-/// One calendar day's typing rollup, as persisted. `date` is `YYYY-MM-DD` (UTC
-/// civil date, matching the dated motor snapshots). `coord + precis == slips`
-/// always (every counted slip classifies as exactly one).
+/// One calendar day's typing rollup, as persisted. `date` is `YYYY-MM-DD` in the
+/// machine's **LOCAL** calendar (v1.5 item 3 — the day rolls at the user's local
+/// midnight via [`local_ymd_from_epoch_ms`], so "Words today" matches the user's
+/// wall clock). NOTE: this is the display/tally path only — the dated motor
+/// snapshots ([`snapshot_date`]) stay UTC, so near midnight a progress row's date
+/// and a same-day snapshot filename can differ by one (accepted; see
+/// `local_ymd_from_epoch_ms`). `coord + precis == slips` always (every counted
+/// slip classifies as exactly one).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DailyEntry {
     date: String,
@@ -1334,7 +1380,7 @@ fn read_progress_days(path: &Path) -> Vec<DailyEntry> {
 /// counts (Principle #6/#8 — never silently drop the morning's data on a
 /// relaunch) instead of overwriting them with a fresh zero on the next flush.
 fn load_daily_tally(path: Option<&Path>, now: u64) -> DailyTally {
-    let mut tally = DailyTally::new(ymd_from_epoch_ms(now));
+    let mut tally = DailyTally::new(local_ymd_from_epoch_ms(now));
     let today = tally.date_str();
     if let Some(path) = path {
         if let Some(e) = read_progress_days(path)
@@ -1384,7 +1430,7 @@ fn tick_progress(
     now: u64,
     last_save_ms: &mut u64,
 ) -> bool {
-    let today = ymd_from_epoch_ms(now);
+    let today = local_ymd_from_epoch_ms(now);
 
     if today != tally.date {
         let mut wrote = false;
