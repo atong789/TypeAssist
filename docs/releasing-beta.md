@@ -1,8 +1,9 @@
 # Releasing the signed beta DMG
 
-The distributed beta is a **Developer ID**–signed, **notarized** DMG (distinct
-from the local self-signed dev build — see `macos-signing.md`). Bundle identity:
-`app.tencalmdigits`, product name **TenCalmDigits**.
+The distributed beta is a **Developer ID**–signed, **notarized**, **Universal
+Binary** (arm64 + x86_64, since v0.2.0) DMG (distinct from the local self-signed
+dev build — see `macos-signing.md`). Bundle identity: `app.tencalmdigits`, product
+name **TenCalmDigits**. Installs natively on Apple Silicon **and** Intel Macs.
 
 > **Why the id matters.** A product rename (TypeAssist → TenCalmDigits) that kept
 > one `CFBundleIdentifier` across many on-disk bundles corrupted TCC/LaunchServices
@@ -19,31 +20,84 @@ from the local self-signed dev build — see `macos-signing.md`). Bundle identit
   # then use --keychain-profile "<profile-name>" below
   ```
 
-## Build (same recipe each time)
+## Build (same recipe each time) — Universal Binary (arm64 + x86_64)
 
 `just` is **not** installed on the build Mac — use the plain shell steps.
 
-```sh
-# 1. Rebuild the Swift sidecar, stage it under the Tauri target triple, sign it.
-#    (Tauri re-signs the nested copy with Developer ID + hardened runtime during
-#    bundling, so the stage-time signature is transient — but keep it clean.)
-cd adapters/macos && swift build -c release && cd -
-cp adapters/macos/.build/release/typeassist-input-macos \
-   apps/tauri/src-tauri/sidecars/typeassist-input-macos-aarch64-apple-darwin
-codesign --force --options runtime \
-  --sign "Developer ID Application: Soumyo Sinha (XV484C8C6K)" \
-  --identifier "typeassist-input-macos" \
-  apps/tauri/src-tauri/sidecars/typeassist-input-macos-aarch64-apple-darwin
+Since **v0.2.0** the beta ships as a **Universal Binary** so it installs natively
+on both Apple Silicon and Intel Macs. Two non-obvious mechanics drive the sidecar
+step below — read them before touching it:
 
-# 2. Build the signed .app + .dmg with the release config overlay.
-#    (Deep-merges over tauri.conf.json: Developer ID identity + entitlements.plist
-#    + minimumSystemVersion 13.0. The base bundle.icon set is inherited.)
-cd apps/tauri && npm run tauri build -- --config src-tauri/tauri.release.conf.json && cd -
+- **CLT-only cross-compile.** This build Mac has **Command Line Tools, not full
+  Xcode**, so the one-shot `swift build --arch arm64 --arch x86_64` fails
+  (`xcbuild`/`XCBuild.framework` is absent). Build each slice **separately** into
+  isolated scratch dirs — arm64 natively, x86_64 by overriding the target triple —
+  then `lipo -create`. The `__TEXT,__info_plist` friendly-name section survives in
+  both slices.
+- **Tauri's universal build needs THREE staged sidecar files at once.** Tauri
+  compiles each arch in a separate cargo sub-build (each validates its **own**
+  per-arch sidecar name), then the bundler copies in a **fat** `-universal-` one —
+  Tauri does *not* lipo sidecars itself. So all three must be present:
+  `…-aarch64-apple-darwin` (thin arm64), `…-x86_64-apple-darwin` (thin x86_64),
+  and `…-universal-apple-darwin` (fat). Missing a per-arch one → the cargo
+  build-script fails; missing the fat one → the bundler fails.
+
+```sh
+# 1. Build the universal Swift sidecar and stage the THREE files, each signed
+#    Developer ID + hardened runtime. (Tauri re-signs the nested copy during
+#    bundling, but stage them clean.)
+SIDE=apps/tauri/src-tauri/sidecars
+DEVID="Developer ID Application: Soumyo Sinha (XV484C8C6K)"
+
+# 1a. Build each arch into its own scratch dir (CLT-only cross-compile).
+cd adapters/macos
+swift build -c release --scratch-path .build-arm64
+swift build -c release --scratch-path .build-x86 \
+  -Xswiftc -target -Xswiftc x86_64-apple-macosx13.0 \
+  -Xcc     -target -Xcc     x86_64-apple-macosx13.0 \
+  -Xlinker -arch   -Xlinker x86_64
+cd -
+
+# 1b. lipo the fat binary, then extract the two thin per-arch slices from it
+#     (so all three come from identical current source).
+mkdir -p "$SIDE"
+lipo -create \
+  adapters/macos/.build-arm64/arm64-apple-macosx/release/typeassist-input-macos \
+  adapters/macos/.build-x86/arm64-apple-macosx/release/typeassist-input-macos \
+  -output "$SIDE/typeassist-input-macos-universal-apple-darwin"
+lipo "$SIDE/typeassist-input-macos-universal-apple-darwin" -thin arm64 \
+  -output "$SIDE/typeassist-input-macos-aarch64-apple-darwin"
+lipo "$SIDE/typeassist-input-macos-universal-apple-darwin" -thin x86_64 \
+  -output "$SIDE/typeassist-input-macos-x86_64-apple-darwin"
+rm -rf adapters/macos/.build-arm64 adapters/macos/.build-x86
+
+# 1c. Sign all three (Developer ID + hardened runtime + stable identifier).
+for f in "$SIDE"/typeassist-input-macos-{aarch64,x86_64,universal}-apple-darwin; do
+  codesign --force --options runtime --sign "$DEVID" \
+    --identifier "typeassist-input-macos" "$f"
+done
+# sanity: both real slices in the fat one
+lipo -info "$SIDE/typeassist-input-macos-universal-apple-darwin"   # → x86_64 arm64
+
+# 2. Build the signed universal .app + .dmg with the release config overlay.
+#    --target universal-apple-darwin makes Tauri build+lipo both arches.
+#    (The overlay deep-merges over tauri.conf.json: Developer ID identity +
+#    entitlements.plist + minimumSystemVersion 13.0; base bundle.icon inherited.)
+cd apps/tauri && npm run tauri build -- \
+  --target universal-apple-darwin \
+  --config src-tauri/tauri.release.conf.json && cd -
 ```
 
-Outputs:
-- `target/release/bundle/macos/TenCalmDigits.app`
-- `target/release/bundle/dmg/TenCalmDigits_0.1.0_aarch64.dmg`
+Outputs (note the `universal-apple-darwin` target dir and the `universal` arch token):
+- `target/universal-apple-darwin/release/bundle/macos/TenCalmDigits.app`
+- `target/universal-apple-darwin/release/bundle/dmg/TenCalmDigits_0.2.0_universal.dmg`
+
+Verify **both** the app binary and the bundled sidecar are fat before continuing:
+```sh
+APP=target/universal-apple-darwin/release/bundle/macos/TenCalmDigits.app
+lipo -info "$APP/Contents/MacOS/typeassist-app"          # → x86_64 arm64
+lipo -info "$APP/Contents/MacOS/typeassist-input-macos"  # → x86_64 arm64
+```
 
 ### Version-stamp the DMG volume name (do this BEFORE notarize/staple)
 
@@ -55,8 +109,8 @@ There is no Tauri config for the volume name, so re-stamp it post-build. Bump
 covers the final artifact:
 
 ```sh
-DMG="target/release/bundle/dmg/TenCalmDigits_0.1.0_aarch64.dmg"
-VOL="TenCalmDigits 0.1.0"   # ← must match tauri.conf.json "version" each release
+DMG="target/universal-apple-darwin/release/bundle/dmg/TenCalmDigits_0.2.0_universal.dmg"
+VOL="TenCalmDigits 0.2.0"   # ← must match tauri.conf.json "version" each release
 
 # Convert the read-only build DMG to read-write, rename its volume, convert back
 # to compressed (UDZO) at the SAME path so the notarize/staple commands below are
@@ -78,13 +132,13 @@ hdiutil detach /tmp/tcd-mnt
 rm -f "$DMG"
 hdiutil convert /tmp/tcd-rw.dmg -format UDZO -o "$DMG"
 rm -f /tmp/tcd-rw.dmg
-# Confirm: mounting the DMG now shows the volume as "TenCalmDigits 0.1.0".
+# Confirm: mounting the DMG now shows the volume as "TenCalmDigits 0.2.0".
 ```
 
 Verify before notarizing:
 ```sh
 codesign --verify --deep --strict --verbose=2 \
-  target/release/bundle/macos/TenCalmDigits.app          # → valid, satisfies DR
+  target/universal-apple-darwin/release/bundle/macos/TenCalmDigits.app   # → valid, satisfies DR
 ```
 `spctl -a -vv` will say **"Unnotarized Developer ID"** until the next step — expected.
 
@@ -94,12 +148,12 @@ The Tauri build **skips notarization** (no `APPLE_*` env vars) — do it explici
 on the DMG, then staple so it validates offline:
 
 ```sh
-xcrun notarytool submit target/release/bundle/dmg/TenCalmDigits_0.1.0_aarch64.dmg \
-  --keychain-profile "<profile-name>" --wait
-xcrun stapler staple target/release/bundle/dmg/TenCalmDigits_0.1.0_aarch64.dmg
+DMG="target/universal-apple-darwin/release/bundle/dmg/TenCalmDigits_0.2.0_universal.dmg"
+xcrun notarytool submit "$DMG" --keychain-profile "<profile-name>" --wait
+xcrun stapler staple "$DMG"
 # confirm:
 spctl -a -vv -t open --context context:primary-signature \
-  target/release/bundle/dmg/TenCalmDigits_0.1.0_aarch64.dmg   # → accepted, source=Notarized Developer ID
+  "$DMG"   # → accepted, source=Notarized Developer ID
 ```
 
 ## First-install cleanup on a Mac that ran an OLD-id build
