@@ -4,8 +4,11 @@
 //! different jobs** and uses **two different data sources**:
 //!
 //! 1. **Membership** — "is this a correctly-spelled word?" Answered by a
-//!    clean spelling dictionary (SCOWL en_US + contractions, ~80k entries).
-//!    Common misspellings like `teh`, `recieve`, `didnt` are *not* members.
+//!    clean spelling dictionary (SCOWL en_US + contractions + VarCon British
+//!    spellings, ~84k entries — the v3 **merged tolerant list**: both US and UK
+//!    spellings are always valid, so a spelling variant is never flagged as a
+//!    slip). Common misspellings like `teh`, `recieve`, `didnt` are *not*
+//!    members.
 //!    Plus a temporary seed list of proper nouns (dev fixture — see below).
 //! 2. **Frequency** — used by Component 3b *only* to rank candidates of an
 //!    unknown word. Sourced from the Norvig web-unigram counts (top 50k).
@@ -37,7 +40,10 @@
 //! same contract as [`crate::tokenizer::TOKENIZER_VERSION`].
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{OnceLock, RwLock};
+
+use crate::spelling_variant::SpellingVariant;
 
 /// Version of the loaded lexicon (clean dict + freq table + seed fixture).
 ///
@@ -48,7 +54,24 @@ use std::sync::{OnceLock, RwLock};
 /// v2 — split sources: SCOWL en_US + contractions is the membership test
 ///       (rejects `teh` / `recieve`, includes `didn't`); Norvig stays as the
 ///       ranking-only frequency table.
-pub const LEXICON_VERSION: u32 = 2;
+/// v3 — **merged list** (UK English): British spellings (VarCon British forms,
+///       level ≤ 50, ~3.1k words) are unioned into the membership set alongside
+///       en_US so both variants are bundled.
+/// v4 — **locale-gated membership** (UK English, v0.3.0 refinement): once L5
+///       reports the system locale ([`Self::set_spelling_variant`]), the
+///       **opposite-locale** spelling of a VarCon variant pair is excluded from
+///       `is_known` — on a British system `color` is unknown, on an American
+///       system `colour` is. **Locale defines the correct spelling; the other
+///       variant is a slip against it**, routed through the slip engine toward
+///       the locale spelling (the user still confirms via Shift / dismisses —
+///       nothing is auto-applied). This *supersedes* the earlier v3 "spelling
+///       variant is authorship, never flagged" stance. Before a locale is set
+///       the gate is off (both variants known — the pre-locale tolerant
+///       default, so startup and tests are unaffected). The runtime learner is
+///       guarded so a variant word can never re-enter "known" (see
+///       [`crate::spelling_variant::is_variant_word`] /
+///       [`crate::LexiconProposer::note_record`]); novel words learn normally.
+pub const LEXICON_VERSION: u32 = 4;
 
 /// Bundled clean spelling dictionary — SCOWL cumulative size-50, en_US
 /// flavour (english-words + american-words + variant_1-words +
@@ -56,6 +79,14 @@ pub const LEXICON_VERSION: u32 = 2;
 /// per line, lowercase, sorted, deduplicated. ~81k entries. License: SCOWL
 /// composite — see `lexicon/SCOWL_COPYRIGHT.txt`.
 const WORDS_CLEAN: &str = include_str!("../lexicon/words_clean.txt");
+
+/// Bundled **British** spellings — VarCon British forms (level ≤ 50, en_US
+/// removed so it's add-only), lowercase, one per line incl. possessives to
+/// match `words_clean`. Unioned into the membership set so both US and UK
+/// spellings are always valid (v3 merged tolerant list — see
+/// [`LEXICON_VERSION`]). License: VarCon (Kevin Atkinson, SCOWL sibling) — see
+/// `lexicon/SCOWL_COPYRIGHT.txt`.
+const WORDS_UK: &str = include_str!("../lexicon/words_uk.txt");
 
 /// Bundled `word<TAB>count` frequency table — top 50k Norvig web unigrams.
 /// Lowercase ASCII. Used **only** for ranking candidates of an unknown
@@ -99,6 +130,14 @@ pub struct Lexicon {
     /// caller (linguistic gate, candidate gen, decision pipeline) sees
     /// the live lexicon without a separate code path.
     learned: RwLock<HashSet<String>>,
+    /// **v4 locale gate** — the active spelling variant reported by L5,
+    /// encoded `0 = unset` (both variants known — pre-locale tolerant
+    /// default), `1 = American`, `2 = British`. When set, the
+    /// opposite-locale spelling of a VarCon pair is excluded from
+    /// membership (see [`Self::is_known`]). Atomic so the `'static`
+    /// singleton can be re-pointed on a `SetSpellingVariant` control
+    /// without a lock on the hot membership path.
+    active_variant: AtomicU8,
 }
 
 impl Lexicon {
@@ -108,6 +147,13 @@ impl Lexicon {
     pub fn load() -> Self {
         let mut clean: HashSet<String> = HashSet::with_capacity(90_000);
         for raw in WORDS_CLEAN.lines() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            clean.insert(line.to_ascii_lowercase());
+        }
+        for raw in WORDS_UK.lines() {
             let line = raw.trim();
             if line.is_empty() {
                 continue;
@@ -138,6 +184,7 @@ impl Lexicon {
             clean,
             freq,
             learned: RwLock::new(HashSet::new()),
+            active_variant: AtomicU8::new(0), // unset → gate off until L5 reports
         }
     }
 
@@ -165,12 +212,46 @@ impl Lexicon {
     /// that gives every consumer (linguistic gate, candidate
     /// generation, decision pipeline) live access to the user's
     /// learned vocabulary without a separate code path.
+    ///
+    /// **v4 locale gate:** once a spelling variant is set, the
+    /// opposite-locale spelling of a VarCon pair is *not* known — so a
+    /// garble converges only on the locale spelling and a cleanly-typed
+    /// opposite variant routes through the slip engine toward it.
     pub fn is_known(&self, word: &str) -> bool {
         if word.is_empty() {
             return false;
         }
         let key = word.to_ascii_lowercase();
+        if self.is_opposite_locale_variant(&key) {
+            return false;
+        }
         self.clean.contains(&key) || self.learned.read().unwrap().contains(&key)
+    }
+
+    /// Adopt the system spelling variant reported by L5 (v0.3.0). Flips
+    /// the locale gate (see [`Self::is_known`]): the opposite-locale
+    /// spelling of every VarCon pair becomes unknown. Content-free (a
+    /// two-value enum), never persisted. Cheap — a single atomic store.
+    pub fn set_spelling_variant(&self, variant: SpellingVariant) {
+        let code = match variant {
+            SpellingVariant::American => 1,
+            SpellingVariant::British => 2,
+        };
+        self.active_variant.store(code, Ordering::Relaxed);
+    }
+
+    /// True iff `key` (already lowercase) is the opposite-locale spelling
+    /// of a VarCon pair under the active variant. `false` while the
+    /// variant is unset (pre-locale tolerant default) or for non-variant
+    /// words. Hot path: one relaxed atomic load + one hashmap probe, no
+    /// allocation.
+    fn is_opposite_locale_variant(&self, key: &str) -> bool {
+        let variant = match self.active_variant.load(Ordering::Relaxed) {
+            1 => SpellingVariant::American,
+            2 => SpellingVariant::British,
+            _ => return false, // unset → gate off
+        };
+        crate::spelling_variant::is_opposite_locale(key, variant)
     }
 
     /// True iff the word is in the **runtime-learned** set
@@ -188,16 +269,23 @@ impl Lexicon {
     }
 
     /// True iff the word is in the **bundled clean dict** ONLY (SCOWL
-    /// + seed). Does NOT consult the runtime-learned set, and so does
+    /// plus seed). Does NOT consult the runtime-learned set, and so does
     /// NOT acquire the RwLock. Used by hot inner loops (the linguistic
     /// gate's edit-2 proximity check runs ~120k membership probes per
     /// call) that already check the learned side via a passed-in
-    /// snapshot. Case-insensitive.
+    /// snapshot. Case-insensitive. **v4 locale gate applies** — the
+    /// opposite-locale variant is excluded here too, so convergence
+    /// candidate generation ([`crate::shadow_convergence_scan`]) never
+    /// offers it as a rival to the locale spelling.
     pub fn is_in_clean(&self, word: &str) -> bool {
         if word.is_empty() {
             return false;
         }
-        self.clean.contains(&word.to_ascii_lowercase())
+        let key = word.to_ascii_lowercase();
+        if self.is_opposite_locale_variant(&key) {
+            return false;
+        }
+        self.clean.contains(&key)
     }
 
     /// Add a word to the runtime-learned set. Case-insensitive
@@ -452,6 +540,57 @@ mod tests {
     }
 
     // ---- Singleton ------------------------------------------------------
+
+    // ---- v4 locale gate --------------------------------------------------
+
+    #[test]
+    fn both_variants_known_until_locale_is_set() {
+        // Pre-locale tolerant default (gate off): a fresh lexicon accepts
+        // both spellings, so startup and every existing test are unaffected.
+        let l = lex();
+        assert!(l.is_known("color"));
+        assert!(l.is_known("colour"));
+        assert!(l.is_in_clean("color"));
+        assert!(l.is_in_clean("colour"));
+    }
+
+    #[test]
+    fn british_locale_gates_the_american_spelling() {
+        let l = lex();
+        l.set_spelling_variant(SpellingVariant::British);
+        // The American spelling is now a slip against the locale → unknown.
+        assert!(!l.is_known("color"), "color should be gated on a British system");
+        assert!(!l.is_known("colors"));
+        assert!(!l.is_in_clean("color"), "candidate gen must not offer `color`");
+        // The locale-correct British spelling stays known.
+        assert!(l.is_known("colour"));
+        assert!(l.is_in_clean("colour"));
+        // Non-variant words are untouched by the gate.
+        assert!(l.is_known("keyboard"));
+        assert!(!l.is_known("teh"));
+    }
+
+    #[test]
+    fn american_locale_gates_the_british_spelling() {
+        let l = lex();
+        l.set_spelling_variant(SpellingVariant::American);
+        assert!(!l.is_known("colour"), "colour should be gated on an American system");
+        assert!(!l.is_in_clean("colour"));
+        assert!(l.is_known("color"));
+        assert!(l.is_in_clean("color"));
+    }
+
+    #[test]
+    fn locale_gate_beats_the_learned_set() {
+        // Even if a variant word were somehow learned, the gate wins — the
+        // opposite-locale spelling can never be "known" (the anti-suppression
+        // guarantee; the learner is *also* guarded upstream, belt-and-braces).
+        let l = lex();
+        l.set_spelling_variant(SpellingVariant::British);
+        l.learn("color");
+        assert!(!l.is_known("color"), "gate must override a learned variant");
+        l.clear_learned();
+    }
 
     #[test]
     fn shared_is_singleton_and_matches_load() {

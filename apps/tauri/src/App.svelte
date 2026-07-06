@@ -2,6 +2,7 @@
   import { onMount, tick, type ComponentType } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
+  import { resolveVariant, loadSpellingPref } from "./lib/locale";
   import DebugPanel from "./routes/DebugPanel.svelte";
   import Today from "./routes/Today.svelte";
   import Progress from "./routes/Progress.svelte";
@@ -45,6 +46,17 @@
       // If the check fails, fall back to the stored flag as-is.
     }
     firstRunResolved = true;
+    // UK English (v0.3.0): tell the engine which spelling variant to SUGGEST in,
+    // resolved from the OS locale here in L5 (membership already accepts both
+    // spellings). Best-effort + fire-once; a failure just leaves the engine's
+    // American default. `resolveVariant` returns exactly "american" | "british".
+    try {
+      await invoke("set_spelling_variant", {
+        variant: resolveVariant(loadSpellingPref()),
+      });
+    } catch {
+      // Non-fatal — engine keeps its default variant.
+    }
     if ($onboarded) {
       // Existing-user shell just mounted — land the focus ring as the normal
       // launch path would (the sibling onMount's focus call ran before the gate).

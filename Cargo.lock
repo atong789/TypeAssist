@@ -96,7 +96,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "behavioural-model"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "correction-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3894,7 +3894,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "typeassist-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "behavioural-model",
@@ -4057,7 +4057,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "volatility-map"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "schemars 0.8.22",
