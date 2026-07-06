@@ -5,6 +5,8 @@
 
 mod allow_list;
 mod backup;
+#[cfg(target_os = "macos")]
+mod cue_position;
 mod engine;
 #[cfg(target_os = "macos")]
 mod menu_focus;
@@ -1352,19 +1354,26 @@ pub fn run() {
             }
 
             // M3 correction bubble — the suggest/accept/undo HUD. Rust owns
-            // show + position (top-right, no positioner JS dependency) and the
-            // window is `focus: false`, so it never steals the caret from the app
-            // the user is typing in. We show on BOTH a new suggestion and an
-            // apply/undo; the bubble webview owns its own HIDE (it knows the
-            // stage-dependent lifetimes — ~5s suggest, 6s accepted-undo, brief
-            // familiar), so there's no Rust timer racing the UI's fade.
+            // show + position (TF-07: top-left of the active screen, see
+            // `position_cue_top_left`) and the window is `focus: false`, so it
+            // never steals the caret from the app the user is typing in. We show
+            // on BOTH a new suggestion and an apply/undo; the bubble webview owns
+            // its own HIDE (it knows the stage-dependent lifetimes — ~5s suggest,
+            // 6s accepted-undo, brief familiar), so there's no Rust timer racing
+            // the UI's fade.
             {
                 let handle = app.handle().clone();
                 let show_cue = move |h: &tauri::AppHandle| {
-                    if let Some(w) = h.get_webview_window("cue") {
-                        let _ = w.move_window(Position::TopRight);
-                        let _ = w.show();
-                    }
+                    // TF-07: place + show on the TOP-LEFT of the active screen.
+                    // The placement touches AppKit (NSScreen / the window's
+                    // NSWindow), which must run on the main thread; the
+                    // correction-event listener can fire off it, so hop onto the
+                    // main loop. `run_on_main_thread` queues even when already on
+                    // main, so the bubble surfaces a beat later — fine for a HUD.
+                    let h2 = h.clone();
+                    let _ = h.run_on_main_thread(move || {
+                        cue_position::show_cue_top_left(&h2);
+                    });
                 };
                 let h_sug = handle.clone();
                 let show_sug = show_cue.clone();
