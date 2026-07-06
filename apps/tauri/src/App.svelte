@@ -2,6 +2,8 @@
   import { onMount, tick, type ComponentType } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
+  import { resolveVariant, loadSpellingPref } from "./lib/locale";
+  import { getVersion } from "@tauri-apps/api/app";
   import DebugPanel from "./routes/DebugPanel.svelte";
   import Today from "./routes/Today.svelte";
   import Progress from "./routes/Progress.svelte";
@@ -33,7 +35,16 @@
   // "Replay onboarding" sets the flag false AFTER mount, within a session, so
   // this one-shot mount reconciliation doesn't undo it.)
   let firstRunResolved = false;
+  // About screen — the app's REAL version, read at runtime from the bundle
+  // (tauri.conf.json / Cargo), never a hardcoded string that drifts. Empty
+  // until resolved; the About copy tolerates a blank for the first frame.
+  let appVersion = "";
   onMount(async () => {
+    try {
+      appVersion = await getVersion();
+    } catch {
+      // Best-effort — the About line just renders without a number.
+    }
     try {
       // TWO-WAY reconciliation — the backend `is_first_run` is authoritative.
       // `ta.onboarded` lives in the WebKit data store, which survives app
@@ -45,6 +56,17 @@
       // If the check fails, fall back to the stored flag as-is.
     }
     firstRunResolved = true;
+    // UK English (v0.3.0): tell the engine which spelling variant to SUGGEST in,
+    // resolved from the OS locale here in L5 (membership already accepts both
+    // spellings). Best-effort + fire-once; a failure just leaves the engine's
+    // American default. `resolveVariant` returns exactly "american" | "british".
+    try {
+      await invoke("set_spelling_variant", {
+        variant: resolveVariant(loadSpellingPref()),
+      });
+    } catch {
+      // Non-fatal — engine keeps its default variant.
+    }
     if ($onboarded) {
       // Existing-user shell just mounted — land the focus ring as the normal
       // launch path would (the sibling onMount's focus call ran before the gate).
@@ -350,7 +372,8 @@
       <Settings />
     {:else if route === "about"}
       <!-- About — copy verbatim from design doc Section 08 About panel. Reuses
-           the Privacy wrapper/typography. Version is the app's actual 0.1.0. -->
+           the Privacy wrapper/typography. Version is read at runtime from the
+           bundle (see `appVersion`), never hardcoded. -->
       <header class="screen-header"><h1>{activeLabel}</h1></header>
       <div class="privacy about-stack">
         <!-- The TenCalmDigits hand mark (Noto 🖐, credited below). Decorative —
@@ -376,7 +399,7 @@
           The more we type together, the better I come to know your hands. Everything I learn stays
           right here on your Mac — no cloud, no account, no one else.
         </p>
-        <p class="about-foot">TenCalmDigits · version 0.1.0 — everything stays on your Mac.</p>
+        <p class="about-foot">TenCalmDigits · version {appVersion} — everything stays on your Mac.</p>
       </div>
     {:else if route === "privacy"}
       <!-- Privacy & Terms — copy is verbatim from design doc Section 08 (honesty

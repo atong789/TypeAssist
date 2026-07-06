@@ -41,8 +41,9 @@ use correction_engine::{
     ranked_known_candidates, score_candidates, should_log, target_is_recordable, AnchorTracker,
     Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome, GuessLedger, Lexicon,
     LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver,
-    PatternReadiness, ScoredCandidate, SlipClass, StabilityReport, Token, TokenKind, Tokenizer,
-    WordFreq, WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION, DECISION_VERSION, LEXICON_VERSION,
+    PatternReadiness, ScoredCandidate, SlipClass, SpellingVariant, StabilityReport, Token,
+    TokenKind, Tokenizer, WordFreq, WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION,
+    DECISION_VERSION, LEXICON_VERSION,
     MAX_PATTERN_EDIT_DISTANCE, MAX_PATTERN_LENGTH_DIFF, SCORE_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -380,6 +381,14 @@ pub enum EngineControl {
     /// and reset the correction gate to **off**. Emits [`EVT_DATA_DELETED`] plus
     /// the refreshed [`EVT_CORRECTION_STATE`] / [`EVT_LEARNED_SNAPSHOT`].
     DeleteAllData,
+    /// **UK English (v0.3.0) — locale-driven suggestion spelling.** Set the
+    /// spelling variant a suggestion should use for a variant word (US-locale →
+    /// `color`, UK-locale → `colour`). Detected in L5 from the webview locale
+    /// (`navigator.language`) and pushed here at startup; the engine applies it
+    /// only to the *suggested* target of a genuine motor slip
+    /// ([`correction_engine::spelling_variant`]) — membership stays dialect-blind
+    /// (both spellings always valid). Never persisted; no OS read in L2–L4.
+    SetSpellingVariant(SpellingVariant),
 }
 
 /// Tauri-managed handle for sending [`EngineControl`] messages to
@@ -3332,6 +3341,12 @@ pub fn spawn<R: Runtime>(
         // keystroke past the word, a caret move, the ~5s timeout, or a newer
         // suggestion — so an accept only ever injects against the live caret.
         let mut pending_suggestion: Option<PendingSuggestion> = None;
+        // UK English (v0.3.0): the spelling variant a suggestion should use for a
+        // variant word, set from the OS locale by L5 via
+        // `EngineControl::SetSpellingVariant`. Defaults to American until L5
+        // reports — safe, since it only rewrites British-spelled targets and
+        // leaves everything else as typed. Never persisted (Principle #8).
+        let mut spelling_variant = SpellingVariant::default();
         // Count of injected events (backspaces + replacement chars) we still
         // expect to see echoed back through the L1 tap. The tap re-captures our
         // own injection (`.cgSessionEventTap` sees posted events), so each
@@ -4529,6 +4544,20 @@ pub fn spawn<R: Runtime>(
                                                                 // `lead`/`trail`/`outer_trail_len`) while the
                                                                 // stripped-off quotes are still in scope.
                                                                 fire = suggestion.map(|(t, g)| {
+                                                                    // UK English (v0.3.0): rewrite the
+                                                                    // suggested spelling to the system
+                                                                    // locale's variant (color↔colour) —
+                                                                    // suggestion only; membership already
+                                                                    // accepts both. No-op for non-variant
+                                                                    // words. This is the SINGLE place the
+                                                                    // target spelling is finalised, so the
+                                                                    // injected text and the Esc-undo (which
+                                                                    // both read `ps.target`) stay in lockstep.
+                                                                    let g = correction_engine::localize_spelling(
+                                                                        &g,
+                                                                        spelling_variant,
+                                                                    )
+                                                                    .unwrap_or(g);
                                                                     let g = match_source_case(&t, &g);
                                                                     PendingSuggestion {
                                                                         typed: t,
@@ -4933,6 +4962,20 @@ pub fn spawn<R: Runtime>(
                             // on/off, no app id, no text.
                             prompted_capture_active = active;
                             tracing::info!("PROMPTED_CAPTURE active={active}");
+                        }
+                        EngineControl::SetSpellingVariant(variant) => {
+                            // UK English (v0.3.0): L5 resolved the OS locale to a
+                            // spelling variant; adopt it for future suggestions.
+                            // Content-free (a two-value enum), never persisted.
+                            spelling_variant = variant;
+                            // Flip the lexicon's locale gate: the opposite-locale
+                            // spelling of every VarCon pair becomes unknown, so a
+                            // garble converges only on the locale spelling and a
+                            // cleanly-typed opposite variant routes through the
+                            // slip engine toward it (LOCALE wins over incidental
+                            // learning). Single source of truth for membership.
+                            Lexicon::shared().set_spelling_variant(variant);
+                            tracing::info!("SPELLING_VARIANT set to {variant:?}");
                         }
                         EngineControl::SetCorrectionEnabled(enabled) => {
                             // M3 Step 1 master gate — the instant global on/off.

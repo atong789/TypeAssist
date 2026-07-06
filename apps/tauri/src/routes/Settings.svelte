@@ -22,11 +22,17 @@
     pickAndPreviewBackup,
     type RestoreSummary,
   } from "../lib/dataActions";
+  import { resolveVariant, loadSpellingPref } from "../lib/locale";
 
-  // ---- Warm-up language — fixed to English (US) for beta. The locale
-  // machinery (lib/locale.ts) stays in place and Practice still reads the
-  // stored pref; we just don't surface a picker until UK English ships, so
-  // there's no control state to hold here.
+  // ---- Language — the active English spelling, resolved from the system
+  // locale (or an override in lib/locale). Read-only by design: no picker
+  // (Principle #5). It drives both the warm-up/Practice spelling AND the
+  // engine's correction-suggestion spelling (v0.3.0 locale gate). Resolved on
+  // mount; Settings is recreated on navigation, so it reflects the current OS.
+  const activeLanguage =
+    resolveVariant(loadSpellingPref()) === "british"
+      ? "English (UK)"
+      : "English (US)";
 
   // ---- Corrections master gate — the SAME on/off as the menu-bar toggle and
   // Today's offer card (one source of truth). Off by default; the engine never
@@ -137,12 +143,12 @@
   <span>Observing your typing · Everything stays on this Mac</span>
 </div>
 
-<!-- 2) Warm-up language — fixed to English (US) for beta. Non-interactive: the
-     picker is unsurfaced (no slider/segmented control), the locale code stays. -->
+<!-- 2) Language — the active English spelling, resolved from the system locale.
+     Read-only by design: no picker (Principle #5). Drives warm-up spelling and
+     correction suggestions alike. -->
 <section class="group">
-  <h2 class="group-label">Warm-up language</h2>
-  <p class="lang-fixed">English (US)</p>
-  <p class="lang-note">UK English coming after beta.</p>
+  <h2 class="group-label">Language</h2>
+  <p class="lang-fixed">{activeLanguage}</p>
 </section>
 
 <!-- 3) Corrections — one always-available On/Off (no readiness gate). Same state
@@ -280,17 +286,11 @@
     color: var(--text-secondary);
   }
 
-  /* ---- warm-up language (fixed label for beta; picker unsurfaced) ---- */
+  /* ---- language (read-only active spelling; no picker) ---- */
   .lang-fixed {
     margin: 0;
     font-size: 0.95rem;
     font-weight: 600;
-  }
-  .lang-note {
-    margin: 0.3rem 0 0;
-    font-size: 0.85rem;
-    line-height: 1.5;
-    color: var(--text-secondary);
   }
 
   /* ---- corrections row ---- */

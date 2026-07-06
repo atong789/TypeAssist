@@ -547,6 +547,17 @@ impl LexiconProposer {
 
         let word = record.original_text.clone();
 
+        // Learner guard (v0.3.0 locale gate): never learn a VarCon spelling
+        // variant. Once L5 sets a locale the opposite-locale spelling is
+        // unknown (a slip toward the locale spelling); if the proposer then
+        // confirmed it, `lex.learn` would try to re-add it to "known" and the
+        // learning-suppression leak would return. The locale-correct spelling
+        // is already bundled-known, so it never needs learning either. Novel
+        // words (names, jargon) are not in the map — they learn normally.
+        if crate::spelling_variant::is_variant_word(&word) {
+            return ProposalUpdate::empty();
+        }
+
         // Idempotency check.
         if let Some(prev) = self.record_contributions.get(&record.id) {
             if prev.outcome == record.outcome && prev.word == word {
@@ -1278,6 +1289,29 @@ mod tests {
         }
         assert_eq!(p.get("Krutrim").unwrap().tier, ProposalTier::Confirmed);
         assert_eq!(p.get("Krutrim").unwrap().occasions, 3);
+    }
+
+    #[test]
+    fn spelling_variants_are_never_learned() {
+        // Learner guard (v0.3.0 locale gate): a VarCon spelling variant must
+        // never be proposed or confirmed — otherwise a learned opposite-locale
+        // spelling would re-enter `is_known` and suppress the locale correction
+        // again. Even after enough clean-motor Kept occasions to confirm any
+        // other word, the variant leaves NO proposal trace.
+        let mut ledger = DecisionLedger::new();
+        let _g = serial_setup();
+        let mut p = LexiconProposer::new();
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
+            let id = append_fast(&mut ledger, "colour", clean_motor("colour"));
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            let update = p.note_record(&kept);
+            assert!(update.changes.is_empty(), "variant word must not move any tier");
+        }
+        assert!(p.get("colour").is_none(), "variant word must not be proposed");
+        assert!(
+            !Lexicon::shared().is_learned("colour"),
+            "variant word must never enter the learned set"
+        );
     }
 
     // ---- Slow-lane promotion path --------------------------------------

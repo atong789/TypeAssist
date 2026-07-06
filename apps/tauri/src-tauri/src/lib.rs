@@ -55,6 +55,27 @@ fn set_learning_paused(
         .map_err(|e| format!("engine control channel closed: {e}"))
 }
 
+/// Tauri command: set the spelling variant used for locale-aware suggestions
+/// (UK English, v0.3.0). The webview resolves the OS locale to `"american"` /
+/// `"british"` (`lib/locale.ts`) and calls this once at startup. Membership is
+/// unaffected — both spellings are always valid; this only steers which variant
+/// a suggested motor-slip fix is offered in. Unknown strings are ignored (engine
+/// keeps its American default). No OS read here — the locale came from L5.
+#[tauri::command]
+fn set_spelling_variant(
+    variant: String,
+    sender: tauri::State<EngineControlSender>,
+) -> Result<(), String> {
+    let v = match variant.as_str() {
+        "british" => correction_engine::SpellingVariant::British,
+        "american" => correction_engine::SpellingVariant::American,
+        other => return Err(format!("unknown spelling variant: {other}")),
+    };
+    sender
+        .send(EngineControl::SetSpellingVariant(v))
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
 /// Tauri command: hard-pause the engine. While true, Key/Backspace
 /// events from the sidecar are dropped at the engine task boundary —
 /// before model.ingest, before tokenization, before any emission.
@@ -1218,6 +1239,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             reset_lexicon,
             set_learning_paused,
+            set_spelling_variant,
             set_input_paused,
             restart_capture,
             start_capture,

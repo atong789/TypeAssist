@@ -32,6 +32,7 @@ pub mod persist;
 pub mod resolver;
 pub mod score;
 pub mod slip_class;
+pub mod spelling_variant;
 pub mod tokenizer;
 pub mod trigram;
 pub mod word_freq;
@@ -85,6 +86,7 @@ pub use score::{
     confidence_for, score_candidates, Confidence, ConfidenceReport, EditType, ScoredCandidate,
     CONFIDENCE_HIGH_FLOOR, CONFIDENCE_LOW_FLOOR, CONFIDENCE_MEDIUM_FLOOR, SCORE_VERSION,
 };
+pub use spelling_variant::{localize as localize_spelling, SpellingVariant};
 pub use slip_class::{
     classify_slip, corrected_target_indices, involved_keys, motor_edit_within_budget,
     single_motor_edit, transposition_keys, MotorEdit, SlipClass, SLIP_CLASS_VERSION,
