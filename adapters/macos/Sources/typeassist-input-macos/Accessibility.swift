@@ -134,44 +134,16 @@ enum Accessibility {
     // structurally cannot fire outside the confirmed dead zone (Chrome = different
     // bundle; native = different app/field; Apple Silicon = different arch).
 
-    /// Toggle read from `~/.typeassist/inject_config` (honoring `TYPEASSIST_DATA_DIR`)
-    /// so the suppression can be A/B'd in place — `suppress=on` enables it, absent
-    /// or `off` keeps today's behaviour. Parsed fresh per focus-eval (infrequent).
-    static func suppressDeadZoneEnabled() -> Bool {
-        let env = ProcessInfo.processInfo.environment
-        let dir: URL
-        if let d = env["TYPEASSIST_DATA_DIR"], !d.isEmpty {
-            dir = URL(fileURLWithPath: d)
-        } else if let home = env["HOME"], !home.isEmpty {
-            dir = URL(fileURLWithPath: home).appendingPathComponent(".typeassist")
-        } else {
-            return false
-        }
-        guard let text = try? String(
-            contentsOf: dir.appendingPathComponent("inject_config"), encoding: .utf8)
-        else { return false }
-        for raw in text.split(separator: "\n") {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.isEmpty || line.hasPrefix("#") { continue }
-            let parts = line.split(separator: "=", maxSplits: 1).map {
-                $0.trimmingCharacters(in: .whitespaces).lowercased()
-            }
-            if parts.count == 2, parts[0] == "suppress" {
-                return ["on", "1", "true", "yes"].contains(parts[1])
-            }
-        }
-        return false
-    }
-
     /// True when the focused field is the confirmed injection dead zone:
     /// **Intel (x86_64) + Safari frontmost + focused role `AXTextArea`** (the
     /// web/contenteditable surface that vends the phantom caret — Docs / Gmail /
-    /// WhatsApp Web all match). Content-blind: reads the frontmost bundle id
-    /// (ephemeral, never persisted — Principle #8) and the focused element's ROLE
-    /// only, never its text. On Apple Silicon the `#if` compiles this to `false`,
-    /// so the arm64 slice can never suppress.
+    /// WhatsApp Web all match). Raw structural fact — the `suppress` toggle is
+    /// applied ENGINE-side (a faceless L1 adapter must not depend on reading the
+    /// user's config dir; that mismatch was the TF-08b `emit=false` bug). Content-
+    /// blind: reads the frontmost bundle id (ephemeral, never persisted — Principle
+    /// #8) and the focused element's ROLE only, never its text. On Apple Silicon the
+    /// `#if` compiles this to `false`, so the arm64 slice can never suppress.
     static func isInjectionDeadZone() -> Bool {
-        guard suppressDeadZoneEnabled() else { return false }
         #if arch(x86_64)
         primeAXConnection()
         guard let front = NSWorkspace.shared.frontmostApplication,
@@ -185,6 +157,105 @@ enum Accessibility {
         #else
         return false
         #endif
+    }
+
+    // MARK: - TF-08b web-host detection (weld suppression gate)
+    //
+    // In a web/contenteditable host (Google Docs/Gmail in any browser, on any
+    // arch), a competing WEB autocorrect can shrink a word a beat before Jordan's
+    // accept, so her dead-reckoned delete count over-deletes into the previous word
+    // — the weld. Read-back can't rescue it (content-blind wall + TF-08's phantom
+    // caret), and Jordan is web-blind to the competitor. So the engine WITHHOLDS
+    // only length-changing corrections (`len(typed) != len(target)`, the exact
+    // weld-risk set) in web hosts, ceding that word to the host. This is the L1
+    // half: report whether the focused field is a web host.
+    //
+    // "Web host" = the focused element has an `AXWebArea` ancestor. That role marks
+    // rendered web content in WebKit (Safari) and Chromium (Chrome/Edge/Electron),
+    // and is ABSENT for native fields (TextEdit/Notes are `AXTextArea` with no web
+    // ancestor) — so this fires in browsers/Electron and never in native apps,
+    // regardless of arch (Chrome-web welds on Silicon too). Content-blind: reads
+    // element ROLES only, never text.
+
+    private static let webAncestorMaxHops = 12
+
+    /// Browser bundle ids — the FALLBACK web-host signal for canvas/iframe editors
+    /// (Google Docs) whose degraded AX subtree defeats the AXWebArea ancestor walk.
+    /// Docs/Gmail/any web tab runs in one of these, and the bundle id is readable
+    /// regardless of how the page vends AX. (Electron web apps still detect via the
+    /// AXWebArea walk, so they don't need to be listed.)
+    private static let browserBundleIDs: Set<String> = [
+        "com.apple.Safari", "com.apple.SafariTechnologyPreview",
+        "com.google.Chrome", "com.google.Chrome.canary", "com.google.Chrome.beta",
+        "com.microsoft.edgemac", "com.brave.Browser", "com.brave.Browser.beta",
+        "org.mozilla.firefox", "com.operasoftware.Opera", "com.vivaldi.Vivaldi",
+        "company.thebrowser.Browser", "com.kagi.kagimacOS",
+        "com.duckduckgo.macos.browser",
+    ]
+
+    /// Whether the focused field is a web content host, plus a rich detail string
+    /// for the validation log. Two signals, OR'd:
+    ///   1. **AXWebArea ancestor** — walk the focused element's `AXParent` chain for
+    ///      an `AXWebArea` (rendered web content). Works for normal contenteditable
+    ///      (Gmail) and Electron; runtime-derived. But **Google Docs** is a
+    ///      canvas-rendered editor whose input target sits in an offscreen iframe
+    ///      with a degraded AX subtree, so the walk dead-ends before AXWebArea.
+    ///   2. **Browser bundle id** (fallback) — the frontmost app is a known browser.
+    ///      Rescues Docs (and any web surface the walk misses) since the bundle id
+    ///      doesn't depend on the page's AX tree.
+    /// Content-blind: reads element ROLES / SUBROLES and the app bundle id (an
+    /// ephemeral, never-persisted read — Principle #8), never text. The `detail`
+    /// records the full role chain + why the walk stopped, so a dev run confirms
+    /// exactly where Docs' AX chain breaks.
+    static func webHostDetail() -> (isWeb: Bool, detail: String) {
+        primeAXConnection()
+        guard let front = NSWorkspace.shared.frontmostApplication else {
+            return (false, "no-frontmost")
+        }
+        let bundle = front.bundleIdentifier ?? "?"
+        let isBrowser = browserBundleIDs.contains(bundle)
+
+        func roleSub(_ e: AXUIElement) -> String {
+            let r = (copyAttr(e, kAXRoleAttribute as String) as? String) ?? "?"
+            let s = (copyAttr(e, kAXSubroleAttribute as String) as? String) ?? "-"
+            return s == "-" ? r : "\(r)/\(s)"
+        }
+
+        guard let f = copyAttr(
+                AXUIElementCreateApplication(front.processIdentifier),
+                kAXFocusedUIElementAttribute as String),
+              CFGetTypeID(f) == AXUIElementGetTypeID() else {
+            // No focused element to walk — the browser fallback still decides.
+            return (isBrowser, "bundle=\(bundle) browser=\(isBrowser) focused=none")
+        }
+
+        var el = f as! AXUIElement
+        var chain = [roleSub(el)]
+        var foundWebArea = false
+        var stop = "depth-cap"
+        for _ in 0..<webAncestorMaxHops {
+            guard let p = copyAttr(el, kAXParentAttribute as String),
+                  CFGetTypeID(p) == AXUIElementGetTypeID() else {
+                stop = "nil-parent"
+                break
+            }
+            let parent = p as! AXUIElement
+            chain.append(roleSub(parent))
+            if (copyAttr(parent, kAXRoleAttribute as String) as? String) == "AXWebArea" {
+                foundWebArea = true
+                stop = "found-AXWebArea"
+                break
+            }
+            el = parent
+        }
+
+        let isWeb = foundWebArea || isBrowser
+        let method = foundWebArea ? "webarea" : (isBrowser ? "browser-fallback" : "none")
+        return (
+            isWeb,
+            "bundle=\(bundle) browser=\(isBrowser) method=\(method) stop=\(stop) "
+                + "chain=\(chain.joined(separator: ">"))"
+        )
     }
 
     // MARK: - Phase 0 / M3 overlay feasibility probe

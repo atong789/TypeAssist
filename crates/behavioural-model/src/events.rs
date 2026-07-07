@@ -93,11 +93,32 @@ pub enum InputEvent {
     /// cue) — never a "worse autocorrect" (Principle #9). This supersedes the Watch
     /// Dog competition there (nothing is injected, so nothing double-corrects).
     ///
-    /// A **level** signal (not an edge), re-emitted on focus change only when it
-    /// flips; the pre-signal default is `false` (inject as normal), so nothing
-    /// changes for native fields, Chrome, or Apple Silicon. Content-free (Principle
-    /// #8): a single bool — never the app id, field role, or arch that derived it.
+    /// A **level** signal, re-evaluated on the adapter heartbeat and emitted only
+    /// when it flips. `dead` is the **raw** structural fact (arch + Safari +
+    /// AXTextArea) — the `suppress` toggle is applied engine-side, not by the
+    /// adapter. The pre-signal default is `false`, so nothing changes for native
+    /// fields, Chrome, or Apple Silicon. Content-free (Principle #8): a single
+    /// bool — never the app id, field role, or arch that derived it.
     InjectionZone { dead: bool },
+    /// **Web/contenteditable host signal (TF-08b, weld suppression).** The L1
+    /// adapter reports whether the focused field lives inside a web content area
+    /// (an `AXWebArea` ancestor, OR — fallback — the frontmost app is a browser,
+    /// which rescues Google Docs' canvas editor whose degraded AX subtree defeats
+    /// the walk). In such a host a competing **web** autocorrect (Google Docs/Gmail)
+    /// can shrink a word a beat before Jordan's accept, so Jordan's dead-reckoned
+    /// delete count over-deletes into the previous word (the weld). The engine pairs
+    /// this with a length-delta test (`len(typed) != len(target)`, the exact
+    /// weld-risk set) to WITHHOLD only length-changing corrections in web hosts —
+    /// ceding that one word to the host. Same-length slips, and every slip in native
+    /// apps, are untouched.
+    ///
+    /// A **level** signal, re-evaluated on the adapter heartbeat and emitted only
+    /// when it flips. `web` is the **raw** web-host fact — the `weld_suppress`
+    /// toggle is applied engine-side, not by the adapter (a faceless L1 adapter must
+    /// not depend on reading the user's config dir). The pre-signal default is
+    /// `false`. Content-free (Principle #8): a single bool, never the app id or
+    /// field role that derived it.
+    WebHost { web: bool },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -265,6 +286,30 @@ mod tests {
         let e = InputEvent::SpaceObserved { total: 42 };
         let json = serde_json::to_string(&e).unwrap();
         assert_eq!(json, r#"{"type":"space_observed","total":42}"#);
+        let back: InputEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn injection_zone_event_round_trips() {
+        // TF-08: L1 reports whether the focused field is an injection dead zone
+        // (host-scoped suppression). snake_case tag + `dead` field must match the
+        // Swift bridge's `injection_zone` encoding.
+        let e = InputEvent::InjectionZone { dead: true };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(json, r#"{"type":"injection_zone","dead":true}"#);
+        let back: InputEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn web_host_event_round_trips() {
+        // TF-08b: L1 reports whether the focused field is a web/contenteditable
+        // host (weld suppression). snake_case tag + `web` field must match the
+        // Swift bridge's `web_host` encoding.
+        let e = InputEvent::WebHost { web: true };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(json, r#"{"type":"web_host","web":true}"#);
         let back: InputEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
     }

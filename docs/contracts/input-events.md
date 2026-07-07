@@ -57,10 +57,18 @@ Emitted on every **deliberate (non-auto-repeat) space keyDown**, carrying the ad
 
 ### `injection_zone`
 
-**TF-08 host-scoped suppression.** Reports whether the focused field is a place a synthetic delete+retype correction **cannot** land. The confirmed case is a Safari web/contenteditable surface on **Intel (x86_64)**, whose AX caret is a pinned phantom (`loc=1`, no tracking — TF-08 probe), so blind dead-reckoned injection garbles or no-ops. In the dead zone the core goes **watch-only**: it keeps observing/learning slips but withholds the bubble entirely (no cue), rather than fire a "worse autocorrect" (Principle #9). Derived in the adapter from arch + frontmost bundle (Safari) + focused role (`AXTextArea`) — a structural gate that cannot fire on Chrome (different bundle), native apps (different app/field), or Apple Silicon (different arch). The adapter sets `dead: true` only when the field is a dead zone **and** the `suppress` toggle is on, so the pre-signal / toggle-off default is `false`. A **level** signal, re-emitted on focus change only when it flips. Content-free (Principle #8): a single bool, never the app id, field role, or arch.
+**TF-08 host-scoped suppression.** Reports whether the focused field is a place a synthetic delete+retype correction **cannot** land. The confirmed case is a Safari web/contenteditable surface on **Intel (x86_64)**, whose AX caret is a pinned phantom (`loc=1`, no tracking — TF-08 probe), so blind dead-reckoned injection garbles or no-ops. In the dead zone the core goes **watch-only**: it keeps observing/learning slips but withholds the bubble entirely (no cue), rather than fire a "worse autocorrect" (Principle #9). Derived in the adapter from arch + frontmost bundle (Safari) + focused role (`AXTextArea`) — a structural gate that cannot fire on Chrome (different bundle), native apps (different app/field), or Apple Silicon (different arch). `dead` is the **raw** structural fact; the core applies the `suppress` toggle (read core-side from `~/.typeassist/inject_config`, default on). A **level** signal, re-evaluated on the adapter heartbeat and emitted only when it flips. Content-free (Principle #8): a single bool, never the app id, field role, or arch.
 
 ```json
 { "type": "injection_zone", "dead": true }
+```
+
+### `web_host`
+
+**TF-08b weld suppression.** Reports whether the focused field lives inside a web/contenteditable host — an `AXWebArea` ancestor **or** (fallback) the frontmost app is a browser. The AXWebArea walk covers normal contenteditable (Gmail) and Electron; the browser-bundle fallback rescues **Google Docs**, whose canvas editor keeps an offscreen input target with a degraded AX subtree that the walk can't reach. In such a host a competing **web** autocorrect can shrink a word a beat before the user's accept, so the core's dead-reckoned delete over-deletes into the previous word (the weld). The core pairs this with a length-delta test (`len(typed) != len(target)`) and **withholds only length-changing corrections in web hosts**, ceding that word to the host. `web` is the **raw** fact; the core applies the `weld_suppress` toggle (read engine-side from `~/.typeassist/inject_config`, default on). A **level** signal, re-evaluated on the adapter heartbeat and emitted only when it flips. Content-free (Principle #8): a single bool, never the app id or field role.
+
+```json
+{ "type": "web_host", "web": true }
 ```
 
 ### `shift_tap`

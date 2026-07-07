@@ -60,9 +60,17 @@ enum InputEvent {
     /// the focused field is a place a synthetic correction can't land — the
     /// confirmed case is a Safari web/contenteditable surface on Intel (phantom AX
     /// caret). The engine goes watch-only there (keeps learning, withholds the
-    /// bubble). Level signal, emitted on focus change only when it flips.
-    /// Content-free (a single bool). See `InputEvent::InjectionZone`.
+    /// bubble). Raw structural fact; the engine applies the `suppress` toggle. Level
+    /// signal, re-evaluated on the heartbeat, emitted when it flips. Content-free.
+    /// See `InputEvent::InjectionZone`.
     case injectionZone(dead: Bool)
+    /// **Web/contenteditable host (TF-08b, weld suppression).** `web=true` when the
+    /// focused field is a web host — inside an `AXWebArea` OR the frontmost app is a
+    /// browser (the fallback for Google Docs' canvas editor, whose AX subtree
+    /// defeats the walk). Raw fact; the engine applies the `weld_suppress` toggle
+    /// and the length-delta test. Level signal, emitted when it flips (re-evaluated
+    /// on the heartbeat). Content-free. See `InputEvent::WebHost`.
+    case webHost(web: Bool)
 }
 
 enum OutboundCommand {
@@ -165,6 +173,8 @@ final class Bridge {
             payload = ["type": "space_observed", "total": total]
         case let .injectionZone(dead):
             payload = ["type": "injection_zone", "dead": dead]
+        case let .webHost(web):
+            payload = ["type": "web_host", "web": web]
         }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
               let s = String(data: data, encoding: .utf8) else {
