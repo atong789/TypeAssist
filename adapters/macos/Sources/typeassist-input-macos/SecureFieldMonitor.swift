@@ -247,6 +247,27 @@ final class SecureFieldMonitor {
             FileHandle.standardError.write(
                 Data("SECURE_FIELD_FOCUS \(secure ? "ENTER" : "LEAVE") tid=\(threadID())\n".utf8))
         }
+        // TF-08: re-evaluate the injection dead zone on the same focus-eval cadence
+        // (focus / app change — never per keystroke). Emitted OUTSIDE the lock.
+        updateInjectionZone()
+    }
+
+    /// Last dead-zone value emitted to the engine, so we only send on a FLIP (a
+    /// level signal, one line per transition — not per focus event). `nil` until
+    /// the first evaluation so the initial state is always emitted once.
+    private var lastInjectionDead: Bool?
+
+    /// TF-08 host-scoped suppression: compute the injection dead-zone bool
+    /// (arch + Safari + web-field, gated by the `suppress` toggle) and emit it to
+    /// the engine only when it changes. Content-free — a single bool crosses the
+    /// wire, never the app/field that derived it (Principle #8).
+    private func updateInjectionZone() {
+        let dead = Accessibility.isInjectionDeadZone()
+        guard lastInjectionDead != dead else { return }
+        lastInjectionDead = dead
+        FileHandle.standardError.write(
+            Data("INJECTION_ZONE_EMIT dead=\(dead) tid=\(threadID())\n".utf8))
+        bridge.emit(.injectionZone(dead: dead))
     }
 
     /// True iff the app's focused UI element is a secure / password text field.

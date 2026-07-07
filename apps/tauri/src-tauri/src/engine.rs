@@ -949,6 +949,15 @@ struct Funnel {
     /// engine WOULD have surfaced but withheld so it doesn't double-correct the
     /// host. Idiosyncratic fixes are never counted here (they always fire).
     competitor_deferred: u64,
+    /// **TF-08 host-scoped suppression (Principle #7).** Times Jordan went
+    /// watch-only on a would-fire suggestion because L1 reported the focused field
+    /// as an injection dead zone (Safari web/contenteditable on Intel — phantom AX
+    /// caret; a synthetic fix can't land). A deliberate, visible drop: the engine
+    /// WOULD have surfaced the bubble but withheld it (no cue) rather than garble
+    /// the field. Kept observing/learning regardless. Distinct from
+    /// `competitor_deferred` (host-redundant deferral); the dead zone withholds
+    /// ALL fixes, not just redundant ones.
+    dead_zone_suppressed: u64,
     /// **L1 space-drop detection (Principle #7, QA-15 Step 1 — observe-only).**
     /// `space_observed` is the latest cumulative space-keyDown total the L1 tap
     /// reported ([`InputEvent::SpaceObserved`]); `space_accepted` is the spaces
@@ -1012,7 +1021,8 @@ impl Funnel {
              corr_sug: {}, corr_oth: {}, abandoned: {}}}, c_motor_observations: {{kept: {}, \
              slip: {}}}, c_motor_saves: {}, c_word_patterns: {{observed: {}, skipped: {}}}, \
              c_word_pattern_saves: {}, c_corrections: {{applied: {}, undone: {}}}, \
-             c_competitor_deferred: {}, c_space: {{observed: {}, accepted: {}, \
+             c_competitor_deferred: {}, c_dead_zone_suppressed: {}, \
+             c_space: {{observed: {}, accepted: {}, \
              drops_suspected: {}}}, session_started_at: {} }}",
             self.keystrokes_received,
             self.autorepeat_dropped,
@@ -1032,6 +1042,7 @@ impl Funnel {
             self.corrections_applied,
             self.corrections_undone,
             self.competitor_deferred,
+            self.dead_zone_suppressed,
             self.space_observed,
             self.space_accepted,
             self.space_drops_suspected,
@@ -3271,6 +3282,14 @@ pub fn spawn<R: Runtime>(
         // `tick_resolver`; read by the fire gate; reset on focus change; decayed
         // by the watchdog.
         let mut competitor_sense = CompetitorSense::default();
+        // TF-08 host-scoped suppression: the latest injection dead-zone verdict
+        // from L1 (`InputEvent::InjectionZone`). `true` ⇒ the focused field is a
+        // place a synthetic correction can't land (Safari web/contenteditable on
+        // Intel — phantom AX caret), so the fire gate goes WATCH-ONLY there:
+        // keep observing/learning, withhold the bubble (no cue). Level signal,
+        // updated on focus change; default `false` so nothing changes for native
+        // fields, Chrome, or Apple Silicon.
+        let mut injection_dead_zone = false;
         // Daily-snapshot bookkeeping (Principle #6): the calendar date whose
         // snapshot we've already handled this run, seeded from the newest dated
         // file on disk so the first event of a *new* calendar day is detected
@@ -3684,6 +3703,17 @@ pub fn spawn<R: Runtime>(
                                     funnel.space_accepted,
                                     suspected,
                                 );
+                            }
+                        }
+                        InputEvent::InjectionZone { dead } => {
+                            // TF-08 host-scoped suppression: L1 reports whether the
+                            // focused field is an injection dead zone (Safari
+                            // web/contenteditable on Intel — phantom AX caret).
+                            // Level signal, so only a flip is logged. Drives the
+                            // watch-only fire gate; ingests nothing, counts nothing.
+                            if dead != injection_dead_zone {
+                                injection_dead_zone = dead;
+                                tracing::info!("INJECTION_ZONE dead={dead}");
                             }
                         }
                         InputEvent::PermissionRequired => {
@@ -4521,17 +4551,29 @@ pub fn spawn<R: Runtime>(
                                                         // `competitor_deferred` is a content-free verdict bool
                                                         // (Principle #8): it never names the app or the reason's source.
                                                         tracing::info!(
-                                                            "FIRE_DECISION word={:?} gate_on={} suggestion={:?} apostrophe_suppressed={} competitor_deferred={} t1={} t1_minus_t0_ms={}",
+                                                            "FIRE_DECISION word={:?} gate_on={} suggestion={:?} apostrophe_suppressed={} competitor_deferred={} dead_zone={} t1={} t1_minus_t0_ms={}",
                                                             tok.core,
                                                             allow_list.correction_enabled,
                                                             suggestion.as_ref().map(|(t, g)| format!("{t}->{g}")),
                                                             apostrophe_suppressed,
                                                             competitor_deferred,
+                                                            injection_dead_zone,
                                                             t1,
                                                             t1.saturating_sub(t_recv),
                                                         );
                                                         if allow_list.correction_enabled {
-                                                            if competitor_deferred {
+                                                            if injection_dead_zone {
+                                                                // TF-08 dead zone (Safari-web/Intel
+                                                                // phantom caret): a synthetic fix can't
+                                                                // land, so WATCH-ONLY — withhold the bubble
+                                                                // entirely (silent, no cue) while the
+                                                                // observation/learning below runs as normal.
+                                                                // Supersedes the competitor deferral (we
+                                                                // inject nothing, so nothing double-corrects).
+                                                                // A deliberate, counted drop (Principle #7);
+                                                                // `fire` stays None.
+                                                                funnel.dead_zone_suppressed += 1;
+                                                            } else if competitor_deferred {
                                                                 // A live bubble withheld to avoid
                                                                 // double-correcting the host — a deliberate,
                                                                 // counted drop (Principle #7). `fire` stays

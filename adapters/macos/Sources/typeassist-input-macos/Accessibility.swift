@@ -115,6 +115,78 @@ enum Accessibility {
         up.post(tap: .cgSessionEventTap)
     }
 
+    // MARK: - TF-08 host-scoped suppression (injection dead-zone gate)
+    //
+    // TF-08 established that a synthetic delete+retype correction cannot land in a
+    // Safari web/contenteditable surface on Intel: its AX caret is a pinned phantom
+    // (`loc=1`, writes hit a ghost AXTextArea — probe TF-08), so injection garbles
+    // or no-ops. Neither HID-tap nor pacing fixed placement (both tried and
+    // rejected). The fix is host-scoped suppression: in that confirmed dead zone
+    // the engine goes WATCH-ONLY (keeps learning, withholds the bubble).
+    //
+    // The condition is derived, NOT hardcoded-behaviour-in-the-engine: the sidecar
+    // (the only place OS/AX calls live) reads arch + frontmost bundle + focused
+    // role and reports a single content-free bool. It is deliberately a STRUCTURAL
+    // gate, not a runtime caret-trust signal, because caret-untrustworthiness does
+    // NOT predict injection failure — Chrome-web likely vends an equally poor AX
+    // caret yet its keystroke injection WORKS, so a pure caret signal would
+    // wrongly suppress Chrome. Gating on arch+app+field is the only signal that
+    // structurally cannot fire outside the confirmed dead zone (Chrome = different
+    // bundle; native = different app/field; Apple Silicon = different arch).
+
+    /// Toggle read from `~/.typeassist/inject_config` (honoring `TYPEASSIST_DATA_DIR`)
+    /// so the suppression can be A/B'd in place — `suppress=on` enables it, absent
+    /// or `off` keeps today's behaviour. Parsed fresh per focus-eval (infrequent).
+    static func suppressDeadZoneEnabled() -> Bool {
+        let env = ProcessInfo.processInfo.environment
+        let dir: URL
+        if let d = env["TYPEASSIST_DATA_DIR"], !d.isEmpty {
+            dir = URL(fileURLWithPath: d)
+        } else if let home = env["HOME"], !home.isEmpty {
+            dir = URL(fileURLWithPath: home).appendingPathComponent(".typeassist")
+        } else {
+            return false
+        }
+        guard let text = try? String(
+            contentsOf: dir.appendingPathComponent("inject_config"), encoding: .utf8)
+        else { return false }
+        for raw in text.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            let parts = line.split(separator: "=", maxSplits: 1).map {
+                $0.trimmingCharacters(in: .whitespaces).lowercased()
+            }
+            if parts.count == 2, parts[0] == "suppress" {
+                return ["on", "1", "true", "yes"].contains(parts[1])
+            }
+        }
+        return false
+    }
+
+    /// True when the focused field is the confirmed injection dead zone:
+    /// **Intel (x86_64) + Safari frontmost + focused role `AXTextArea`** (the
+    /// web/contenteditable surface that vends the phantom caret — Docs / Gmail /
+    /// WhatsApp Web all match). Content-blind: reads the frontmost bundle id
+    /// (ephemeral, never persisted — Principle #8) and the focused element's ROLE
+    /// only, never its text. On Apple Silicon the `#if` compiles this to `false`,
+    /// so the arm64 slice can never suppress.
+    static func isInjectionDeadZone() -> Bool {
+        guard suppressDeadZoneEnabled() else { return false }
+        #if arch(x86_64)
+        primeAXConnection()
+        guard let front = NSWorkspace.shared.frontmostApplication,
+              front.bundleIdentifier == "com.apple.Safari" else { return false }
+        let appEl = AXUIElementCreateApplication(front.processIdentifier)
+        guard let f = copyAttr(appEl, kAXFocusedUIElementAttribute as String),
+              CFGetTypeID(f) == AXUIElementGetTypeID() else { return false }
+        let focused = f as! AXUIElement
+        let role = (copyAttr(focused, kAXRoleAttribute as String) as? String) ?? ""
+        return role == "AXTextArea"
+        #else
+        return false
+        #endif
+    }
+
     // MARK: - Phase 0 / M3 overlay feasibility probe
 
     private static var axPrimed = false

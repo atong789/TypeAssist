@@ -83,6 +83,21 @@ pub enum InputEvent {
     /// Content-free (Principle #8/#9): a count, never the character, its timing,
     /// or the focused app.
     SpaceObserved { total: u64 },
+    /// **Injection dead-zone signal (TF-08, host-scoped suppression).** The L1
+    /// adapter reports whether the currently focused field is a place a synthetic
+    /// delete+retype correction CANNOT land. The confirmed case is a Safari
+    /// web/contenteditable surface on Intel (x86_64), whose AX caret is a pinned
+    /// phantom (`loc=1`, no tracking — TF-08 probe), so blind dead-reckoned
+    /// injection garbles or no-ops. In the dead zone the engine goes WATCH-ONLY:
+    /// it keeps observing/learning slips but withholds the bubble entirely (no
+    /// cue) — never a "worse autocorrect" (Principle #9). This supersedes the Watch
+    /// Dog competition there (nothing is injected, so nothing double-corrects).
+    ///
+    /// A **level** signal (not an edge), re-emitted on focus change only when it
+    /// flips; the pre-signal default is `false` (inject as normal), so nothing
+    /// changes for native fields, Chrome, or Apple Silicon. Content-free (Principle
+    /// #8): a single bool — never the app id, field role, or arch that derived it.
+    InjectionZone { dead: bool },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

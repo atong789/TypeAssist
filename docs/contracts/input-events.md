@@ -55,6 +55,14 @@ Emitted on every **deliberate (non-auto-repeat) space keyDown**, carrying the ad
 { "type": "space_observed", "total": 42 }
 ```
 
+### `injection_zone`
+
+**TF-08 host-scoped suppression.** Reports whether the focused field is a place a synthetic delete+retype correction **cannot** land. The confirmed case is a Safari web/contenteditable surface on **Intel (x86_64)**, whose AX caret is a pinned phantom (`loc=1`, no tracking — TF-08 probe), so blind dead-reckoned injection garbles or no-ops. In the dead zone the core goes **watch-only**: it keeps observing/learning slips but withholds the bubble entirely (no cue), rather than fire a "worse autocorrect" (Principle #9). Derived in the adapter from arch + frontmost bundle (Safari) + focused role (`AXTextArea`) — a structural gate that cannot fire on Chrome (different bundle), native apps (different app/field), or Apple Silicon (different arch). The adapter sets `dead: true` only when the field is a dead zone **and** the `suppress` toggle is on, so the pre-signal / toggle-off default is `false`. A **level** signal, re-emitted on focus change only when it flips. Content-free (Principle #8): a single bool, never the app id, field role, or arch.
+
+```json
+{ "type": "injection_zone", "dead": true }
+```
+
 ### `shift_tap`
 
 An **isolated Shift tap** — Shift pressed and released with no other key in between (either Shift, reachable one-handed). The accept gesture for a pending correction suggestion (the M3 bubble). The adapter derives it from `.flagsChanged` transitions and cancels the in-progress tap on any real key / mouse-down, so a `Shift+key` chord never produces it. Content-free.

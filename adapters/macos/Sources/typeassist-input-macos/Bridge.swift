@@ -56,6 +56,13 @@ enum InputEvent {
     /// spaces it actually receives to flag a dropped space. Observe-only;
     /// content-free (a count, never the character). See `InputEvent::SpaceObserved`.
     case spaceObserved(total: UInt64)
+    /// **Injection dead-zone (TF-08, host-scoped suppression).** `dead=true` when
+    /// the focused field is a place a synthetic correction can't land — the
+    /// confirmed case is a Safari web/contenteditable surface on Intel (phantom AX
+    /// caret). The engine goes watch-only there (keeps learning, withholds the
+    /// bubble). Level signal, emitted on focus change only when it flips.
+    /// Content-free (a single bool). See `InputEvent::InjectionZone`.
+    case injectionZone(dead: Bool)
 }
 
 enum OutboundCommand {
@@ -156,6 +163,8 @@ final class Bridge {
             payload = ["type": "autorepeat_dropped"]
         case let .spaceObserved(total):
             payload = ["type": "space_observed", "total": total]
+        case let .injectionZone(dead):
+            payload = ["type": "injection_zone", "dead": dead]
         }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
               let s = String(data: data, encoding: .utf8) else {
