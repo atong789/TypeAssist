@@ -12,7 +12,7 @@ All user data — keystrokes, motor map, snapshots, slip patterns, fatigue signa
 
 ## Capture integrity is observable, not assumed (Principle #7 — non-negotiable)
 
-Every stage of the pipeline (**L1 ingest → engine accept → sealing → 5a verdict → 5c observe → persistence**) exposes a cumulative counter reconciled against the previous stage, so the conversion ratio between adjacent stages is auditable in real time. **Silent drops are unacceptable.** For a recovery-tracking app, a stroke survivor whose week of typing produces 1% of the expected data hasn't been *underserved* — the product has **lied to them about their recovery**. That is the worst failure mode the system has, worse than a wrong correction. This is foundational, not a feature.
+Every stage of the pipeline (**L1 ingest → engine accept → sealing → 5a verdict → 5c observe → persistence**) exposes a cumulative counter reconciled against the previous stage, so the conversion ratio between adjacent stages is auditable in real time. **Silent drops are unacceptable.** For a recovery-tracking app, a user recovering fine motor control whose week of typing produces 1% of the expected data hasn't been *underserved* — the product has **lied to them about their recovery**. That is the worst failure mode the system has, worse than a wrong correction. This is foundational, not a feature.
 
 Concretely: the engine maintains a `Funnel` (`apps/tauri/src-tauri/src/engine.rs`) with `c_keystrokes_received` / `c_keystrokes_accepted` / `c_tokens_sealed` / `c_records_admitted` / `c_verdicts_resolved` (by outcome) / `c_motor_observations` (kept vs slip) / `c_motor_saves`. `c_records_admitted` sits at the boundary that *caused* the first cliff: the motor map now has its own **`MotorLedger`** (`crates/correction-engine/src/motor_ledger.rs`) admitting **every** motor-evidenced word, decoupled from the C5b decision ledger's `should_log` Known-skip (which is a lexicon concern, not a capture one). The shared `OutcomeResolver` verdicts both ledgers; the decision ledger feeds the lexicon proposer, the motor ledger feeds the motor map. Counters are **reconciled per run, never per session**: **Cmd+Shift+F** dumps a structured `FUNNEL_DUMP` line and then **auto-resets** (closes the run); **Cmd+Shift+R** resets without dumping (start a run from zero); a **60 s periodic dump** emits without resetting (cumulative-within-run, so a long run is reconstructable from the log and survives a crash). Any new pipeline stage adds its counter and its reconciliation; never merge a stage that can drop data without a counter that makes the drop visible.
 
@@ -74,17 +74,17 @@ This is the **one** numbered list; cite these numbers everywhere (code comments,
 
 ## Recovery physiology
 
-After stroke, fingers recover at physiologically different rates — not by the user's choice. **Thumb and index regain independent control fastest**; the outer three (middle, ring, little) are more tendon-interconnected and recover slowest, **ring and little especially**. This is anatomy, not effort. The engine must be finger-aware about it:
+After an injury or condition affecting hand motor control, fingers recover at physiologically different rates — not by the user's choice. **Thumb and index regain independent control fastest**; the outer three (middle, ring, little) are more tendon-interconnected and recover slowest, **ring and little especially**. This is anatomy, not effort. The engine must be finger-aware about it:
 
 1. **Frame as physiology, not failure.** Higher slip rates and slower improvement on slow-recovery fingers are NORMAL physiology — never the user's failure. UI copy, progress framings, and insights treat a slow ring finger the way physical therapy treats a slow leg: expected, not a deficit.
 2. **Weight correction priors by finger.** Downstream of L2, the correction engine should bias confidence by which finger is involved. A slip on a slow-recovery finger is more likely a motor error to smooth; an unusual key under thumb or index is more likely intentional and should be left alone. This applies to the L4 confidence tiers (`Cautious`/`Balanced`/`Eager`) and to swap-pair scoring in L3.
 3. **Calibrate progress per finger — internally; never surface a finger in the UI.** Grade each finger against *its own* expected recovery curve so a slow finger is never made to feel like it's lagging — but keep that calibration **internal** (it informs engine priors and copy *tone*, not a per-finger readout). The **Progress view does not surface per-finger**: the "where your hands are gaining ground" per-finger breakdown is **retired**. **Why:** finger attribution is *inferred* from a standard touch-typing hand-map we can't trust for an adapted typist, and showing it implies those fingers *ought* to improve — the opposite of the dignity goal. This is a **refinement** of #3 this session, not a reversal: the per-finger correction *weighting* in #2 is unchanged, and the physiology-not-failure stance in #1 stands. (See *Insight system → Design principles for insight surfaces → Report what's observed, never what's assumed*.)
 
-Sourced from the builder's lived stroke-recovery experience — load-bearing for both engine weighting and UI tone.
+Sourced from the builder's own lived experience with motor impairment and hands-on accessibility research — load-bearing for both engine weighting and UI tone.
 
 ## Accessibility standards — non-negotiable
 
-TypeAssist's users have motor difficulties (stroke survivors, arthritis). Large, mouse-forgiving targets and full keyboard operability are the *core of the product*, not enhancements. Every screen must meet all of these:
+TypeAssist's users have motor difficulties (limited fine motor control, hand tremor, arthritis, and similar conditions). Large, mouse-forgiving targets and full keyboard operability are the *core of the product*, not enhancements. Every screen must meet all of these:
 
 - **Target size.** Interactive controls are at least **36px tall** (aim for 44px) with comfortable padding. Prefer large hit areas — e.g. make a whole card clickable, with an inner control as the visible affordance.
 - **Full keyboard navigation.** Every interactive element is reachable with **Tab** and activatable with **Enter and Space**. Use a logical DOM/tab order (primary navigation, then main content); never use positive `tabindex` — the visual order is the tab order.
@@ -167,7 +167,7 @@ The same number that motivates on a good day can sting on a bad one. Progress is
 
 These govern Today / Progress / Practice and **extend** the non-negotiables (#8 capture integrity, #9 nothing leaves the device, #10 grows with you not over you).
 
-- **Mirror, not coach.** Reflect how the user types *now*; never imply they should return to a baseline they've moved past. A survivor's ring/little fingers opting out is their **adapted normal**, not a gap to close. (This retired the per-finger "still finding footing" framing — see Recovery physiology #3.)
+- **Mirror, not coach.** Reflect how the user types *now*; never imply they should return to a baseline they've moved past. A user's ring/little fingers opting out is their **adapted normal**, not a gap to close. (This retired the per-finger "still finding footing" framing — see Recovery physiology #3.)
 - **Report what's observed, never what's assumed.** Surface **keystrokes** — what the app actually sees — not **finger attribution**, which is *inferred* from a standard touch-typing hand-map that may be wrong for any given user. No finger-level claims in the UI.
 - **Mirror, not scoreboard.** No targets, no good/bad coloring; a single neutral color. A flat trend reads as "holding steady," never "no progress." **Never use red for slips.**
 - **Facts, not commentary.** No invented or clinical-sounding state words ("smoothing", "holding steady"). The numbers and the line speak for themselves; any interpretive word must come from defined criteria or the user's/therapist's vocabulary — never invented by the app.
@@ -194,7 +194,7 @@ TypeAssist sees user typing on three kinds of surface: the **ambient** OS-wide c
 
 The resolver is an **event + idle state machine** (`resolver::decide_verdict`), not a debounce. Core rule: **never fire a verdict mid-edit.** Four definitive triggers:
 - **`CorrectedToOther` / `CorrectedToSuggestion`** — fire *immediately* when a successor token seals at the original's `start` with different content (a seal is unambiguous; no wait).
-- **`Kept`** — fire when the token is still intact, the caret is **not** in/at its span, and its region has been idle ≥ `KEPT_IDLE_THRESHOLD_MS` (~5s; sized for slow-typing/stroke-survivor notice-pauses).
+- **`Kept`** — fire when the token is still intact, the caret is **not** in/at its span, and its region has been idle ≥ `KEPT_IDLE_THRESHOLD_MS` (~5s; sized for slow-typing/motor-impairment notice-pauses).
 - **`Abandoned`** — fire when the token is wiped, no successor, the caret has moved ≥ `ABANDONED_CARET_MARGIN` chars from its `start`, and idle ≥ `ABANDONED_IDLE_THRESHOLD_MS` (~10s).
 - otherwise stay `Pending`.
 

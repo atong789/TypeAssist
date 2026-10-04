@@ -67,8 +67,8 @@
 //!
 //! Thresholds ([`KEPT_IDLE_THRESHOLD_MS`], [`ABANDONED_IDLE_THRESHOLD_MS`],
 //! [`ABANDONED_CARET_MARGIN`]) are **tunable** module constants — slow
-//! typists (e.g. stroke survivors) take longer pauses and may need them
-//! raised.
+//! typists (e.g. those with limited fine motor control) take longer pauses and
+//! may need them raised.
 //!
 //! `CorrectedToSuggestion` is **independent of the decision arm** — the
 //! candidate is stored on every loggable record regardless of whether the
@@ -92,7 +92,7 @@ use crate::log::Outcome;
 
 /// Idle period (ms) of no edits in a token's region before an untouched,
 /// still-`Tracking` token resolves `Kept`. **Tunable.** Set to 5s to cover
-/// the stroke-survivor "I see the typo, let me think, OK I'll fix it"
+/// the motor-impaired typist's "I see the typo, let me think, OK I'll fix it"
 /// window — it must comfortably exceed a user's typical notice-pause so a
 /// deliberate correction-after-a-beat isn't locked as `Kept` first (which
 /// then revises to a correction and double-counts in the 5c motor map).

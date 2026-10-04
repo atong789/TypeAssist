@@ -12,7 +12,7 @@
 //! confirms** (confirm-to-accept). The earlier Tier-1 "silent auto-fix" outcome
 //! is **retired** — nothing is ever marked for silent application, regardless of
 //! how confident we are. This is a deliberate product stance: TypeAssist must
-//! never feel like a "worse autocorrect" (Principle #9), and a survivor's typed
+//! never feel like a "worse autocorrect" (Principle #9), and a user's typed
 //! word is never overwritten without their say-so. So [`PatternReadiness`] has
 //! exactly two outcomes:
 //!

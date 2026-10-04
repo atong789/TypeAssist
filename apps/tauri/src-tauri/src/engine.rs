@@ -783,7 +783,7 @@ fn immediate_revert_injection(lc: &LastCorrection) -> (u32, String) {
 }
 
 /// How long after a correction an Escape still reverts it. Sized for slow /
-/// stroke-survivor reaction time — generous, but the window also closes the
+/// motor-impaired reaction time — generous, but the window also closes the
 /// moment the user types any other character (an implicit accept), so a long
 /// timeout doesn't keep Escape hijacked. **Tunable.**
 const UNDO_WINDOW_MS: u64 = 6_000;
