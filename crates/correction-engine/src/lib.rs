@@ -95,7 +95,8 @@ pub use tokenizer::{Token, TokenKind, Tokenizer, TOKENIZER_VERSION};
 pub use trigram::{target_is_recordable, TrigramModel};
 pub use word_freq::{WordFreq, WORD_FREQ_VERSION};
 pub use word_pattern::{
-    edit_distance, normalize_word, PatternObserveReport, PatternSnapshot, PatternStat,
+    edit_distance, normalize_word, OutcomeEvent, OutcomeReading, PatternObserveReport, PatternOutcomes,
+    PatternSnapshot, PatternStat,
     WordPatternStore, MAX_PATTERN_EDIT_DISTANCE, MAX_PATTERN_LENGTH_DIFF, PATTERN_PERSIST_EVERY,
     UNDO_BRAKE_STRIKES, WORD_PATTERN_VERSION,
 };

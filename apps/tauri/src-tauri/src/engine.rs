@@ -40,7 +40,7 @@ use correction_engine::{
     classify_slip, decide, has_motor_evidence, measure_token_motor, normalize_word,
     ranked_known_candidates, score_candidates, should_log, target_is_recordable, AnchorTracker,
     Confidence, ConfidenceTier, DecisionLedger, DecisionOutcome, GuessLedger, Lexicon,
-    LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeResolver,
+    LexiconProposer, MotorLedger, MotorMap, ObserveReport, Outcome, OutcomeEvent, OutcomeResolver,
     PatternReadiness, ScoredCandidate, SlipClass, SpellingVariant, StabilityReport, Token,
     TokenKind, Tokenizer, WordFreq, WordPatternStore, ACTIVE_TIER, CANDIDATES_VERSION,
     DECISION_VERSION, LEXICON_VERSION,
@@ -1051,6 +1051,13 @@ struct Funnel {
     /// that reverted one. A healthy run reconciles `undone ≤ applied`.
     corrections_applied: u64,
     corrections_undone: u64,
+    /// Per-pattern bubble-outcome capture integrity (Principle #7). `o_events`
+    /// is bumped at each bubble site INDEPENDENTLY of the store write;
+    /// `o_recorded` only when `WordPatternStore::record_outcome` actually
+    /// recorded. They must reconcile — a disagreement means an outcome call
+    /// stopped landing and the store is flagged untracked (never a false zero).
+    o_events: OutcomeCounts,
+    o_recorded: OutcomeCounts,
     /// **M3 autocorrect coexistence — "Watch Dog Not Attack Dog" (Principle
     /// #7).** Times Jordan stood down on a host-redundant (common) suggestion
     /// because he behaviourally sensed an active competing corrector
@@ -1122,7 +1129,8 @@ impl Funnel {
              slip: {}}}, c_motor_saves: {}, c_word_patterns: {{observed: {}, skipped: {}}}, \
              c_word_pattern_saves: {}, c_corrections: {{applied: {}, undone: {}}}, \
              c_competitor_deferred: {}, c_space: {{observed: {}, accepted: {}, \
-             drops_suspected: {}}}, session_started_at: {} }}",
+             drops_suspected: {}}}, c_outcomes_events_vs_recorded: {{shown: {}/{}, accepted: {}/{}, \
+             self_matched: {}/{}, undone: {}/{}}}, session_started_at: {} }}",
             self.keystrokes_received,
             self.autorepeat_dropped,
             self.keystrokes_accepted,
@@ -1144,6 +1152,14 @@ impl Funnel {
             self.space_observed,
             self.space_accepted,
             self.space_drops_suspected,
+            self.o_events.shown,
+            self.o_recorded.shown,
+            self.o_events.accepted,
+            self.o_recorded.accepted,
+            self.o_events.self_matched,
+            self.o_recorded.self_matched,
+            self.o_events.undone,
+            self.o_recorded.undone,
             self.session_started_ms,
         );
     }
@@ -1352,6 +1368,73 @@ fn allow_list_path() -> Option<PathBuf> {
 /// pairs already live in `word_patterns.json`.)
 fn shadow_log_path() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("shadow_suggestions.log"))
+}
+
+/// Per-event tallies used to reconcile bubble-outcome capture (see
+/// [`Funnel::o_events`]). Text-free counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OutcomeCounts {
+    shown: u64,
+    accepted: u64,
+    self_matched: u64,
+    undone: u64,
+}
+
+impl OutcomeCounts {
+    fn bump(&mut self, e: OutcomeEvent) {
+        match e {
+            OutcomeEvent::Shown => self.shown += 1,
+            OutcomeEvent::Accepted => self.accepted += 1,
+            OutcomeEvent::SelfMatched => self.self_matched += 1,
+            OutcomeEvent::Undone => self.undone += 1,
+        }
+    }
+}
+
+/// Whether a bubble pair can be recorded as an outcome (mirrors the store's own
+/// guard so a legitimate skip is never mistaken for a broken call).
+fn outcome_pair_recordable(typed: &str, target: &str) -> bool {
+    let (t, g) = (normalize_word(typed), normalize_word(target));
+    !t.is_empty() && !g.is_empty() && t != g
+}
+
+/// Count one bubble event at its site (the independent side of the reconcile)
+/// and record it on the pattern store (the other side).
+fn record_pattern_outcome(
+    store: &mut WordPatternStore,
+    funnel: &mut Funnel,
+    event: OutcomeEvent,
+    typed: &str,
+    target: &str,
+    now: u64,
+) {
+    if !outcome_pair_recordable(typed, target) {
+        return;
+    }
+    funnel.o_events.bump(event);
+    if store.record_outcome(event, typed, target, now) {
+        funnel.o_recorded.bump(event);
+    }
+}
+
+/// `Some(description)` when the independent event counts and the store's recorded
+/// counts disagree — i.e. an outcome-recording call stopped landing.
+fn outcome_mismatch(events: &OutcomeCounts, recorded: &OutcomeCounts) -> Option<String> {
+    (events != recorded).then(|| format!("events={events:?} recorded={recorded:?}"))
+}
+
+/// Reconcile at the funnel-dump cadence. On a mismatch, flag the store so every
+/// outcome reads **untracked** (never a false 0) and warn loudly. Returns whether
+/// it flagged.
+fn outcome_integrity_check(funnel: &Funnel, store: &mut WordPatternStore, now: u64) -> bool {
+    match outcome_mismatch(&funnel.o_events, &funnel.o_recorded) {
+        Some(d) => {
+            tracing::warn!("OUTCOME_INTEGRITY_BROKEN {d} — pattern outcomes now read untracked");
+            store.flag_outcomes_broken(now);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Opt-in LOCAL bubble debug log: one line per bubble that fires, with the exact
@@ -2124,6 +2207,7 @@ fn tick_resolver<R: Runtime>(
                                     now,
                                 ) {
                                     tally.add_self_matched();
+                                    record_pattern_outcome(word_patterns, funnel, OutcomeEvent::SelfMatched, &normalize_word(&rec.original_text), &normalize_word(c), now);
                                 }
                             }
                         }
@@ -3419,6 +3503,9 @@ pub fn spawn<R: Runtime>(
             },
             _ => WordPatternStore::new(),
         };
+        // Per-pattern bubble-outcome tracking starts (idempotent; stamps the
+        // 'tracked since' date the first time only).
+        word_patterns.start_outcome_tracking(now_ms());
         let mut last_word_patterns_save_ms: u64 = 0;
         // Guesser accuracy scoreboard (M3 Phase 1, observe-only) — measures how
         // often the guesser's top guess matches the user's actual fix. Its own
@@ -4165,6 +4252,7 @@ pub fn spawn<R: Runtime>(
                                         funnel.corrections_applied += 1;
                                         tally.add_accepted();
                                         accepted_ok = true;
+                                        record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Accepted, &ended_slot.1, &ended_slot.2, now_ms());
                                         tracing::info!(
                                             "CORRECTION_APPLIED typed={:?} target={:?} delete_count={} boundary={:?} after_len={}",
                                             ps.typed,
@@ -4383,6 +4471,7 @@ pub fn spawn<R: Runtime>(
                             //   Cmd+Shift+R → reset only (start a run from zero).
                             if modifiers.command && modifiers.shift {
                                 if matches!(single_char, Some('f') | Some('F')) {
+                                    outcome_integrity_check(&funnel, &mut word_patterns, now_ms());
                                     funnel.dump();
                                     dump_classifications(&word_patterns, &motor_map);
                                     funnel.reset(now_ms());
@@ -4460,6 +4549,7 @@ pub fn spawn<R: Runtime>(
                                     };
                                     if reverted {
                                         funnel.corrections_undone += 1;
+                                        record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Undone, &lc.typed, &lc.target, now_ms());
                                         tracing::info!(
                                             "CORRECTION_UNDONE typed={:?} target={:?} after_len={}",
                                             lc.typed,
@@ -4878,6 +4968,7 @@ pub fn spawn<R: Runtime>(
                                                             timestamp_ms,
                                                         );
                                                         tally.add_bubble_shown();
+                                                        record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Shown, &ps.typed, &ps.target, now_ms());
                                                         log_bubble_debug(now_ms(), &ps.typed, &ps.target, &fire_meta);
                                                         pending_suggestion = Some(ps);
                                                     }
@@ -5474,6 +5565,7 @@ pub fn spawn<R: Runtime>(
                     // reconstructable from logs after the fact, in addition
                     // to the on-demand Cmd+Shift+F chord.
                     if watchdog_ticks % 60 == 0 {
+                        outcome_integrity_check(&funnel, &mut word_patterns, now_ms());
                         funnel.dump();
                         // Read-only kill-switch observability (no injection).
                         dump_classifications(&word_patterns, &motor_map);
@@ -5995,6 +6087,79 @@ mod tests {
             std::fs::remove_file(dir.join(BUBBLE_DEBUG_FLAG)).unwrap();
             assert!(!bubble_debug_enabled(&dir), "deleting the flag turns it off");
         }
+    }
+
+
+    // ---- Per-pattern outcome loop (data-only) -----------------------------
+
+    fn outcome_fixture() -> (WordPatternStore, Funnel) {
+        let mut st = WordPatternStore::new();
+        st.start_outcome_tracking(1_000);
+        (st, Funnel::default())
+    }
+
+    #[test]
+    fn outcome_loop_accept_goes_zero_to_one_and_reconciles() {
+        let (mut st, mut f) = outcome_fixture();
+        record_pattern_outcome(&mut st, &mut f, OutcomeEvent::Shown, "Teh", "The", 2_000);
+        match st.outcome_reading("teh", "the") {
+            correction_engine::OutcomeReading::Tracked(o) => assert_eq!(o.accepted, 0.0),
+            other => panic!("{other:?}"),
+        }
+        record_pattern_outcome(&mut st, &mut f, OutcomeEvent::Accepted, "teh", "the", 3_000);
+        match st.outcome_reading("teh", "the") {
+            correction_engine::OutcomeReading::Tracked(o) => {
+                assert!(
+                    (o.shown - 1.0).abs() < 1e-3 && (o.accepted - 1.0).abs() < 1e-3,
+                    "accepted must go 0 -> 1: {o:?}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(outcome_mismatch(&f.o_events, &f.o_recorded).is_none());
+        assert!(!outcome_integrity_check(&f, &mut st, 4_000), "healthy run must not flag");
+    }
+
+    #[test]
+    fn outcome_never_reads_a_false_zero_when_a_call_stops_landing() {
+        // Invariant that must hold for healthy AND broken recording: a pattern is
+        // either Tracked with accepted == the independent event count, or
+        // Untracked. It may NEVER read Tracked with a count that disagrees.
+        let (mut st, mut f) = outcome_fixture();
+        record_pattern_outcome(&mut st, &mut f, OutcomeEvent::Shown, "teh", "the", 2_000);
+        record_pattern_outcome(&mut st, &mut f, OutcomeEvent::Accepted, "teh", "the", 3_000);
+        outcome_integrity_check(&f, &mut st, 4_000);
+        match st.outcome_reading("teh", "the") {
+            correction_engine::OutcomeReading::Untracked => {}
+            correction_engine::OutcomeReading::Tracked(o) => {
+                assert_eq!(o.accepted as u64, f.o_events.accepted, "false zero!")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_dropped_record_call_is_flagged_and_reads_untracked() {
+        // Simulates exactly what a removed `note_accept` call looks like at the
+        // site: the independent event is counted, the store write never happens.
+        let (mut st, mut f) = outcome_fixture();
+        record_pattern_outcome(&mut st, &mut f, OutcomeEvent::Shown, "teh", "the", 2_000);
+        f.o_events.bump(OutcomeEvent::Accepted); // event happened...
+        // ...but no store.record_outcome(Accepted) ran.
+        assert!(outcome_mismatch(&f.o_events, &f.o_recorded).is_some());
+        assert!(outcome_integrity_check(&f, &mut st, 4_000), "must flag");
+        assert_eq!(
+            st.outcome_reading("teh", "the"),
+            correction_engine::OutcomeReading::Untracked,
+            "broken recording must read untracked, not a false 0"
+        );
+    }
+
+    #[test]
+    fn outcome_pair_guard_matches_store_guard() {
+        assert!(!outcome_pair_recordable("Is", "is"), "case-only is not a pair");
+        assert!(!outcome_pair_recordable("", "is"));
+        assert!(outcome_pair_recordable("teh", "the"));
     }
 
     #[test]

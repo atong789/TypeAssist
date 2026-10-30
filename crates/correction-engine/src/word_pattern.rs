@@ -114,6 +114,59 @@ pub struct PatternObserveReport {
     pub weight: f32,
 }
 
+/// Per-pattern bubble-response tallies — the evidence a per-pattern acceptance
+/// rate (`accepted / shown`) is later computed from. Decayed with the SAME
+/// half-life and the SAME lazy `decay_in_place` as [`PatternStat::count`], so
+/// attempts and successes stay on one clock.
+///
+/// **Data-only.** Nothing here changes what fires: the undo brake
+/// (`consecutive_undos`) is deliberately NOT driven by these tallies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct PatternOutcomes {
+    /// Bubbles displayed for this `typed → target`.
+    pub shown: f32,
+    /// Shift accepts whose injection succeeded.
+    pub accepted: f32,
+    /// Bubble ignored, then the user typed the exact suggested word at the
+    /// same slot inside the self-match window.
+    pub self_matched: f32,
+    /// Accepted fixes the user reverted with Escape.
+    pub undone: f32,
+}
+
+impl PatternOutcomes {
+    fn scale(&mut self, f: f32) {
+        self.shown *= f;
+        self.accepted *= f;
+        self.self_matched *= f;
+        self.undone *= f;
+    }
+}
+
+/// One bubble-response event (see [`PatternOutcomes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeEvent {
+    Shown,
+    Accepted,
+    SelfMatched,
+    Undone,
+}
+
+/// What a reader may say about a pattern's outcome evidence. The three states
+/// are deliberately distinct: "the counter didn't run" must never look like "the
+/// counter is genuinely zero".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutcomeReading {
+    /// Not tracked: tracking never started on this store, or the integrity
+    /// check found the recording path broken. NO number may be inferred.
+    Untracked,
+    /// Tracking has run since this time and no bubble has been recorded for this
+    /// pattern: a real zero, "since T".
+    NoneSince(Timestamp),
+    /// Recorded tallies (decayed to the store's read time).
+    Tracked(PatternOutcomes),
+}
+
 /// One learned `typed → target` correction pattern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatternStat {
@@ -130,6 +183,10 @@ pub struct PatternStat {
     /// brake. Bumped by [`WordPatternStore::note_undo`], reset to 0 by
     /// [`WordPatternStore::note_accept`]. Not decayed (see module note 3).
     consecutive_undos: u32,
+    /// Bubble-response tallies. `None` = no bubble recorded for this pattern
+    /// (absent in every file written before outcome tracking existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcomes: Option<PatternOutcomes>,
 }
 
 impl PatternStat {
@@ -140,6 +197,7 @@ impl PatternStat {
             count: 0.0,
             last_update: now,
             consecutive_undos: 0,
+            outcomes: None,
         }
     }
 
@@ -160,6 +218,9 @@ impl PatternStat {
         let f = self.decay_factor(now);
         if f < 1.0 {
             self.count *= f;
+            if let Some(o) = self.outcomes.as_mut() {
+                o.scale(f);
+            }
         }
         self.last_update = now;
     }
@@ -167,6 +228,13 @@ impl PatternStat {
     /// Decayed weight as of `now`, without mutating.
     fn decayed_count(&self, now: Timestamp) -> f32 {
         self.count * self.decay_factor(now)
+    }
+
+    /// Decayed `shown` as of `now` (0 when no outcomes) — what keeps an
+    /// outcome-only (zero-weight) entry alive through [`WordPatternStore::prune`].
+    fn decayed_shown(&self, now: Timestamp) -> f32 {
+        self.outcomes
+            .map_or(0.0, |o| o.shown * self.decay_factor(now))
     }
 }
 
@@ -200,6 +268,15 @@ pub struct WordPatternStore {
     last_now: Timestamp,
     /// Lifetime corrections folded in. Reflective; never a target.
     total_observations: u64,
+    /// When per-pattern bubble-outcome tracking first ran on this store. Set
+    /// once, never reset. `None` ⇒ every pattern's outcomes read **untracked**.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcomes_tracking_since: Option<Timestamp>,
+    /// Set when the engine's integrity reconcile found the outcome-recording
+    /// path disagreeing with the independent event counters. While set, every
+    /// outcome reads **untracked** (a broken counter must not pass as a zero).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcomes_integrity_broken_since: Option<Timestamp>,
     /// Corrections since the last [`Self::save_to`]. Drives
     /// [`Self::persist_due`]; not persisted (a loaded store is "clean").
     #[serde(skip)]
@@ -213,6 +290,8 @@ impl Default for WordPatternStore {
             patterns: Vec::new(),
             last_now: 0,
             total_observations: 0,
+            outcomes_tracking_since: None,
+            outcomes_integrity_broken_since: None,
             obs_since_persist: 0,
         }
     }
@@ -353,18 +432,116 @@ impl WordPatternStore {
         }
     }
 
+    // --- Bubble-outcome tracking (data-only) --------------------------------
+
+    /// Start per-pattern outcome tracking on this store (idempotent — the first
+    /// call stamps `outcomes_tracking_since`, later calls change nothing). Until
+    /// this has run, [`Self::outcome_reading`] says **untracked** for everything.
+    pub fn start_outcome_tracking(&mut self, now: Timestamp) {
+        if self.outcomes_tracking_since.is_none() {
+            self.outcomes_tracking_since = Some(now);
+            self.obs_since_persist += 1; // make the stamp durable
+        }
+    }
+
+    pub fn outcomes_tracking_since(&self) -> Option<Timestamp> {
+        self.outcomes_tracking_since
+    }
+
+    /// Mark the recording path as broken (the engine's reconcile disagreed).
+    /// While set, every reading is [`OutcomeReading::Untracked`]. Idempotent.
+    pub fn flag_outcomes_broken(&mut self, now: Timestamp) {
+        if self.outcomes_integrity_broken_since.is_none() {
+            self.outcomes_integrity_broken_since = Some(now);
+            self.obs_since_persist += 1;
+        }
+    }
+
+    pub fn outcomes_integrity_broken_since(&self) -> Option<Timestamp> {
+        self.outcomes_integrity_broken_since
+    }
+
+    /// Record one bubble-response for `typed → target`. Creates a zero-weight
+    /// entry if the pair has no pattern yet (so a bold-lane / accepted bubble —
+    /// whose fix the engine never re-observes as a correction — still lands).
+    /// Returns `true` iff it was recorded; `false` (nothing written) when
+    /// tracking has not started. Does NOT touch `consecutive_undos`, so the
+    /// undo brake is unaffected. Not a correction: `total_observations` is
+    /// unchanged.
+    pub fn record_outcome(
+        &mut self,
+        event: OutcomeEvent,
+        typed: &str,
+        target: &str,
+        now: Timestamp,
+    ) -> bool {
+        if self.outcomes_tracking_since.is_none() {
+            return false;
+        }
+        let typed = normalize_word(typed);
+        let target = normalize_word(target);
+        if typed.is_empty() || target.is_empty() || typed == target {
+            return false;
+        }
+        if now > self.last_now {
+            self.last_now = now;
+        }
+        let stat = self.entry_mut(&typed, &target, now);
+        let o = stat.outcomes.get_or_insert_with(PatternOutcomes::default);
+        match event {
+            OutcomeEvent::Shown => o.shown += 1.0,
+            OutcomeEvent::Accepted => o.accepted += 1.0,
+            OutcomeEvent::SelfMatched => o.self_matched += 1.0,
+            OutcomeEvent::Undone => o.undone += 1.0,
+        }
+        self.obs_since_persist += 1;
+        true
+    }
+
+    /// What may be said about `typed → target`'s outcome evidence (see
+    /// [`OutcomeReading`]). Decayed to [`Self::last_now`].
+    pub fn outcome_reading(&self, typed: &str, target: &str) -> OutcomeReading {
+        let Some(since) = self.outcomes_tracking_since else {
+            return OutcomeReading::Untracked;
+        };
+        if self.outcomes_integrity_broken_since.is_some() {
+            return OutcomeReading::Untracked;
+        }
+        let typed = normalize_word(typed);
+        let target = normalize_word(target);
+        match self.find(&typed, &target).and_then(|s| {
+            s.outcomes.map(|mut o| {
+                o.scale(s.decay_factor(self.last_now));
+                o
+            })
+        }) {
+            Some(o) => OutcomeReading::Tracked(o),
+            None => OutcomeReading::NoneSince(since),
+        }
+    }
+
     /// Read one pattern's view, decayed to [`Self::last_now`]. `None` if the
     /// pattern has never been observed. The classifier's entry point.
     pub fn snapshot(&self, typed: &str, target: &str) -> Option<PatternSnapshot> {
         let typed = normalize_word(typed);
         let target = normalize_word(target);
-        self.find(&typed, &target).map(|stat| self.view(stat))
+        self.find(&typed, &target)
+            .filter(|s| s.decayed_count(self.last_now) >= PRUNE_EPSILON)
+            .map(|stat| self.view(stat))
     }
 
     /// All patterns as views, decayed to [`Self::last_now`], strongest first.
     /// For diagnostics and a classifier sweep over everything learned.
     pub fn snapshots(&self) -> Vec<PatternSnapshot> {
-        let mut out: Vec<PatternSnapshot> = self.patterns.iter().map(|s| self.view(s)).collect();
+        // An outcome-only entry (weight ~0: a bubble was shown but no correction
+        // has been observed for the pair) is NOT a learned slip — keep it out of
+        // every sweep (Impact ledger, classifier, guesser model).
+        let mut out: Vec<PatternSnapshot> = self
+            .patterns
+            .iter()
+            .filter(|s| s.decayed_count(self.last_now) >= PRUNE_EPSILON)
+            .map(|s| self.view(s))
+            .collect();
         out.sort_by(|a, b| {
             b.weight
                 .partial_cmp(&a.weight)
@@ -452,8 +629,9 @@ impl WordPatternStore {
     /// fallen below [`PRUNE_EPSILON`] — the intended forgetting policy.
     fn prune(&mut self) {
         let now = self.last_now;
-        self.patterns
-            .retain(|s| s.decayed_count(now) >= PRUNE_EPSILON);
+        self.patterns.retain(|s| {
+            s.decayed_count(now) >= PRUNE_EPSILON || s.decayed_shown(now) >= PRUNE_EPSILON
+        });
     }
 
     fn write_json(&self, path: &Path) -> io::Result<()> {
@@ -641,6 +819,144 @@ mod tests {
         assert_eq!(store.len(), 1);
         let snap = store.snapshot("teh", "the").unwrap();
         assert!((snap.weight - 2.0).abs() < 1e-6);
+    }
+
+
+    // ---- Bubble-outcome tracking (data-only) -----------------------------
+
+    fn tracked_store() -> WordPatternStore {
+        let mut s = WordPatternStore::new();
+        s.start_outcome_tracking(T0);
+        s
+    }
+
+    fn tracked(s: &WordPatternStore, t: &str, g: &str) -> PatternOutcomes {
+        match s.outcome_reading(t, g) {
+            OutcomeReading::Tracked(o) => o,
+            other => panic!("expected Tracked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_accepted_goes_zero_to_one() {
+        let mut s = tracked_store();
+        assert!(s.record_outcome(OutcomeEvent::Shown, "teh", "the", T0));
+        assert_eq!(tracked(&s, "teh", "the").accepted, 0.0, "genuine zero, shown=1");
+        assert_eq!(tracked(&s, "teh", "the").shown, 1.0);
+        assert!(s.record_outcome(OutcomeEvent::Accepted, "Teh", "the", T0));
+        assert_eq!(tracked(&s, "teh", "the").accepted, 1.0, "accepted must go 0 -> 1");
+    }
+
+    #[test]
+    fn outcomes_untracked_until_started_and_nothing_is_written() {
+        let mut s = WordPatternStore::new();
+        assert!(!s.record_outcome(OutcomeEvent::Accepted, "teh", "the", T0));
+        assert_eq!(s.len(), 0, "an untracked store must not create entries");
+        assert_eq!(s.outcome_reading("teh", "the"), OutcomeReading::Untracked);
+    }
+
+    #[test]
+    fn started_store_with_no_bubble_reads_none_since_not_untracked() {
+        let s = tracked_store();
+        assert_eq!(s.outcome_reading("teh", "the"), OutcomeReading::NoneSince(T0));
+    }
+
+    #[test]
+    fn broken_integrity_reads_untracked_not_zero() {
+        let mut s = tracked_store();
+        s.record_outcome(OutcomeEvent::Shown, "teh", "the", T0);
+        s.flag_outcomes_broken(T0);
+        assert_eq!(s.outcome_reading("teh", "the"), OutcomeReading::Untracked);
+        assert_eq!(s.outcome_reading("zzz", "yyy"), OutcomeReading::Untracked);
+    }
+
+    #[test]
+    fn start_tracking_is_idempotent() {
+        let mut s = tracked_store();
+        s.start_outcome_tracking(T0 + 999);
+        assert_eq!(s.outcomes_tracking_since(), Some(T0));
+    }
+
+    #[test]
+    fn outcome_only_entry_is_not_pruned_and_not_in_snapshots() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("ta_word_patterns_outcome_{}.json", std::process::id()));
+        let mut s = tracked_store();
+        s.record_outcome(OutcomeEvent::Shown, "apliaction", "application", T0);
+        s.record_outcome(OutcomeEvent::Accepted, "apliaction", "application", T0);
+        // Zero-weight pattern: invisible to every sweep (Impact / classifier)...
+        assert!(s.snapshots().is_empty());
+        assert!(s.snapshot("apliaction", "application").is_none());
+        // ...but it survives save (prune) and reload with its outcomes intact.
+        s.save_to(&path).unwrap();
+        let loaded = WordPatternStore::load_from(&path).unwrap();
+        assert_eq!(loaded.len(), 1, "outcome-only entry must NOT be pruned");
+        assert!(loaded.snapshots().is_empty(), "and must not pollute sweeps");
+        let o = tracked(&loaded, "apliaction", "application");
+        assert_eq!((o.shown, o.accepted), (1.0, 1.0));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fully_decayed_outcome_only_entry_is_pruned() {
+        let mut s = tracked_store();
+        s.record_outcome(OutcomeEvent::Shown, "teh", "the", T0);
+        // An unrelated later observation advances the clock ~20 half-lives.
+        observe_n(&mut s, "adn", "and", 1, T0 + HALF_LIFE * 20);
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("ta_word_patterns_decayout_{}.json", std::process::id()));
+        s.save_to(&path).unwrap();
+        assert_eq!(WordPatternStore::load_from(&path).unwrap().len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn outcomes_decay_with_the_pattern_half_life() {
+        let mut s = tracked_store();
+        observe_n(&mut s, "teh", "the", 1, T0);
+        s.record_outcome(OutcomeEvent::Shown, "teh", "the", T0);
+        s.record_outcome(OutcomeEvent::Accepted, "teh", "the", T0);
+        // Advance one half-life via another pattern, then read.
+        observe_n(&mut s, "adn", "and", 1, T0 + HALF_LIFE);
+        let o = tracked(&s, "teh", "the");
+        assert!((o.shown - 0.5).abs() < 1e-3 && (o.accepted - 0.5).abs() < 1e-3, "{o:?}");
+        let w = s.snapshot("teh", "the").unwrap().weight;
+        assert!((w - 0.5).abs() < 1e-3, "weight and outcomes decay in lockstep");
+    }
+
+    #[test]
+    fn recording_outcomes_never_touches_the_undo_brake_or_observations() {
+        let mut s = tracked_store();
+        observe_n(&mut s, "teh", "the", 3, T0);
+        let before = s.total_observations();
+        for _ in 0..5 {
+            s.record_outcome(OutcomeEvent::Undone, "teh", "the", T0);
+        }
+        assert_eq!(s.snapshot("teh", "the").unwrap().consecutive_undos, 0, "brake not driven");
+        assert_eq!(s.total_observations(), before);
+        assert_eq!(tracked(&s, "teh", "the").undone, 5.0);
+    }
+
+    #[test]
+    fn pre_tracking_file_loads_as_untracked() {
+        let old = r#"{"version":1,"patterns":[{"typed":"teh","target":"the","count":2.0,"last_update":5,"consecutive_undos":0}],"last_now":5,"total_observations":2}"#;
+        let s: WordPatternStore = serde_json::from_str(old).unwrap();
+        assert_eq!(s.outcome_reading("teh", "the"), OutcomeReading::Untracked);
+        assert_eq!(s.len(), 1);
+    }
+
+
+    #[test]
+    fn mixed_store_sweeps_see_only_real_patterns() {
+        let mut s = tracked_store();
+        observe_n(&mut s, "teh", "the", 6, T0);
+        s.record_outcome(OutcomeEvent::Shown, "apliaction", "application", T0);
+        s.record_outcome(OutcomeEvent::Shown, "teh", "the", T0);
+        let snaps = s.snapshots();
+        assert_eq!(snaps.len(), 1, "only the learned slip is visible to sweeps/Impact");
+        assert_eq!((snaps[0].typed.as_str(), snaps[0].target.as_str()), ("teh", "the"));
+        assert!((snaps[0].weight - 6.0).abs() < 1e-3, "outcomes must not change weight");
+        assert_eq!(s.len(), 2);
     }
 
     // ---- Decay ----------------------------------------------------------
