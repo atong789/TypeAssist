@@ -636,6 +636,115 @@ struct PendingSuggestion {
 /// (The bubble's own SUGGEST_MS backstop sits above this.) **Tunable.**
 const SUGGESTION_TIMEOUT_MS: u64 = 5_000;
 
+/// Self-match window: after a bubble ends WITHOUT an accept, the user has this
+/// long for the corrected word to seal for it to count as SELF_MATCHED (they
+/// ignored Jordan, then backspaced and typed Jordan's exact word themselves).
+/// Sized well above the bubble's own 5s life: the target user types slowly and
+/// may pause before fixing. **Tunable.**
+const SELF_MATCH_WINDOW_MS: u64 = 30_000;
+
+/// Cap on remembered ended bubbles — old ones are pruned by age anyway; this just
+/// bounds memory if the user ignores many in a burst.
+const MAX_ENDED_BUBBLES: usize = 16;
+
+/// A bubble that ended without being accepted, remembered briefly so a later
+/// exact retype of its target can be recognised (SELF_MATCHED). **In-memory
+/// only — never serialised, never logged**: it holds words, and only the
+/// text-free counts ever reach disk (Principle #8).
+#[derive(Debug, Clone)]
+struct EndedBubble {
+    /// Line position of the word slot (`word_end - word_len` at seal).
+    start: usize,
+    /// Normalized typed word the bubble was shown for.
+    typed: String,
+    /// Normalized word the bubble suggested.
+    target: String,
+    ended_at_ms: u64,
+}
+
+/// Ties a resolver-reported correction back to the specific bubble the user
+/// ignored. A match requires ALL of: same slot start, same typed word, corrected
+/// word == the suggested target, inside [`SELF_MATCH_WINDOW_MS`]. Each ended
+/// bubble matches at most once. When the tie can't be established (line reset on
+/// click/focus change, quoted-word shape differences) the correction simply does
+/// not count — the safe direction: undercount, never overcount.
+///
+/// **Known limits — `self_matched` can read LOW (accepted, not fixed):**
+/// 1. Text edited *before* the word shifts the resolver's anchor start, but the
+///    remembered slot start is frozen at seal → no match.
+/// 2. Quoted words: the bubble's `typed` has quotes stripped, the record's
+///    `original_text` keeps them → typed-word compare fails.
+/// 3. The original anchor may change or vanish during the backspace/retype; if it
+///    is gone the lookup finds no start and the hook skips. (Unverified by test.)
+/// Never overcounts. So "diverged or unmatched" = shown − accepted − self_matched
+/// includes self-matches we couldn't tie back.
+#[derive(Debug, Default)]
+struct BubbleLedger {
+    ended: Vec<EndedBubble>,
+}
+
+impl BubbleLedger {
+    fn note_ended(&mut self, start: usize, typed: &str, target: &str, now: u64) {
+        self.ended.push(EndedBubble {
+            start,
+            typed: typed.to_string(),
+            target: target.to_string(),
+            ended_at_ms: now,
+        });
+        if self.ended.len() > MAX_ENDED_BUBBLES {
+            self.ended.remove(0);
+        }
+    }
+
+    /// `true` iff this correction is the user self-matching an ignored bubble.
+    /// `typed`/`corrected` are normalized words; `start` is the corrected word's
+    /// slot start in the line.
+    fn note_correction(
+        &mut self,
+        start: usize,
+        typed: &str,
+        corrected: &str,
+        now: u64,
+    ) -> bool {
+        // Expired bubbles can never match again — drop them first.
+        self.ended
+            .retain(|b| now.saturating_sub(b.ended_at_ms) <= SELF_MATCH_WINDOW_MS);
+        let hit = self
+            .ended
+            .iter()
+            .position(|b| b.start == start && b.typed == typed && b.target == corrected);
+        match hit {
+            Some(i) => {
+                self.ended.remove(i); // one bubble, one match
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// End a pending bubble that was NOT accepted: remember it (in memory, for the
+/// self-match tie) and hide the cue. Returns whether one was pending.
+fn end_pending_bubble<R: Runtime>(
+    pending: &mut Option<PendingSuggestion>,
+    bubbles: &mut BubbleLedger,
+    app: &AppHandle<R>,
+) -> bool {
+    match pending.take() {
+        Some(ps) => {
+            bubbles.note_ended(
+                ps.word_end.saturating_sub(ps.word_len),
+                &normalize_word(&ps.typed),
+                &normalize_word(&ps.target),
+                now_ms(),
+            );
+            let _ = app.emit(EVT_CORRECTION_DISMISSED, ());
+            true
+        }
+        None => false,
+    }
+}
+
 /// Distance cap for the anchored accept: how many chars the caret may have moved
 /// PAST the word and still let Shift land it (≈ 1–2 words). Beyond this the
 /// dead-reckoning drift risk is too high → dismiss. Deliberately tight (the
@@ -1245,6 +1354,44 @@ fn shadow_log_path() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("shadow_suggestions.log"))
 }
 
+/// Opt-in LOCAL bubble debug log: one line per bubble that fires, with the exact
+/// typed → suggested pair, lane/tier, evidence and a timestamp. Words stay on this
+/// Mac in `~/.typeassist/bubble_debug.log` (honors `TYPEASSIST_DATA_DIR`) — no
+/// network, no UI. **Off unless switched on**: create the empty file
+/// `~/.typeassist/bubble_debug.on` (or set `TYPEASSIST_BUBBLE_LOG=1`); delete the
+/// file to turn it off. Same on-device pairs as `shadow_suggestions.log`.
+const BUBBLE_DEBUG_FLAG: &str = "bubble_debug.on";
+const BUBBLE_DEBUG_LOG: &str = "bubble_debug.log";
+/// Hard size cap so the log can never grow unbounded; past it, lines are dropped.
+const BUBBLE_DEBUG_MAX_BYTES: u64 = 1_000_000;
+
+fn bubble_debug_enabled(dir: &Path) -> bool {
+    std::env::var_os("TYPEASSIST_BUBBLE_LOG").is_some_and(|v| v == "1") || dir.join(BUBBLE_DEBUG_FLAG).exists()
+}
+
+/// One log line. `typed`/`target` are exactly what the bubble shows (user's
+/// casing); `meta` carries the lane, tier, evidence and the raw lowercase target.
+fn bubble_debug_line(now: u64, typed: &str, target: &str, meta: &str) -> String {
+    format!("{now} bubble  {typed} -> {target}  {meta}\n")
+}
+
+/// Append a bubble line when enabled. Best-effort: never disturbs the pipeline.
+fn log_bubble_debug(now: u64, typed: &str, target: &str, meta: &str) {
+    use std::io::Write;
+    let Some(dir) = typeassist_dir() else { return };
+    if !bubble_debug_enabled(&dir) {
+        return;
+    }
+    let path = dir.join(BUBBLE_DEBUG_LOG);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() >= BUBBLE_DEBUG_MAX_BYTES) {
+        return;
+    }
+    let line = bubble_debug_line(now, typed, target, meta);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// Minimum interval between live motor-map flushes when there are unsaved
 /// observations. The watchdog checks every 1s; flushing at most this often
 /// bounds force-quit data loss to ~this window while keeping disk writes
@@ -1403,6 +1550,15 @@ struct DailyEntry {
     slips: u64,
     coord: u64,
     precis: u64,
+    /// Bubble scorecard counters (text-free tallies, local-day). `None` = the
+    /// counter did not run that day (rows written before this existed) — NOT
+    /// zero. A day written by a build that has them always carries `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bubbles_shown: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    self_matched: Option<u64>,
 }
 
 /// The file: a version tag + the accumulated daily history.
@@ -1422,6 +1578,11 @@ struct DailyTally {
     slips: u64,
     coord: u64,
     precis: u64,
+    /// Bubble scorecard: bubbles displayed / accepted (Shift, injection
+    /// succeeded) / ignored-then-retyped-exactly. DIVERGED is derived on read.
+    bubbles_shown: u64,
+    accepted: u64,
+    self_matched: u64,
     /// Unwritten increments since the last flush — gates the periodic write.
     dirty: bool,
 }
@@ -1434,6 +1595,9 @@ impl DailyTally {
             slips: 0,
             coord: 0,
             precis: 0,
+            bubbles_shown: 0,
+            accepted: 0,
+            self_matched: 0,
             dirty: false,
         }
     }
@@ -1450,7 +1614,30 @@ impl DailyTally {
             slips: self.slips,
             coord: self.coord,
             precis: self.precis,
+            bubbles_shown: Some(self.bubbles_shown),
+            accepted: Some(self.accepted),
+            self_matched: Some(self.self_matched),
         }
+    }
+
+    fn add_bubble_shown(&mut self) {
+        self.bubbles_shown += 1;
+        self.dirty = true;
+    }
+
+    fn add_accepted(&mut self) {
+        self.accepted += 1;
+        self.dirty = true;
+    }
+
+    fn add_self_matched(&mut self) {
+        self.self_matched += 1;
+        self.dirty = true;
+    }
+
+    /// Anything worth writing at a day rollover.
+    fn has_data(&self) -> bool {
+        self.words > 0 || self.slips > 0 || self.bubbles_shown > 0
     }
 
     /// A word landed (a `Kept` clean word, or a `CorrectedToOther` that also
@@ -1505,6 +1692,11 @@ fn load_daily_tally(path: Option<&Path>, now: u64) -> DailyTally {
             tally.slips = e.slips;
             tally.coord = e.coord;
             tally.precis = e.precis;
+            // A pre-counter row (None) resumes at 0: from this build on, today's
+            // counters are running, so 0 is honest from here.
+            tally.bubbles_shown = e.bubbles_shown.unwrap_or(0);
+            tally.accepted = e.accepted.unwrap_or(0);
+            tally.self_matched = e.self_matched.unwrap_or(0);
         }
     }
     tally
@@ -1548,7 +1740,7 @@ fn tick_progress(
 
     if today != tally.date {
         let mut wrote = false;
-        if tally.words > 0 || tally.slips > 0 {
+        if tally.has_data() {
             if let Some(path) = path {
                 match write_progress(path, tally) {
                     Ok(()) => wrote = true,
@@ -1836,6 +2028,7 @@ fn tick_resolver<R: Runtime>(
     guess_ledger: &mut GuessLedger,
     funnel: &mut Funnel,
     tally: &mut DailyTally,
+    bubbles: &mut BubbleLedger,
     competitor_sense: &mut CompetitorSense,
 ) {
     let now = now_ms();
@@ -1913,6 +2106,27 @@ fn tick_resolver<R: Runtime>(
                             anchors.anchors(),
                             line_buf,
                         );
+                        // Bubble scorecard — SELF_MATCHED: the user ignored a bubble,
+                        // then fixed this exact slot to Jordan's exact suggested
+                        // word themselves. Tie = same slot + typed + target inside
+                        // the window (see `BubbleLedger`). Counts only; no text kept.
+                        if let Some(c) = corrected.as_deref() {
+                            if let Some(start) = anchors
+                                .anchors()
+                                .iter()
+                                .find(|a| a.id == rec.anchor_id)
+                                .map(|a| a.start)
+                            {
+                                if bubbles.note_correction(
+                                    start,
+                                    &normalize_word(&rec.original_text),
+                                    &normalize_word(c),
+                                    now,
+                                ) {
+                                    tally.add_self_matched();
+                                }
+                            }
+                        }
                         // Watch Dog Not Attack Dog (M3 autocorrect coexistence):
                         // a word was just corrected toward a COMMON target that
                         // Jordan didn't cause (his own accepts are echo-skipped
@@ -3341,6 +3555,8 @@ pub fn spawn<R: Runtime>(
         // keystroke past the word, a caret move, the ~5s timeout, or a newer
         // suggestion — so an accept only ever injects against the live caret.
         let mut pending_suggestion: Option<PendingSuggestion> = None;
+        // Ignored-bubble memory for SELF_MATCHED (in-memory only, text never persisted).
+        let mut bubbles = BubbleLedger::default();
         // UK English (v0.3.0): the spelling variant a suggestion should use for a
         // variant word, set from the OS locale by L5 via
         // `EngineControl::SetSpellingVariant`. Defaults to American until L5
@@ -3793,9 +4009,7 @@ pub fn spawn<R: Runtime>(
                             }
                             // The caret moved off the boundary — a pending bubble
                             // could no longer inject safely. Drop it and hide it.
-                            if pending_suggestion.take().is_some() {
-                                let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
-                            }
+                            end_pending_bubble(&mut pending_suggestion, &mut bubbles, &app_handle);
                         }
                         InputEvent::ShiftTap { .. } => {
                             // M3 bubble ACCEPT — an isolated Shift tap applies the
@@ -3806,6 +4020,14 @@ pub fn spawn<R: Runtime>(
                             // in the right place. No suggestion → a bare Shift is a
                             // harmless no-op.
                             if let Some(ps) = pending_suggestion.take() {
+                                // Bubble scorecard: remember this bubble's slot in case
+                                // the accept doesn't land (noted unaccepted below).
+                                let ended_slot = (
+                                    ps.word_end.saturating_sub(ps.word_len),
+                                    normalize_word(&ps.typed),
+                                    normalize_word(&ps.target),
+                                );
+                                let mut accepted_ok = false;
                                 // `after_len` = chars from the word's end to the
                                 // caret now (the boundary + anything typed since).
                                 // 1 = immediate (caret still at the boundary);
@@ -3941,6 +4163,8 @@ pub fn spawn<R: Runtime>(
                                     };
                                     if applied {
                                         funnel.corrections_applied += 1;
+                                        tally.add_accepted();
+                                        accepted_ok = true;
                                         tracing::info!(
                                             "CORRECTION_APPLIED typed={:?} target={:?} delete_count={} boundary={:?} after_len={}",
                                             ps.typed,
@@ -3989,6 +4213,17 @@ pub fn spawn<R: Runtime>(
                                         );
                                     }
                                 }
+                                // ACCEPTED counts only a successful injection. An
+                                // aborted / declined / failed accept ended the bubble
+                                // unaccepted — it can still be self-matched.
+                                if !accepted_ok {
+                                    bubbles.note_ended(
+                                        ended_slot.0,
+                                        &ended_slot.1,
+                                        &ended_slot.2,
+                                        now_ms(),
+                                    );
+                                }
                             }
                         }
                         InputEvent::Backspace { .. } => {
@@ -3997,9 +4232,7 @@ pub fn spawn<R: Runtime>(
                             // dismiss; we can't safely tell a source-word edit from
                             // a forward fix-up, and a wrong-place accept is worse
                             // than a missed one).
-                            if pending_suggestion.take().is_some() {
-                                let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
-                            }
+                            end_pending_bubble(&mut pending_suggestion, &mut bubbles, &app_handle);
                             // Funnel: a backspace passed the pause filter and
                             // enters the edit pipeline (not a modifier drop).
                             funnel.keystrokes_accepted += 1;
@@ -4077,6 +4310,7 @@ pub fn spawn<R: Runtime>(
                                 &mut guess_ledger,
                                 &mut funnel,
                                 &mut tally,
+                                &mut bubbles,
                                 &mut competitor_sense,
                             );
                             let snap = anchors.snapshot();
@@ -4442,6 +4676,7 @@ pub fn spawn<R: Runtime>(
                                                     // gate (`correction_enabled`) still arms the whole feature. Capture what
                                                     // the bubble needs BEFORE `tok` moves into emit_sealed_token.
                                                     let mut fire: Option<PendingSuggestion> = None;
+                                                    let mut fire_meta = String::new();
                                                     // FIRE_TIMING t1 — set at the fire decision below; hoisted here
                                                     // so it stays in scope for the t2 emit log (measurement only).
                                                     let mut t1: u64 = 0;
@@ -4474,6 +4709,10 @@ pub fn spawn<R: Runtime>(
                                                             if let Some(p) = shadow_log_path() {
                                                                 append_shadow_log(&p, now_ms(), &sh);
                                                             }
+                                                            fire_meta = format!(
+                                                                "lane=learned tier={} evidence={:.1} bar={:.1}/{:.1} raw_target={}",
+                                                                sh.tier, sh.evidence, sh.bar_used, sh.base_bar, sh.target
+                                                            );
                                                             Some((inner.clone(), sh.target.clone()))
                                                         } else {
                                                             let scan = correction_engine::shadow_convergence_scan(
@@ -4487,6 +4726,13 @@ pub fn spawn<R: Runtime>(
                                                                 }
                                                                 // convergent ⇒ exactly one fire target (the lone
                                                                 // candidate, or the frequency-dominant one).
+                                                                fire_meta = format!(
+                                                                    "lane=bold tier=convergence candidates={} nonword={} affected={:.2} raw_target={}",
+                                                                    scan.candidates.len(),
+                                                                    scan.typed_is_non_word,
+                                                                    scan.affectedness,
+                                                                    scan.target.as_deref().unwrap_or("")
+                                                                );
                                                                 scan.target.as_ref().map(|t| (inner.clone(), t.clone()))
                                                             } else {
                                                                 None
@@ -4631,6 +4877,8 @@ pub fn spawn<R: Runtime>(
                                                             dwell_ms,
                                                             timestamp_ms,
                                                         );
+                                                        tally.add_bubble_shown();
+                                                        log_bubble_debug(now_ms(), &ps.typed, &ps.target, &fire_meta);
                                                         pending_suggestion = Some(ps);
                                                     }
                                                 }
@@ -4693,6 +4941,7 @@ pub fn spawn<R: Runtime>(
                                                     &mut guess_ledger,
                                                     &mut funnel,
                                                     &mut tally,
+                                                    &mut bubbles,
                                                     &mut competitor_sense,
                                                 );
                                                 let snap = anchors.snapshot();
@@ -4756,8 +5005,7 @@ pub fn spawn<R: Runtime>(
                                     ps.outer_trail_len,
                                     ANCHORED_ACCEPT_ENABLED,
                                 ) {
-                                    pending_suggestion = None;
-                                    let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                                    end_pending_bubble(&mut pending_suggestion, &mut bubbles, &app_handle);
                                 }
                             }
                         }
@@ -4985,9 +5233,7 @@ pub fn spawn<R: Runtime>(
                             if allow_list.set_enabled(enabled) {
                                 if !enabled {
                                     last_correction = None;
-                                    if pending_suggestion.take().is_some() {
-                                        let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
-                                    }
+                                    end_pending_bubble(&mut pending_suggestion, &mut bubbles, &app_handle);
                                 }
                                 tracing::info!("CORRECTION_GATE enabled={enabled}");
                                 persist_and_emit_allow_list(
@@ -5055,10 +5301,7 @@ pub fn spawn<R: Runtime>(
                                     allow_list.set_enabled(false);
                                     allow_list.patterns.clear();
                                     last_correction = None;
-                                    if pending_suggestion.take().is_some() {
-                                        let _ =
-                                            app_handle.emit(EVT_CORRECTION_DISMISSED, ());
-                                    }
+                                    end_pending_bubble(&mut pending_suggestion, &mut bubbles, &app_handle);
                                     persist_and_emit_allow_list(
                                         &app_handle,
                                         &allow_list,
@@ -5103,8 +5346,7 @@ pub fn spawn<R: Runtime>(
                     // typist clears it eagerly on the next keystroke.
                     if let Some(ps) = &pending_suggestion {
                         if now_ms().saturating_sub(ps.armed_at_ms) > SUGGESTION_TIMEOUT_MS {
-                            pending_suggestion = None;
-                            let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                            end_pending_bubble(&mut pending_suggestion, &mut bubbles, &app_handle);
                         }
                     }
 
@@ -5131,6 +5373,7 @@ pub fn spawn<R: Runtime>(
                         &mut guess_ledger,
                         &mut funnel,
                         &mut tally,
+                        &mut bubbles,
                         &mut competitor_sense,
                     );
 
@@ -5641,6 +5884,117 @@ mod tests {
         // 5b: the trailing `"` sits beyond word_end (in tok.trailing). The
         // leading `"` is never in the delete window, so it survives untouched.
         assert_accept_revert("beleive", "\"", "believe", "\"beleive\" ", "\"believe\" ");
+    }
+
+
+    // ---- Bubble ledger (SELF_MATCHED tie-back) ----------------------------
+
+    #[test]
+    fn self_match_positive_counts_once() {
+        let mut t = DailyTally::new((2026, 6, 3));
+        let mut b = BubbleLedger::default();
+        assert_eq!(t.self_matched, 0);
+        b.note_ended(10, "teh", "the", 1_000);
+        if b.note_correction(10, "teh", "the", 5_000) {
+            t.add_self_matched();
+        }
+        assert_eq!(t.self_matched, 1, "ignored bubble then exact retype must count");
+    }
+
+    #[test]
+    fn self_match_breaks_on_wrong_slot() {
+        let mut b = BubbleLedger::default();
+        b.note_ended(10, "teh", "the", 1_000);
+        assert!(!b.note_correction(40, "teh", "the", 5_000), "different slot must not count");
+    }
+
+    #[test]
+    fn self_match_breaks_on_wrong_word() {
+        let mut b = BubbleLedger::default();
+        b.note_ended(10, "teh", "the", 1_000);
+        assert!(!b.note_correction(10, "teh", "then", 5_000), "fixed to a different word must not count");
+        let mut b2 = BubbleLedger::default();
+        b2.note_ended(10, "teh", "the", 1_000);
+        assert!(!b2.note_correction(10, "tej", "the", 5_000), "different typed word must not count");
+    }
+
+    #[test]
+    fn self_match_breaks_outside_window() {
+        let mut b = BubbleLedger::default();
+        b.note_ended(10, "teh", "the", 1_000);
+        assert!(
+            !b.note_correction(10, "teh", "the", 1_000 + SELF_MATCH_WINDOW_MS + 1),
+            "retype after the window must not count"
+        );
+    }
+
+    #[test]
+    fn self_match_inside_window_edge_counts() {
+        let mut b = BubbleLedger::default();
+        b.note_ended(10, "teh", "the", 1_000);
+        assert!(b.note_correction(10, "teh", "the", 1_000 + SELF_MATCH_WINDOW_MS));
+    }
+
+    #[test]
+    fn self_match_never_double_counts() {
+        let mut b = BubbleLedger::default();
+        b.note_ended(10, "teh", "the", 1_000);
+        assert!(b.note_correction(10, "teh", "the", 2_000));
+        assert!(!b.note_correction(10, "teh", "the", 3_000), "one bubble matches once");
+    }
+
+    #[test]
+    fn pre_counter_rows_read_untracked_not_zero() {
+        let old = r#"{"version":1,"days":[{"date":"2026-06-20","words":480,"slips":19,"coord":2,"precis":17}]}"#;
+        let s: ProgressSnapshots = serde_json::from_str(old).unwrap();
+        assert_eq!(s.days[0].bubbles_shown, None);
+        assert_eq!(s.days[0].accepted, None);
+        assert_eq!(s.days[0].self_matched, None);
+        // And a running-but-zero day serialises as 0, distinguishable from absent.
+        let t = DailyTally::new((2026, 6, 3));
+        let e = serde_json::to_string(&t.to_entry()).unwrap();
+        assert!(e.contains("\"bubbles_shown\":0"), "{e}");
+        let legacy = serde_json::to_string(&s.days[0]).unwrap();
+        assert!(!legacy.contains("bubbles_shown"), "{legacy}");
+    }
+
+    #[test]
+    fn bubble_counters_resume_after_restart() {
+        let scratch = ScratchDir::new("bubble_resume");
+        let path = scratch.file();
+        let now = epoch_ms_from_ymd(2026, 6, 3) + 5_000;
+        let mut t = DailyTally::new(local_ymd_from_epoch_ms(now));
+        t.add_bubble_shown();
+        t.add_bubble_shown();
+        t.add_accepted();
+        t.add_self_matched();
+        write_progress(&path, &t).unwrap();
+        let r = load_daily_tally(Some(&path), now);
+        assert_eq!((r.bubbles_shown, r.accepted, r.self_matched), (2, 1, 1));
+    }
+
+
+    #[test]
+    fn bubble_debug_line_carries_exact_pair_and_meta() {
+        let l = bubble_debug_line(1234, "Is", "Us", "lane=learned tier=real_word_source evidence=12.0 bar=11.6/12.0 raw_target=us");
+        assert_eq!(
+            l,
+            "1234 bubble  Is -> Us  lane=learned tier=real_word_source evidence=12.0 bar=11.6/12.0 raw_target=us\n"
+        );
+    }
+
+    #[test]
+    fn bubble_debug_is_off_unless_flag_file_present() {
+        let scratch = ScratchDir::new("bubble_dbg");
+        let dir = scratch.file().parent().unwrap().to_path_buf();
+        let _ = std::fs::remove_file(dir.join(BUBBLE_DEBUG_FLAG));
+        if std::env::var_os("TYPEASSIST_BUBBLE_LOG").is_none() {
+            assert!(!bubble_debug_enabled(&dir), "must be off by default");
+            std::fs::write(dir.join(BUBBLE_DEBUG_FLAG), b"").unwrap();
+            assert!(bubble_debug_enabled(&dir), "flag file turns it on");
+            std::fs::remove_file(dir.join(BUBBLE_DEBUG_FLAG)).unwrap();
+            assert!(!bubble_debug_enabled(&dir), "deleting the flag turns it off");
+        }
     }
 
     #[test]
