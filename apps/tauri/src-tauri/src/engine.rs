@@ -1287,6 +1287,10 @@ impl CompetitorSense {
 /// never writes the same files as an installed release build (two writers on
 /// the same recovery data is a Principle #6/#8 hazard). Unset in normal use, so
 /// the default `~/.typeassist` is unchanged.
+pub(crate) fn data_dir() -> Option<PathBuf> {
+    typeassist_dir()
+}
+
 fn typeassist_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("TYPEASSIST_DATA_DIR") {
         return Some(PathBuf::from(dir));

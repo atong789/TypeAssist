@@ -56,3 +56,7 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSNotification", "NSString", "NSArray", "NSOperation", "NSGeometry"] }
 objc2-app-kit = { version = "0.3", features = ["NSMenu", "NSMenuItem", "NSEvent", "NSApplication", "NSResponder", "NSGraphicsContext"] }
 block2 = "0.6"
+# Open at Login: `SMAppService.mainApp` (macOS 13+ login-items API) — registers the
+# signed .app itself, shows up in System Settings ▸ General ▸ Login Items, and is
+# removable there. Local OS call only; no network (Principle #8 unaffected).
+objc2-service-management = { version = "0.3", default-features = false, features = ["std", "SMAppService", "SMErrors", "objc2", "objc2-foundation"] }
