@@ -1058,6 +1058,17 @@ struct Funnel {
     /// stopped landing and the store is flagged untracked (never a false zero).
     o_events: OutcomeCounts,
     o_recorded: OutcomeCounts,
+    /// Learned-lexicon persistence integrity (Principle #7). `lex_confirmed` is
+    /// the in-memory Confirmed count and `lex_persisted` the count last written
+    /// to (or restored from) `learned_lexicon.json`; both are stamped by
+    /// [`lexicon_integrity_check`] just before a dump and must agree. `lex_saves`
+    /// counts successful flushes, `lex_save_errors` failed ones, `lex_restored`
+    /// the words re-seated at startup.
+    lex_confirmed: u64,
+    lex_persisted: u64,
+    lex_saves: u64,
+    lex_save_errors: u64,
+    lex_restored: u64,
     /// **M3 autocorrect coexistence — "Watch Dog Not Attack Dog" (Principle
     /// #7).** Times Jordan stood down on a host-redundant (common) suggestion
     /// because he behaviourally sensed an active competing corrector
@@ -1130,7 +1141,8 @@ impl Funnel {
              c_word_pattern_saves: {}, c_corrections: {{applied: {}, undone: {}}}, \
              c_competitor_deferred: {}, c_space: {{observed: {}, accepted: {}, \
              drops_suspected: {}}}, c_outcomes_events_vs_recorded: {{shown: {}/{}, accepted: {}/{}, \
-             self_matched: {}/{}, undone: {}/{}}}, session_started_at: {} }}",
+             self_matched: {}/{}, undone: {}/{}}}, c_lexicon: {{confirmed: {}, persisted: {}, saves: {}, \
+             save_errors: {}, restored: {}}}, session_started_at: {} }}",
             self.keystrokes_received,
             self.autorepeat_dropped,
             self.keystrokes_accepted,
@@ -1160,6 +1172,11 @@ impl Funnel {
             self.o_recorded.self_matched,
             self.o_events.undone,
             self.o_recorded.undone,
+            self.lex_confirmed,
+            self.lex_persisted,
+            self.lex_saves,
+            self.lex_save_errors,
+            self.lex_restored,
             self.session_started_ms,
         );
     }
@@ -1340,6 +1357,15 @@ fn snapshots_dir() -> Option<PathBuf> {
 /// motor map (counts only — no order, no context).
 fn word_freq_path() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("word_freq.json"))
+}
+
+/// `~/.typeassist/learned_lexicon.json` — the Confirmed words of the
+/// `LexiconProposer`, persisted so a word the user has confirmed stays known
+/// across restarts. Counts as learned data: backed up, restored and deleted
+/// with the other stores (see `backup.rs`). Words are kept indefinitely — a word
+/// is a fact, not a habit, so it does not decay.
+fn learned_lexicon_path() -> Option<PathBuf> {
+    typeassist_dir().map(|d| d.join(crate::backup::LEARNED_LEXICON_FILE))
 }
 
 /// `~/.typeassist/word_freq_snapshots` — the word-tally's daily dated archive.
@@ -2459,6 +2485,61 @@ fn flush_word_patterns(
     }
 }
 
+/// Flush the learned lexicon (Confirmed words) when it changed. Driven by the
+/// 1s watchdog; the `dirty` flag on the proposer means an idle lexicon costs
+/// nothing. Counts the outcome on the funnel and remembers how many words are
+/// now on disk so [`lexicon_integrity_check`] can reconcile.
+fn flush_learned_lexicon(
+    proposer: &mut LexiconProposer,
+    path: Option<&Path>,
+    funnel: &mut Funnel,
+    last_persisted: &mut usize,
+) {
+    let Some(path) = path else {
+        return; // no HOME — in-memory only this session
+    };
+    match correction_engine::lexicon_persist_if_dirty(proposer, path) {
+        Ok(Some(n)) => {
+            funnel.lex_saves += 1;
+            *last_persisted = n;
+            tracing::info!("LEXICON_SAVED words={n} path={path:?}");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            funnel.lex_save_errors += 1;
+            tracing::warn!("LEXICON_SAVE_FAILED ({e}) — will retry on the next tick");
+        }
+    }
+}
+
+/// The learned lexicon in memory disagrees with what is on disk.
+fn lexicon_mismatch(confirmed: usize, persisted: usize) -> bool {
+    confirmed != persisted
+}
+
+/// Stamp the lexicon counters on the funnel (after one last flush attempt, so a
+/// change still in flight is not misread as a drop) and warn if memory and disk
+/// disagree. Returns whether a mismatch was found. Called before each dump.
+fn lexicon_integrity_check(
+    funnel: &mut Funnel,
+    proposer: &mut LexiconProposer,
+    path: Option<&Path>,
+    last_persisted: &mut usize,
+) -> bool {
+    flush_learned_lexicon(proposer, path, funnel, last_persisted);
+    let confirmed = proposer.confirmed_proposals().len();
+    funnel.lex_confirmed = confirmed as u64;
+    funnel.lex_persisted = *last_persisted as u64;
+    let bad = path.is_some() && lexicon_mismatch(confirmed, *last_persisted);
+    if bad {
+        tracing::warn!(
+            "LEXICON_PERSIST_MISMATCH confirmed_in_memory={confirmed} persisted={}",
+            *last_persisted
+        );
+    }
+    bad
+}
+
 /// Flush the live word-frequency tally (C5e) on the same time cadence as
 /// [`flush_motor_map`] — its own file, its own last-save clock. Observe-only;
 /// no pruning (it does not decay). Returns whether a write succeeded.
@@ -3413,6 +3494,27 @@ pub fn spawn<R: Runtime>(
         // contribution so a kept-then-corrected word never stays
         // promoted.
         let mut proposer = LexiconProposer::new();
+        // Re-seat the Confirmed words saved by a previous run so a word the user
+        // confirmed stays known (and a valid suggestion target) across restarts.
+        // Entries that no longer belong (now in the bundled dictionary, or a
+        // spelling variant) are dropped, and the file is rewritten to match.
+        let learned_lexicon_path = learned_lexicon_path();
+        let mut lex_last_persisted: usize = 0;
+        let mut lex_restored_at_start: u64 = 0;
+        if let Some(p) = learned_lexicon_path.as_deref() {
+            let report = proposer.restore_confirmed(correction_engine::load_learned_lexicon(p));
+            lex_last_persisted = report.restored;
+            lex_restored_at_start = report.restored as u64;
+            if report.skipped > 0 {
+                proposer.mark_dirty();
+            }
+            tracing::info!(
+                "LEXICON_LOADED restored={} skipped={} path={:?}",
+                report.restored,
+                report.skipped,
+                p
+            );
+        }
         // L4 Observing brief, Component 5c: motor map. Learns this user's
         // per-key slip distribution from resolved Kept / CorrectedToOther
         // outcomes (fed in `tick_resolver`). Loaded from disk on startup;
@@ -3625,6 +3727,7 @@ pub fn spawn<R: Runtime>(
         // Capture-integrity funnel (Principle #7). Per-session boundary
         // counters; dumped on the Cmd+Shift+F chord and every 60s.
         let mut funnel = Funnel::new(now_ms());
+        funnel.lex_restored = lex_restored_at_start;
         // Build marker (Principle #7 observability): one line at engine startup so
         // the dev Terminal proves WHICH build is running — the bubble suggest path
         // (fire from the classifier, accept via ShiftTap), not a stale engine.
@@ -4472,6 +4575,12 @@ pub fn spawn<R: Runtime>(
                             if modifiers.command && modifiers.shift {
                                 if matches!(single_char, Some('f') | Some('F')) {
                                     outcome_integrity_check(&funnel, &mut word_patterns, now_ms());
+                                    lexicon_integrity_check(
+                                        &mut funnel,
+                                        &mut proposer,
+                                        learned_lexicon_path.as_deref(),
+                                        &mut lex_last_persisted,
+                                    );
                                     funnel.dump();
                                     dump_classifications(&word_patterns, &motor_map);
                                     funnel.reset(now_ms());
@@ -5168,6 +5277,8 @@ pub fn spawn<R: Runtime>(
                             // proposer state empty, lex.learned empty,
                             // is_known back to bundled-only.
                             proposer.reset_all();
+                            // The reset is persisted by the next flush (an empty
+                            // lexicon file), so a restart can't bring the words back.
                             let _ = app_handle.emit(EVT_LEXICON_RESET, ());
                             let _ = app_handle.emit(
                                 EVT_LEARNED_SNAPSHOT,
@@ -5356,6 +5467,20 @@ pub fn spawn<R: Runtime>(
                                     // bundle — start it clean so is_known relearns
                                     // rather than carrying the pre-restore session.
                                     proposer.reset_all();
+                                    // The bundle carries the learned lexicon (when the
+                                    // backup has one) and `apply_bundle` wrote it back to
+                                    // disk — re-seat it so restored words are known again.
+                                    if let Some(p) = learned_lexicon_path.as_deref() {
+                                        let report = proposer.restore_confirmed(
+                                            correction_engine::load_learned_lexicon(p),
+                                        );
+                                        lex_last_persisted = report.restored;
+                                        if report.skipped > 0 {
+                                            proposer.mark_dirty();
+                                        } else {
+                                            proposer.take_dirty();
+                                        }
+                                    }
                                     tracing::info!("DATA_RESTORED from {path}");
                                     let _ = app_handle.emit(
                                         EVT_DATA_RESTORED,
@@ -5386,6 +5511,11 @@ pub fn spawn<R: Runtime>(
                             ) {
                                 Ok(()) => {
                                     proposer.reset_all();
+                                    // `delete_all_data` already removed the lexicon file;
+                                    // don't let the reset's dirty flag write an empty one
+                                    // back — a true first-launch-clean disk.
+                                    proposer.take_dirty();
+                                    lex_last_persisted = 0;
                                     // Genuine clean slate: corrections back to off
                                     // (default) + allow-list cleared, persisted and
                                     // echoed so the tray + Settings toggle converge.
@@ -5541,6 +5671,15 @@ pub fn spawn<R: Runtime>(
                         &mut last_word_freq_save_ms,
                     );
 
+                    // Learned lexicon: persist Confirmed words whenever the set
+                    // changed (dirty flag), so a confirmed word survives a restart.
+                    flush_learned_lexicon(
+                        &mut proposer,
+                        learned_lexicon_path.as_deref(),
+                        &mut funnel,
+                        &mut lex_last_persisted,
+                    );
+
                     // Phase 1 guesser accuracy scoreboard: same cadence, its own
                     // file. Observe-only — measurement, no injection.
                     flush_guess_ledger(
@@ -5566,6 +5705,12 @@ pub fn spawn<R: Runtime>(
                     // to the on-demand Cmd+Shift+F chord.
                     if watchdog_ticks % 60 == 0 {
                         outcome_integrity_check(&funnel, &mut word_patterns, now_ms());
+                        lexicon_integrity_check(
+                            &mut funnel,
+                            &mut proposer,
+                            learned_lexicon_path.as_deref(),
+                            &mut lex_last_persisted,
+                        );
                         funnel.dump();
                         // Read-only kill-switch observability (no injection).
                         dump_classifications(&word_patterns, &motor_map);

@@ -59,7 +59,8 @@ pub use kill_switch::{
 };
 pub use lexicon::{Lexicon, LEXICON_VERSION};
 pub use lexicon_proposal::{
-    HoldReason, Lane, LexiconProposal, LexiconProposer, MotorVerdict, ProposalTier, ProposalUpdate,
+    load_learned_lexicon, persist_if_dirty as lexicon_persist_if_dirty, save_learned_lexicon, HoldReason, Lane, LexiconProposal, LexiconProposer,
+    MotorVerdict, ProposalTier, ProposalUpdate, RestoreReport, LEARNED_LEXICON_FILE_VERSION,
     LEXICON_PROPOSAL_VERSION,
 };
 pub use linguistic::{

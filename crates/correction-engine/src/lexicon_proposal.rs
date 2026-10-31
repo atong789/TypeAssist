@@ -162,6 +162,84 @@ pub const CASING_RESCUE_THRESHOLD: f64 = 0.20;
 /// stray observation. **PLACEHOLDER**.
 pub const CASING_MIN_SAMPLES: f64 = 5.0;
 
+// ---- Persisted learned lexicon (learned_lexicon.json) ----------------------
+
+/// Version of the on-disk `learned_lexicon.json` envelope. A file with any
+/// other version is quarantined (never overwritten in place, never deleted).
+pub const LEARNED_LEXICON_FILE_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct LearnedLexiconFile {
+    version: u32,
+    words: Vec<LexiconProposal>,
+}
+
+/// What [`LexiconProposer::restore_confirmed`] did, for the host's log line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub restored: usize,
+    pub skipped: usize,
+}
+
+/// Durably write the confirmed words (atomic write via [`crate::persist`]).
+pub fn save_learned_lexicon(
+    path: &std::path::Path,
+    words: &[LexiconProposal],
+) -> std::io::Result<()> {
+    let file = LearnedLexiconFile {
+        version: LEARNED_LEXICON_FILE_VERSION,
+        words: words.to_vec(),
+    };
+    let bytes = serde_json::to_vec_pretty(&file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    crate::persist::durable_write(path, &bytes)
+}
+
+/// Read the saved words. Missing file → empty. A corrupt or wrong-version file
+/// is moved aside via [`crate::persist::quarantine_corrupt`] (never deleted)
+/// and the lexicon starts empty — the engine must still start.
+pub fn load_learned_lexicon(path: &std::path::Path) -> Vec<LexiconProposal> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    match serde_json::from_slice::<LearnedLexiconFile>(&bytes) {
+        Ok(f) if f.version == LEARNED_LEXICON_FILE_VERSION => f.words,
+        Ok(f) => {
+            crate::persist::quarantine_corrupt(
+                path,
+                format!("learned_lexicon version {} unsupported", f.version),
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            crate::persist::quarantine_corrupt(path, e);
+            Vec::new()
+        }
+    }
+}
+
+/// The host's flush step: if the learned set changed since the last flush,
+/// durably write it. Returns `Ok(Some(n))` when `n` words were written,
+/// `Ok(None)` when nothing was dirty. On a write error the dirty flag is put
+/// back so the next flush retries — a failed save must never be forgotten.
+pub fn persist_if_dirty(
+    proposer: &mut LexiconProposer,
+    path: &std::path::Path,
+) -> std::io::Result<Option<usize>> {
+    if !proposer.take_dirty() {
+        return Ok(None);
+    }
+    let words = proposer.confirmed_proposals();
+    match save_learned_lexicon(path, &words) {
+        Ok(()) => Ok(Some(words.len())),
+        Err(e) => {
+            proposer.dirty = true;
+            Err(e)
+        }
+    }
+}
+
 // ---- Public types ---------------------------------------------------------
 
 /// Which promotion path a candidate word is on. The lane is determined
@@ -382,6 +460,10 @@ pub struct LexiconProposer {
     /// credited on resume — the user wants them excluded, not
     /// deferred. Default `false` (learning active).
     credit_paused: bool,
+    /// The learned (`Confirmed`) set changed since the host last persisted it.
+    /// Set on any learn/unlearn and on [`Self::reset_all`]; the host clears it
+    /// with [`Self::take_dirty`] when it writes `learned_lexicon.json`.
+    dirty: bool,
 }
 
 impl std::fmt::Debug for LexiconProposer {
@@ -438,6 +520,7 @@ impl LexiconProposer {
             casing_word_weight: 0.0,
             learned_at_ms: HashMap::new(),
             credit_paused: false,
+            dirty: false,
         }
     }
 
@@ -652,7 +735,7 @@ impl LexiconProposer {
         };
         let in_learned = self.lex.is_learned(word);
         let key = word.to_ascii_lowercase();
-        match (in_learned, is_confirmed) {
+        let changed = match (in_learned, is_confirmed) {
             (false, true) => {
                 self.learned_at_ms.insert(key, last_seen_ms);
                 self.lex.learn(word)
@@ -662,7 +745,11 @@ impl LexiconProposer {
                 self.lex.unlearn(word)
             }
             _ => false,
+        };
+        if changed {
+            self.dirty = true;
         }
+        changed
     }
 
     /// One pass of "re-evaluate every proposal against the live
@@ -766,6 +853,68 @@ impl LexiconProposer {
         self.record_contributions.clear();
         self.learned_at_ms.clear();
         self.lex.clear_learned();
+        // The persisted file must follow the wipe, or a restart would bring
+        // the reset words straight back.
+        self.dirty = true;
+    }
+
+    // ---- Persistence: the learned lexicon survives a restart ---------
+
+    /// Every `Confirmed` proposal, sorted by word — exactly what is written to
+    /// `learned_lexicon.json`. A word is a fact, not a habit, so nothing here
+    /// decays or ages out: a word stays until it is demoted by the normal
+    /// self-cleaning / manual-correction paths or the user resets the lexicon.
+    pub fn confirmed_proposals(&self) -> Vec<LexiconProposal> {
+        let mut out: Vec<LexiconProposal> = self
+            .proposals
+            .values()
+            .filter(|p| matches!(p.tier, ProposalTier::Confirmed))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.word.cmp(&b.word));
+        out
+    }
+
+    /// Force the next flush to rewrite the file (e.g. after a restore dropped
+    /// entries that no longer belong, so disk is brought back in line).
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// True iff the learned set changed since the last call; clears the flag.
+    /// The host persists when this returns true.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.dirty, false)
+    }
+
+    /// Re-seat previously saved `Confirmed` words after a restart: each goes
+    /// into BOTH the proposer (as a `Confirmed` proposal) and the shared
+    /// lexicon's learned set. Restoring the proposal — not just the word — is
+    /// load-bearing: [`Self::sync_learned_against_current`] is state-based and
+    /// would unlearn a learned word the proposer has no `Confirmed` proposal
+    /// for, the first time the user typed it again.
+    ///
+    /// Guards: an entry that is now in the bundled dictionary is redundant, and
+    /// a spelling-variant word must never be re-learned (the locale gate and
+    /// the learner guard both rely on that), so both are skipped.
+    pub fn restore_confirmed(&mut self, saved: Vec<LexiconProposal>) -> RestoreReport {
+        let mut report = RestoreReport::default();
+        for mut p in saved {
+            if p.word.is_empty()
+                || self.lex.is_in_clean(&p.word)
+                || crate::spelling_variant::is_variant_word(&p.word)
+            {
+                report.skipped += 1;
+                continue;
+            }
+            p.tier = ProposalTier::Confirmed;
+            self.learned_at_ms
+                .insert(p.word.to_ascii_lowercase(), p.last_seen_ms);
+            self.lex.learn(&p.word);
+            self.proposals.insert(p.word.clone(), p);
+            report.restored += 1;
+        }
+        report
     }
 
     // ---- Internal helpers --------------------------------------------
@@ -2486,5 +2635,213 @@ mod tests {
         let snap = p.snapshot();
         assert_eq!(snap[0].word, "beta");
         assert_eq!(snap[1].word, "alpha");
+    }
+
+    // ---- Persistence: the learned lexicon survives a restart -----------
+
+    fn scratch_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("ta-lexicon-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("learned_lexicon.json")
+    }
+
+    /// Drive `word` to `Confirmed` through the normal Kept path.
+    fn confirm(p: &mut LexiconProposer, ledger: &mut DecisionLedger, word: &str) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for _ in 0..CONFIRMED_OCCASIONS_THRESHOLD_FAST {
+            let id = append_fast(ledger, word, clean_motor(word));
+            let kept = flip_outcome(ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// Simulated restart: the process-wide learned set and the proposer are both
+    /// gone; only the file on disk survives.
+    fn simulate_restart() -> LexiconProposer {
+        Lexicon::shared().clear_learned();
+        LexiconProposer::new()
+    }
+
+    #[test]
+    fn confirmed_word_is_written_survives_restart_and_is_a_valid_target() {
+        use crate::kill_switch::{classify, PatternReadiness, SuggestTier};
+        use crate::motor_map::MotorMap;
+        use crate::word_pattern::WordPatternStore;
+        let _g = serial_setup();
+        let path = scratch_path("roundtrip");
+        let lex = Lexicon::shared();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        confirm(&mut p, &mut ledger, "Soumyo");
+        assert!(lex.is_learned("Soumyo"));
+
+        // Written.
+        assert_eq!(persist_if_dirty(&mut p, &path).unwrap(), Some(1));
+        assert!(path.exists(), "learned_lexicon.json must exist after a flush");
+        // Nothing dirty now → no rewrite.
+        assert_eq!(persist_if_dirty(&mut p, &path).unwrap(), None);
+
+        // Restart: memory is gone, the word is unknown again.
+        let mut p2 = simulate_restart();
+        assert!(!lex.is_known("Soumyo"), "precondition: a restart forgets memory");
+
+        // Reload from disk.
+        let report = p2.restore_confirmed(load_learned_lexicon(&path));
+        assert_eq!(report.restored, 1);
+        assert!(lex.is_known("Soumyo"), "a confirmed word must stay known across a restart");
+
+        // ...and it is a valid suggestion TARGET (the chinese/timecode gate).
+        let mut store = WordPatternStore::new();
+        for i in 0..4u64 {
+            store.observe_correction(Outcome::CorrectedToOther, "soumyi", "soumyo", 1_000_000 + i);
+        }
+        assert_eq!(
+            classify("soumyi", "soumyo", &store, lex, &MotorMap::new()),
+            PatternReadiness::Suggest { tier: SuggestTier::NonWordSource },
+            "a persisted word must pass the target-is-a-word gate"
+        );
+    }
+
+    #[test]
+    fn restored_word_survives_being_typed_again_after_restart() {
+        // The word-list-only restore re-adds to the learned set but not to the
+        // proposer; the state-based sync then UNLEARNS it the first time the user
+        // types it again (a fresh Provisional proposal, in_learned && !confirmed).
+        let _g = serial_setup();
+        let path = scratch_path("retype");
+        let lex = Lexicon::shared();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        confirm(&mut p, &mut ledger, "Soumyo");
+        persist_if_dirty(&mut p, &path).unwrap();
+
+        let mut p2 = simulate_restart();
+        p2.restore_confirmed(load_learned_lexicon(&path));
+        assert!(lex.is_known("Soumyo"));
+
+        // The user types the word once more after the restart.
+        let mut ledger2 = DecisionLedger::new();
+        let id = append_fast(&mut ledger2, "Soumyo", clean_motor("Soumyo"));
+        let kept = flip_outcome(&mut ledger2, id, Outcome::Kept);
+        p2.note_record(&kept);
+
+        assert!(
+            lex.is_known("Soumyo"),
+            "retyping a restored word must not unlearn it"
+        );
+        assert_eq!(p2.get("Soumyo").unwrap().tier, ProposalTier::Confirmed);
+    }
+
+    #[test]
+    fn corrupt_file_is_quarantined_and_lexicon_starts_empty() {
+        let path = scratch_path("corrupt");
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(load_learned_lexicon(&path).is_empty());
+        assert!(!path.exists(), "the corrupt file is moved aside, not left in place");
+        let aside = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains("corrupt"));
+        assert!(aside, "the corrupt file must be preserved, never deleted");
+    }
+
+    #[test]
+    fn wrong_version_file_is_quarantined() {
+        let path = scratch_path("version");
+        std::fs::write(&path, br#"{"version": 999, "words": []}"#).unwrap();
+        assert!(load_learned_lexicon(&path).is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn missing_file_is_just_empty() {
+        let path = scratch_path("missing");
+        assert!(load_learned_lexicon(&path).is_empty());
+    }
+
+    #[test]
+    fn reset_all_is_persisted_so_a_restart_does_not_bring_words_back() {
+        let _g = serial_setup();
+        let path = scratch_path("reset");
+        let lex = Lexicon::shared();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        confirm(&mut p, &mut ledger, "Soumyo");
+        persist_if_dirty(&mut p, &path).unwrap();
+
+        p.reset_all();
+        assert_eq!(persist_if_dirty(&mut p, &path).unwrap(), Some(0));
+
+        let mut p2 = simulate_restart();
+        let report = p2.restore_confirmed(load_learned_lexicon(&path));
+        assert_eq!(report.restored, 0);
+        assert!(!lex.is_known("Soumyo"));
+    }
+
+    #[test]
+    fn restore_skips_dictionary_words_and_spelling_variants() {
+        let _g = serial_setup();
+        let mut p = LexiconProposer::new();
+        let mk = |w: &str| LexiconProposal {
+            word: w.to_string(),
+            lane: Lane::Fast,
+            motor_verdict: MotorVerdict::Clean,
+            tier: ProposalTier::Confirmed,
+            occasions: 3,
+            last_motor_evidence: None,
+            last_record_id: 0,
+            last_seen_ms: 1,
+            plausibility: 0.0,
+            proximity: ProximityVerdict::FarFromKnown,
+            norvig_freq: 0,
+            version: LEXICON_PROPOSAL_VERSION,
+        };
+        let report = p.restore_confirmed(vec![mk("the"), mk("colour"), mk("Soumyo")]);
+        assert_eq!(report.restored, 1, "only the genuinely novel word is restored");
+        assert_eq!(report.skipped, 2);
+        assert!(Lexicon::shared().is_learned("Soumyo"));
+        assert!(!Lexicon::shared().is_learned("colour"));
+    }
+
+    #[test]
+    fn a_failed_save_stays_dirty_and_retries() {
+        let _g = serial_setup();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        confirm(&mut p, &mut ledger, "Soumyo");
+        // A path whose parent is a FILE cannot be created → write error.
+        let blocker = scratch_path("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let bad = blocker.join("learned_lexicon.json");
+        assert!(persist_if_dirty(&mut p, &bad).is_err());
+        let good = scratch_path("retry");
+        assert_eq!(
+            persist_if_dirty(&mut p, &good).unwrap(),
+            Some(1),
+            "a failed save must not be forgotten"
+        );
+    }
+
+    #[test]
+    fn restored_words_do_not_decay_or_age_out() {
+        // "A word is a fact, not a habit": a very old last_seen_ms is restored
+        // exactly as saved — there is no staleness gate on vocabulary.
+        let _g = serial_setup();
+        let path = scratch_path("old");
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        confirm(&mut p, &mut ledger, "Soumyo");
+        let mut words = p.confirmed_proposals();
+        words[0].last_seen_ms = 1; // ~55 years before "now"
+        save_learned_lexicon(&path, &words).unwrap();
+        let mut p2 = simulate_restart();
+        assert_eq!(p2.restore_confirmed(load_learned_lexicon(&path)).restored, 1);
+        assert!(Lexicon::shared().is_known("Soumyo"));
     }
 }
