@@ -79,6 +79,22 @@ Run in order. All must hold.
       **without** wiping. It must launch **straight to the app (no onboarding)**
       and the Progress counts/history must be intact — an upgrade must never look
       like a first run or lose recovery data (Principle #6).
+- [ ] **Open at Login (signed build only — cannot be proven in `tauri dev`).**
+      After the first launch of the installed app: System Settings ▸ General ▸
+      Login Items lists TenCalmDigits (macOS also shows an "item added" notice
+      once). Settings ▸ **Open at login** reads **On**. Then: (a) restart the Mac —
+      the menu-bar icon is back after login with no manual launch; (b) turn the
+      Settings switch **Off**, check the Login Items entry is gone, quit and
+      relaunch — it stays Off (the default is applied once, never again);
+      (c) turn it **On** again, then install a newer build over the top and
+      confirm the app relaunches and capture goes live (Accessibility + Input
+      Monitoring both still granted). A dev/sandbox run must show the switch
+      disabled ("Available in the installed app").
+- [ ] **Learned words survive a restart.** After typing a new name/word cleanly
+      a few times (so it is Confirmed), quit and relaunch: `~/.typeassist/
+      learned_lexicon.json` lists it, the log shows `LEXICON_LOADED restored=N`,
+      and the 60 s `FUNNEL_DUMP` `c_lexicon` has `confirmed == persisted`. Settings
+      ▸ Reset lexicon then a restart must leave it empty.
 
 Any failure → do not ship; capture the failing check + the relevant one-liner
 output and file it.

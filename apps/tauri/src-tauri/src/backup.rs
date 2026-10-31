@@ -45,6 +45,8 @@ pub const BACKUP_FORMAT: &str = "tencalmdigits-backup";
 const MOTOR_MAP_FILE: &str = "motor_map.json";
 const WORD_PATTERNS_FILE: &str = "word_patterns.json";
 const WORD_FREQ_FILE: &str = "word_freq.json";
+/// The persisted learned lexicon (Confirmed words that stay known across restarts).
+pub const LEARNED_LEXICON_FILE: &str = "learned_lexicon.json";
 const PROGRESS_SNAPSHOTS_FILE: &str = "progress_snapshots.json";
 const GUESS_ACCURACY_FILE: &str = "guess_accuracy.json";
 const SHADOW_LOG_FILE: &str = "shadow_suggestions.log";
@@ -81,6 +83,10 @@ pub struct BackupData {
     pub word_patterns: Option<Value>,
     #[serde(default)]
     pub word_freq: Option<Value>,
+    /// The learned lexicon (`learned_lexicon.json`). Absent in backups made
+    /// before it was persisted — restoring one of those leaves the lexicon empty.
+    #[serde(default)]
+    pub learned_lexicon: Option<Value>,
     #[serde(default)]
     pub progress_snapshots: Option<Value>,
     /// `"YYYY-MM-DD"` → that day's motor-map snapshot JSON.
@@ -148,6 +154,7 @@ pub fn build_bundle(data_dir: &Path, app_version: &str, created_ms: u64) -> Resu
             motor_map: read_json(&data_dir.join(MOTOR_MAP_FILE)),
             word_patterns: read_json(&data_dir.join(WORD_PATTERNS_FILE)),
             word_freq: read_json(&data_dir.join(WORD_FREQ_FILE)),
+            learned_lexicon: read_json(&data_dir.join(LEARNED_LEXICON_FILE)),
             progress_snapshots: read_json(&data_dir.join(PROGRESS_SNAPSHOTS_FILE)),
             motor_snapshots: read_dated_dir(&data_dir.join(SNAPSHOTS_DIR)),
             word_freq_snapshots: read_dated_dir(&data_dir.join(WORD_FREQ_SNAPSHOTS_DIR)),
@@ -256,6 +263,7 @@ fn clear_learned(data_dir: &Path) -> io::Result<()> {
     remove_if_present(&data_dir.join(MOTOR_MAP_FILE))?;
     remove_if_present(&data_dir.join(WORD_PATTERNS_FILE))?;
     remove_if_present(&data_dir.join(WORD_FREQ_FILE))?;
+    remove_if_present(&data_dir.join(LEARNED_LEXICON_FILE))?;
     remove_if_present(&data_dir.join(PROGRESS_SNAPSHOTS_FILE))?;
     remove_dir_if_present(&data_dir.join(SNAPSHOTS_DIR))?;
     remove_dir_if_present(&data_dir.join(WORD_FREQ_SNAPSHOTS_DIR))?;
@@ -298,6 +306,9 @@ pub fn apply_bundle(bundle: &BackupBundle, data_dir: &Path) -> Result<(), String
     }
     if let Some(v) = &bundle.data.word_freq {
         write_value(&data_dir.join(WORD_FREQ_FILE), v)?;
+    }
+    if let Some(v) = &bundle.data.learned_lexicon {
+        write_value(&data_dir.join(LEARNED_LEXICON_FILE), v)?;
     }
     if let Some(v) = &bundle.data.progress_snapshots {
         write_value(&data_dir.join(PROGRESS_SNAPSHOTS_FILE), v)?;
@@ -415,5 +426,35 @@ mod tests {
         assert!(!dir.join(SHADOW_LOG_FILE).exists());
         // allow_list is config — the engine resets it separately, not here.
         assert!(dir.join("allow_list.json").exists());
+    }
+
+    #[test]
+    fn learned_lexicon_rides_the_backup_and_is_deleted_with_the_rest() {
+        let src = temp_dir("lexsrc");
+        write(&src, MOTOR_MAP_FILE, &motor_json());
+        write(&src, LEARNED_LEXICON_FILE, &json!({ "version": 1, "words": [] }));
+        let bundle = parse_bundle(&build_bundle(&src, "test", 1).unwrap()).unwrap();
+        assert!(bundle.data.learned_lexicon.is_some(), "backup must carry the lexicon");
+
+        let dst = temp_dir("lexdst");
+        apply_bundle(&bundle, &dst).unwrap();
+        assert!(dst.join(LEARNED_LEXICON_FILE).exists(), "restore must write it back");
+
+        delete_all_data(&dst).unwrap();
+        assert!(!dst.join(LEARNED_LEXICON_FILE).exists(), "delete-all must remove it");
+    }
+
+    #[test]
+    fn a_backup_from_before_the_lexicon_was_persisted_still_restores() {
+        let old = serde_json::to_vec(&json!({
+            "format": BACKUP_FORMAT, "schema_version": CURRENT_SCHEMA_VERSION,
+            "data": { "motor_map": motor_json() }
+        })).unwrap();
+        let bundle = parse_bundle(&old).unwrap();
+        assert!(bundle.data.learned_lexicon.is_none());
+        let dst = temp_dir("lexold");
+        write(&dst, LEARNED_LEXICON_FILE, &json!({ "version": 1, "words": [] }));
+        apply_bundle(&bundle, &dst).unwrap();
+        assert!(!dst.join(LEARNED_LEXICON_FILE).exists(), "replace, never merge");
     }
 }

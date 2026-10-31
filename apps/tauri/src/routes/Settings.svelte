@@ -48,7 +48,42 @@
     invoke("set_correction_enabled", { enabled: next }).catch(() => {});
   }
 
+  // ---- Open at login — read from macOS each time (the user can also change it
+  // in System Settings), never a cached preference. Disabled in a dev/sandbox run,
+  // where there is no installed app to register. ON by default (applied once by
+  // the engine on first launch); this is where the user turns it off.
+  interface LoginItemState {
+    enabled: boolean;
+    status: "on" | "off" | "needs_approval" | "unavailable";
+    available: boolean;
+  }
+  let loginItem: LoginItemState = { enabled: false, status: "unavailable", available: false };
+  let loginItemBusy = false;
+  let loginItemError = "";
+  function loadLoginItem() {
+    invoke<LoginItemState>("get_login_item")
+      .then((s) => (loginItem = s))
+      .catch(() => {});
+  }
+  async function toggleLoginItem() {
+    if (!loginItem.available || loginItemBusy) return;
+    loginItemBusy = true;
+    loginItemError = "";
+    try {
+      loginItem = await invoke<LoginItemState>("set_login_item", { enabled: !loginItem.enabled });
+    } catch (e) {
+      loginItemError = typeof e === "string" ? e : "Couldn’t change this just now.";
+      loadLoginItem(); // show what macOS actually says
+    } finally {
+      loginItemBusy = false;
+    }
+  }
+  function openLoginItemsSettings() {
+    invoke("open_login_items_settings").catch(() => {});
+  }
+
   onMount(() => {
+    loadLoginItem();
     invoke<AllowListState>("read_allow_list")
       .then((al) => (correctionEnabled = !!al?.correction_enabled))
       .catch(() => {});
@@ -169,6 +204,46 @@
       aria-checked={correctionEnabled}
       aria-label="Corrections"
       on:click={toggleCorrections}
+    >
+      <span class="knob" aria-hidden="true"></span>
+    </button>
+  </div>
+</section>
+
+<!-- Open at login — a real macOS login item (System Settings ▸ General ▸ Login
+     Items), so the app is already running after a restart or an update. ON by
+     default; this switch is the one place to turn silent auto-start off. -->
+<section class="group">
+  <div class="row">
+    <div class="row-text">
+      <div class="row-title">Open at login</div>
+      <p class="row-desc">
+        {#if !loginItem.available}
+          Available in the installed app.
+        {:else}
+          Start TenCalmDigits when you log in, so it’s already running after a restart or an update.
+        {/if}
+      </p>
+      {#if loginItem.status === "needs_approval"}
+        <p class="row-desc">
+          macOS needs your OK first.
+          <button class="link" on:click={openLoginItemsSettings}>Open Login Items</button>
+        </p>
+      {/if}
+      {#if loginItemError}
+        <p class="data-error" role="alert">
+          <i class="ti ti-alert-circle" aria-hidden="true"></i> {loginItemError}
+        </p>
+      {/if}
+    </div>
+    <button
+      class="switch"
+      class:on={loginItem.enabled}
+      role="switch"
+      aria-checked={loginItem.enabled}
+      aria-label="Open at login"
+      disabled={!loginItem.available || loginItemBusy}
+      on:click={toggleLoginItem}
     >
       <span class="knob" aria-hidden="true"></span>
     </button>
@@ -346,6 +421,10 @@
   }
   .switch.on .knob {
     left: 21px;
+  }
+  .switch:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
   .switch:focus {
     outline: 3px solid var(--focus-ring);

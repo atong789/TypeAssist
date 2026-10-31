@@ -6,6 +6,7 @@
 mod allow_list;
 mod backup;
 mod engine;
+mod login_item;
 #[cfg(target_os = "macos")]
 mod menu_focus;
 
@@ -792,6 +793,46 @@ fn open_input_monitoring_settings() {
     open_privacy_pane("Privacy_ListenEvent");
 }
 
+// ---- Open at Login (SMAppService) ------------------------------------------
+
+/// Where the "ON default has been applied once" marker lives (beside the other
+/// local state in `~/.typeassist`). `None` when HOME is unset.
+fn login_item_marker() -> Option<std::path::PathBuf> {
+    engine::data_dir().map(|d| d.join("login_item_default_applied"))
+}
+
+fn login_item_eligible() -> bool {
+    login_item::eligible(
+        login_item::running_from_app_bundle(),
+        login_item::scratch_data_dir_in_use(),
+    )
+}
+
+/// Tauri command: the Settings toggle's current state, read from macOS (never a
+/// cached preference — the user can change it in System Settings).
+#[tauri::command]
+fn get_login_item() -> login_item::LoginItemState {
+    login_item::read_state(&login_item::MacLoginItem, login_item_eligible())
+}
+
+/// Tauri command: turn Open at Login on or off. Returns the state macOS now
+/// reports (which may be "needs approval").
+#[tauri::command]
+fn set_login_item(enabled: bool) -> Result<login_item::LoginItemState, String> {
+    login_item::set_enabled(
+        &login_item::MacLoginItem,
+        login_item_marker().as_deref(),
+        login_item_eligible(),
+        enabled,
+    )
+}
+
+/// Tauri command: open System Settings ▸ Login Items (for "needs approval").
+#[tauri::command]
+fn open_login_items_settings() {
+    login_item::open_login_items_settings();
+}
+
 /// Tauri command: bring the main window back to the front. Used by onboarding
 /// step 2 after the Accessibility grant — System Settings is frontmost at that
 /// point, so we re-activate our own window (we never force-close System Settings).
@@ -1255,6 +1296,9 @@ pub fn run() {
             reconnect_open_input_monitoring,
             reconnect_surface,
             focus_main_window,
+            get_login_item,
+            set_login_item,
+            open_login_items_settings,
             set_correction_enabled,
             request_allow_list,
             read_allow_list,
@@ -1407,6 +1451,16 @@ pub fn run() {
                     }
                 }
             }
+            // Open at Login: register ONCE on the first launch of a build that has
+            // this feature (existing users included). After that the Settings
+            // toggle / System Settings is the source of truth. A dev/sandbox run
+            // is ineligible and touches nothing.
+            let outcome = login_item::apply_default(
+                &login_item::MacLoginItem,
+                login_item_marker().as_deref(),
+                login_item_eligible(),
+            );
+            tracing::info!("LOGIN_ITEM default outcome={outcome:?}");
             Ok(())
         })
         .build(tauri::generate_context!())
