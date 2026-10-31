@@ -427,4 +427,34 @@ mod tests {
         // allow_list is config — the engine resets it separately, not here.
         assert!(dir.join("allow_list.json").exists());
     }
+
+    #[test]
+    fn learned_lexicon_rides_the_backup_and_is_deleted_with_the_rest() {
+        let src = temp_dir("lexsrc");
+        write(&src, MOTOR_MAP_FILE, &motor_json());
+        write(&src, LEARNED_LEXICON_FILE, &json!({ "version": 1, "words": [] }));
+        let bundle = parse_bundle(&build_bundle(&src, "test", 1).unwrap()).unwrap();
+        assert!(bundle.data.learned_lexicon.is_some(), "backup must carry the lexicon");
+
+        let dst = temp_dir("lexdst");
+        apply_bundle(&bundle, &dst).unwrap();
+        assert!(dst.join(LEARNED_LEXICON_FILE).exists(), "restore must write it back");
+
+        delete_all_data(&dst).unwrap();
+        assert!(!dst.join(LEARNED_LEXICON_FILE).exists(), "delete-all must remove it");
+    }
+
+    #[test]
+    fn a_backup_from_before_the_lexicon_was_persisted_still_restores() {
+        let old = serde_json::to_vec(&json!({
+            "format": BACKUP_FORMAT, "schema_version": CURRENT_SCHEMA_VERSION,
+            "data": { "motor_map": motor_json() }
+        })).unwrap();
+        let bundle = parse_bundle(&old).unwrap();
+        assert!(bundle.data.learned_lexicon.is_none());
+        let dst = temp_dir("lexold");
+        write(&dst, LEARNED_LEXICON_FILE, &json!({ "version": 1, "words": [] }));
+        apply_bundle(&bundle, &dst).unwrap();
+        assert!(!dst.join(LEARNED_LEXICON_FILE).exists(), "replace, never merge");
+    }
 }

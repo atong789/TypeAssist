@@ -6876,4 +6876,89 @@ mod tests {
             "empty days never clutter the history"
         );
     }
+
+    // ---- Learned-lexicon persistence: flush + integrity (Principle #7) ----
+
+    fn confirmed_proposal(word: &str) -> correction_engine::LexiconProposal {
+        correction_engine::LexiconProposal {
+            word: word.to_string(),
+            lane: correction_engine::Lane::Fast,
+            motor_verdict: correction_engine::MotorVerdict::Clean,
+            tier: correction_engine::ProposalTier::Confirmed,
+            occasions: 3,
+            last_motor_evidence: None,
+            last_record_id: 0,
+            last_seen_ms: 1,
+            plausibility: 0.0,
+            proximity: correction_engine::ProximityVerdict::FarFromKnown,
+            norvig_freq: 0,
+            version: correction_engine::LEXICON_PROPOSAL_VERSION,
+        }
+    }
+
+    /// Serialise against the process-wide `Lexicon::shared()` learned set.
+    static LEX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lex_serial() -> std::sync::MutexGuard<'static, ()> {
+        let g = LEX_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        Lexicon::shared().clear_learned();
+        g
+    }
+
+    #[test]
+    fn lexicon_flush_persists_and_reconciles() {
+        let _g = lex_serial();
+        let scratch = ScratchDir::new("lex_ok");
+        let path = scratch.0.join("learned_lexicon.json");
+        let mut p = LexiconProposer::new();
+        p.restore_confirmed(vec![confirmed_proposal("Soumyo")]);
+        p.mark_dirty();
+        let mut f = Funnel::new(0);
+        let mut last = 0usize;
+
+        let bad = lexicon_integrity_check(&mut f, &mut p, Some(&path), &mut last);
+
+        assert!(!bad, "memory and disk must reconcile after a flush");
+        assert_eq!((f.lex_confirmed, f.lex_persisted, f.lex_saves), (1, 1, 1));
+        assert!(path.exists(), "the word must be on disk");
+        // A restart reads it back.
+        Lexicon::shared().clear_learned();
+        let mut p2 = LexiconProposer::new();
+        let r = p2.restore_confirmed(correction_engine::load_learned_lexicon(&path));
+        assert_eq!(r.restored, 1);
+        assert!(Lexicon::shared().is_known("Soumyo"));
+    }
+
+    #[test]
+    fn lexicon_save_failure_is_visible_not_silent() {
+        let _g = lex_serial();
+        let scratch = ScratchDir::new("lex_bad");
+        // The parent "directory" is a file, so the write must fail.
+        let blocker = scratch.0.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("learned_lexicon.json");
+        let mut p = LexiconProposer::new();
+        p.restore_confirmed(vec![confirmed_proposal("Soumyo")]);
+        p.mark_dirty();
+        let mut f = Funnel::new(0);
+        let mut last = 0usize;
+
+        let bad = lexicon_integrity_check(&mut f, &mut p, Some(&path), &mut last);
+
+        assert!(bad, "a save that cannot land must be flagged, never silent");
+        assert!(f.lex_save_errors >= 1);
+        assert_eq!((f.lex_confirmed, f.lex_persisted), (1, 0));
+    }
+
+    #[test]
+    fn lexicon_clean_when_nothing_changed() {
+        let _g = lex_serial();
+        let scratch = ScratchDir::new("lex_idle");
+        let path = scratch.0.join("learned_lexicon.json");
+        let mut p = LexiconProposer::new();
+        let mut f = Funnel::new(0);
+        let mut last = 0usize;
+        assert!(!lexicon_integrity_check(&mut f, &mut p, Some(&path), &mut last));
+        assert!(!path.exists(), "an idle lexicon must not write anything");
+        assert_eq!(f.lex_saves, 0);
+    }
 }
