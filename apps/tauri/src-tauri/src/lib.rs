@@ -8,6 +8,7 @@ mod backup;
 mod engine;
 #[cfg(target_os = "macos")]
 mod menu_focus;
+mod resolution_diary;
 
 use allow_list::AllowList;
 use engine::{EngineControl, EngineControlSender};
@@ -698,6 +699,54 @@ fn delete_all_data(sender: tauri::State<EngineControlSender>) -> Result<(), Stri
         .map_err(|e| format!("engine control channel closed: {e}"))
 }
 
+/// Tauri command: read-only 14-day resolution-diary summary (this week / prior
+/// week, with the actual words). Never writes; `enabled:false` + zeros when off.
+#[tauri::command]
+fn read_resolution_diary() -> Result<resolution_diary::DiarySummary, String> {
+    let dir = typeassist_data_dir().ok_or("no data directory (HOME unset)".to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Ok(resolution_diary::read_summary(&dir, now))
+}
+
+/// Tauri command: opt in/out of the resolution diary. Routed through the engine
+/// (sole writer); opting out deletes the log. Emits `resolution-diary://changed`.
+#[tauri::command]
+fn set_resolution_diary(
+    enabled: bool,
+    sender: tauri::State<EngineControlSender>,
+) -> Result<(), String> {
+    sender
+        .send(EngineControl::SetResolutionDiary { enabled })
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
+/// Tauri command: merge another Mac's exported diary file (union by event id).
+/// Engine-routed; emits `resolution-diary://changed` with the merge report.
+#[tauri::command]
+fn import_resolution_diary(
+    path: String,
+    sender: tauri::State<EngineControlSender>,
+) -> Result<(), String> {
+    sender
+        .send(EngineControl::ImportResolutionDiary { path })
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
+/// Tauri command: export the retained diary rows to a user-chosen file (read-only
+/// on the data dir). Returns the number of rows written.
+#[tauri::command]
+fn export_resolution_diary(path: String) -> Result<usize, String> {
+    let dir = typeassist_data_dir().ok_or("no data directory (HOME unset)".to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    resolution_diary::export_to(&dir, std::path::Path::new(&path), now)
+}
+
 /// Show + focus the Reconnect panel (its own webview window, label "reconnect").
 /// Surfaced by the menu-bar "Reconnect…" recovery item when the sidecar reports
 /// Accessibility was revoked. Centred (not tray-anchored), and — unlike the
@@ -1266,7 +1315,11 @@ pub fn run() {
             create_backup,
             restore_preview,
             apply_restore,
-            delete_all_data
+            delete_all_data,
+            read_resolution_diary,
+            set_resolution_diary,
+            import_resolution_diary,
+            export_resolution_diary
         ])
         .on_window_event(|window, event| match event {
             // Menu-bar app: a window's close button / Cmd+W must NOT quit the

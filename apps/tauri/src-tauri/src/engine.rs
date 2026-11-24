@@ -35,6 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::path::{Path, PathBuf};
 
+use crate::resolution_diary::{DiaryOutcome, ResolutionDiary};
 use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
 use correction_engine::{
     classify_slip, decide, has_motor_evidence, measure_token_motor, normalize_word,
@@ -212,6 +213,8 @@ pub const EVT_CORRECTION_APPLIED: &str = "corrections://applied";
 /// went off, or it timed out. Tells the bubble to hide immediately, so a visible
 /// bubble always means Shift will work (no "dead bubble"). No payload.
 pub const EVT_CORRECTION_DISMISSED: &str = "corrections://dismissed";
+/// Resolution diary toggled / imported. Payload `{ ok, message, enabled, merge? }`.
+pub const EVT_RESOLUTION_DIARY: &str = "resolution-diary://changed";
 
 /// **Data layer.** Result of a restore-from-backup. Payload `{ ok: bool,
 /// message: String }`: on success `message` is the chosen filename's worth of
@@ -381,6 +384,15 @@ pub enum EngineControl {
     /// and reset the correction gate to **off**. Emits [`EVT_DATA_DELETED`] plus
     /// the refreshed [`EVT_CORRECTION_STATE`] / [`EVT_LEARNED_SNAPSHOT`].
     DeleteAllData,
+    /// **Resolution diary — opt in / out.** Turn the per-event diary on (creates
+    /// the flag file) or off (**deletes the log** — opt-out erases). Engine = sole
+    /// writer. Emits [`EVT_RESOLUTION_DIARY`].
+    SetResolutionDiary { enabled: bool },
+    /// **Resolution diary — merge.** Import another Mac's exported diary file
+    /// (user-chosen path): union by event id, 14-day retention, atomic rewrite,
+    /// idempotent. Never network. Emits [`EVT_RESOLUTION_DIARY`] with the
+    /// `{added, duplicates, skipped, expired, total}` report.
+    ImportResolutionDiary { path: String },
     /// **UK English (v0.3.0) — locale-driven suggestion spelling.** Set the
     /// spelling variant a suggestion should use for a variant word (US-locale →
     /// `color`, UK-locale → `colour`). Detected in L5 from the webview locale
@@ -660,6 +672,10 @@ struct EndedBubble {
     /// Normalized word the bubble suggested.
     target: String,
     ended_at_ms: u64,
+    /// Id of the resolution-diary `ignored` row written when this bubble ended
+    /// (None if the diary is off). Lets a later self-match write a `retyped` row
+    /// that supersedes it.
+    diary_id: Option<String>,
 }
 
 /// Ties a resolver-reported correction back to the specific bubble the user
@@ -681,19 +697,53 @@ struct EndedBubble {
 #[derive(Debug, Default)]
 struct BubbleLedger {
     ended: Vec<EndedBubble>,
+    /// Per-event resolution diary (opt-in, local; disabled by default).
+    diary: ResolutionDiary,
+    /// The diary id of the ignored row the LAST successful `note_correction`
+    /// matched — read once by the caller to link its `retyped` row.
+    last_matched_diary_id: Option<String>,
 }
 
 impl BubbleLedger {
+    fn with_diary(diary: ResolutionDiary) -> Self {
+        Self {
+            diary,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
     fn note_ended(&mut self, start: usize, typed: &str, target: &str, now: u64) {
+        self.note_ended_with_id(start, typed, target, now, None);
+    }
+
+    fn note_ended_with_id(
+        &mut self,
+        start: usize,
+        typed: &str,
+        target: &str,
+        now: u64,
+        diary_id: Option<String>,
+    ) {
         self.ended.push(EndedBubble {
             start,
             typed: typed.to_string(),
             target: target.to_string(),
             ended_at_ms: now,
+            diary_id,
         });
         if self.ended.len() > MAX_ENDED_BUBBLES {
             self.ended.remove(0);
         }
+    }
+
+    /// A bubble ended WITHOUT an accept: log it to the resolution diary as
+    /// `ignored` and remember it (with that row's id) for the self-match tie.
+    fn end_unaccepted(&mut self, start: usize, typed: &str, target: &str, now: u64) {
+        let id = self
+            .diary
+            .record(DiaryOutcome::Ignored, typed, target, None, now);
+        self.note_ended_with_id(start, typed, target, now, id);
     }
 
     /// `true` iff this correction is the user self-matching an ignored bubble.
@@ -715,7 +765,8 @@ impl BubbleLedger {
             .position(|b| b.start == start && b.typed == typed && b.target == corrected);
         match hit {
             Some(i) => {
-                self.ended.remove(i); // one bubble, one match
+                let b = self.ended.remove(i); // one bubble, one match
+                self.last_matched_diary_id = b.diary_id;
                 true
             }
             None => false,
@@ -732,7 +783,7 @@ fn end_pending_bubble<R: Runtime>(
 ) -> bool {
     match pending.take() {
         Some(ps) => {
-            bubbles.note_ended(
+            bubbles.end_unaccepted(
                 ps.word_end.saturating_sub(ps.word_len),
                 &normalize_word(&ps.typed),
                 &normalize_word(&ps.target),
@@ -2208,6 +2259,14 @@ fn tick_resolver<R: Runtime>(
                                 ) {
                                     tally.add_self_matched();
                                     record_pattern_outcome(word_patterns, funnel, OutcomeEvent::SelfMatched, &normalize_word(&rec.original_text), &normalize_word(c), now);
+                                    let superseded = bubbles.last_matched_diary_id.take();
+                                    bubbles.diary.record(
+                                        DiaryOutcome::Retyped,
+                                        &rec.original_text,
+                                        c,
+                                        superseded,
+                                        now,
+                                    );
                                 }
                             }
                         }
@@ -3643,7 +3702,8 @@ pub fn spawn<R: Runtime>(
         // suggestion — so an accept only ever injects against the live caret.
         let mut pending_suggestion: Option<PendingSuggestion> = None;
         // Ignored-bubble memory for SELF_MATCHED (in-memory only, text never persisted).
-        let mut bubbles = BubbleLedger::default();
+        let mut bubbles =
+            BubbleLedger::with_diary(ResolutionDiary::open(typeassist_dir(), now_ms()));
         // UK English (v0.3.0): the spelling variant a suggestion should use for a
         // variant word, set from the OS locale by L5 via
         // `EngineControl::SetSpellingVariant`. Defaults to American until L5
@@ -4253,6 +4313,7 @@ pub fn spawn<R: Runtime>(
                                         tally.add_accepted();
                                         accepted_ok = true;
                                         record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Accepted, &ended_slot.1, &ended_slot.2, now_ms());
+                                        bubbles.diary.record(DiaryOutcome::Taken, &ended_slot.1, &ended_slot.2, None, now_ms());
                                         tracing::info!(
                                             "CORRECTION_APPLIED typed={:?} target={:?} delete_count={} boundary={:?} after_len={}",
                                             ps.typed,
@@ -4305,7 +4366,7 @@ pub fn spawn<R: Runtime>(
                                 // aborted / declined / failed accept ended the bubble
                                 // unaccepted — it can still be self-matched.
                                 if !accepted_ok {
-                                    bubbles.note_ended(
+                                    bubbles.end_unaccepted(
                                         ended_slot.0,
                                         &ended_slot.1,
                                         &ended_slot.2,
@@ -4473,6 +4534,7 @@ pub fn spawn<R: Runtime>(
                                 if matches!(single_char, Some('f') | Some('F')) {
                                     outcome_integrity_check(&funnel, &mut word_patterns, now_ms());
                                     funnel.dump();
+                                    bubbles.diary.dump();
                                     dump_classifications(&word_patterns, &motor_map);
                                     funnel.reset(now_ms());
                                     continue;
@@ -5342,6 +5404,32 @@ pub fn spawn<R: Runtime>(
                             // Panel/tray pull fresh state on open. Read-only.
                             let _ = app_handle.emit(EVT_CORRECTION_STATE, allow_list.clone());
                         }
+                        EngineControl::SetResolutionDiary { enabled } => {
+                            let payload = match bubbles.diary.set_enabled(enabled) {
+                                Ok(()) => {
+                                    tracing::info!("RESOLUTION_DIARY enabled={enabled}");
+                                    serde_json::json!({ "ok": true, "message": "", "enabled": enabled })
+                                }
+                                Err(e) => {
+                                    tracing::warn!("RESOLUTION_DIARY toggle failed: {e}");
+                                    serde_json::json!({ "ok": false, "message": e, "enabled": bubbles.diary.enabled() })
+                                }
+                            };
+                            let _ = app_handle.emit(EVT_RESOLUTION_DIARY, payload);
+                        }
+                        EngineControl::ImportResolutionDiary { path } => {
+                            let payload = match bubbles.diary.import(Path::new(&path), now_ms()) {
+                                Ok(report) => {
+                                    tracing::info!("RESOLUTION_DIARY_IMPORTED {report:?}");
+                                    serde_json::json!({ "ok": true, "message": "", "enabled": bubbles.diary.enabled(), "merge": report })
+                                }
+                                Err(e) => {
+                                    tracing::warn!("RESOLUTION_DIARY import failed: {e}");
+                                    serde_json::json!({ "ok": false, "message": e, "enabled": bubbles.diary.enabled() })
+                                }
+                            };
+                            let _ = app_handle.emit(EVT_RESOLUTION_DIARY, payload);
+                        }
                         EngineControl::RestoreData { path } => {
                             // Sole-writer restore. Validate-all-then-apply; the
                             // helper swaps the in-memory maps on success.
@@ -5567,6 +5655,7 @@ pub fn spawn<R: Runtime>(
                     if watchdog_ticks % 60 == 0 {
                         outcome_integrity_check(&funnel, &mut word_patterns, now_ms());
                         funnel.dump();
+                        bubbles.diary.dump();
                         // Read-only kill-switch observability (no injection).
                         dump_classifications(&word_patterns, &motor_map);
                         // Observe-only guesser accuracy readout (no injection).
@@ -5991,6 +6080,38 @@ mod tests {
             t.add_self_matched();
         }
         assert_eq!(t.self_matched, 1, "ignored bubble then exact retype must count");
+    }
+
+    #[test]
+    fn diary_links_a_self_match_back_to_its_ignored_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "tcd-ledger-diary-{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(crate::resolution_diary::DIARY_FLAG), b"").unwrap();
+        let mut b = BubbleLedger::with_diary(ResolutionDiary::open(Some(dir.clone()), 1_000));
+        b.end_unaccepted(10, "teh", "the", 1_000);
+        assert!(b.note_correction(10, "teh", "the", 2_000));
+        let sup = b.last_matched_diary_id.take();
+        assert!(
+            sup.is_some(),
+            "the ignored row's id must travel with the ended bubble"
+        );
+        b.diary
+            .record(DiaryOutcome::Retyped, "teh", "the", sup.clone(), 2_000);
+        let (rows, _) = crate::resolution_diary::parse_lines(
+            &std::fs::read_to_string(dir.join(crate::resolution_diary::DIARY_FILE)).unwrap(),
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].outcome, DiaryOutcome::Ignored);
+        assert_eq!(rows[1].supersedes.as_deref(), Some(rows[0].id.as_str()));
+        // With the diary off, the ledger behaves exactly as before.
+        let mut off = BubbleLedger::default();
+        off.end_unaccepted(10, "teh", "the", 1_000);
+        assert!(off.note_correction(10, "teh", "the", 2_000));
+        assert!(off.last_matched_diary_id.take().is_none());
     }
 
     #[test]

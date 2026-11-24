@@ -159,6 +159,17 @@ Practice Mode lives in the **macOS menu bar** as a small dropdown panel (not a w
 - **Deferred (clean seams left):** fatigue lines in the snapshot (L2 fatigue is deferred) and mode-calibration (Cautious/Balanced/Eager) — the L2→L3 kill-switch is off, so a mode switch wouldn't act yet. Add both when those layers land.
 - All Practice copy lives in **one** place (`apps/tauri/src/lib/practiceCopy.ts`); sentence content in `sentences.txt`.
 
+### Resolution diary — per-event bubble outcomes (opt-in, local, 14 days)
+
+An append-only `~/.typeassist/resolution_diary.jsonl` (honors `TYPEASSIST_DATA_DIR`), one row per bubble resolution: `{v, id, ts, dev, typed, target, outcome: taken|retyped|ignored, supersedes?}`. It is a per-event, timestamped layer *beside* the all-time decayed stores (unchanged) so Progress can show the actual words for the last 7 days / week-over-week and two Macs can **merge**. Code: `apps/tauri/src-tauri/src/resolution_diary.rs`; capture hooks in `engine.rs` (the `BubbleLedger` owns the diary).
+
+- **It stores typed words — a deliberate, bounded exception to "content-blind".** Exactly four content fields (typed, target, outcome, ts) — no app id, no context, no position. **Opt-in** (flag file `resolution_diary.on` or `TYPEASSIST_RESOLUTION_DIARY=1`); opting out **deletes the log**. Hard **14-day retention** and a 2 MB cap (oldest trimmed first). Never network (Principle #8); merge is a user-initiated file import/export.
+- **Principle #6 exception, stated plainly:** this file is deliberately pruned — short-lived *view* data, not recovery history (the dated snapshots remain the durable record).
+- **Principle #7:** `c_decided` vs `c_appended` are reconciled at the funnel-dump cadence (`DIARY_DUMP`; a gap logs `DIARY_INTEGRITY_BROKEN`).
+- **Merge = union by event `id`** (idempotent). A `retyped` row carries `supersedes: <ignored row id>`; the reader folds the pair so one bubble counts once. `dev` is a random per-install id (`device_id`), never hardware-derived, and is **not** in the backup. The diary rides in the backup bundle (schema v2).
+- **`retyped` reads low** — it inherits the self-match limits (see `BubbleLedger`): it needs a sealing boundary (space/punctuation) after the fix, an intact line model (a click/focus change resets it), and the fix inside the 30 s window. A partial edit that keeps a correct prefix *does* count.
+- **Default is a pending product decision:** currently OFF; the intent is default-on under an explicit one-line first-launch consent (wording pending sign-off). Do not flip the default without that consent surface.
+
 ### Cross-cutting — progress is offered, never imposed
 
 The same number that motivates on a good day can sting on a bad one. Progress is rich and available in the views the user **goes to** (Progress, Practice), framed as capability growing — never a daily verdict, notification, or streak that greets them. **The good day and the bad day both belong.**
