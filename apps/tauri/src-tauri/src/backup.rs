@@ -35,7 +35,7 @@ use std::path::Path;
 
 /// The current backup ENVELOPE schema version. Distinct from each embedded
 /// store's own internal `version` field — both are honored on restore.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Identity guard so we never try to restore an unrelated JSON file.
 pub const BACKUP_FORMAT: &str = "tencalmdigits-backup";
@@ -89,6 +89,10 @@ pub struct BackupData {
     pub learned_lexicon: Option<Value>,
     #[serde(default)]
     pub progress_snapshots: Option<Value>,
+    /// Resolution-diary events (schema v2+): the per-event rows, as plain JSON
+    /// objects. Absent in a v1 bundle (a restore then leaves the diary empty).
+    #[serde(default)]
+    pub resolution_diary: Option<Vec<Value>>,
     /// `"YYYY-MM-DD"` → that day's motor-map snapshot JSON.
     #[serde(default)]
     pub motor_snapshots: BTreeMap<String, Value>,
@@ -144,6 +148,17 @@ fn read_dated_dir(dir: &Path) -> BTreeMap<String, Value> {
 
 /// Assemble the bundle from the on-device data dir and serialize it to pretty
 /// JSON bytes. Read-only — never writes into `data_dir`.
+/// The diary's events as JSON objects (skipping unreadable lines), or `None` if
+/// there's no diary — so a bundle from a Mac that never opted in carries nothing.
+fn read_diary(data_dir: &Path) -> Option<Vec<Value>> {
+    let text = std::fs::read_to_string(data_dir.join(crate::resolution_diary::DIARY_FILE)).ok()?;
+    let rows: Vec<Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    (!rows.is_empty()).then_some(rows)
+}
+
 pub fn build_bundle(data_dir: &Path, app_version: &str, created_ms: u64) -> Result<Vec<u8>, String> {
     let bundle = BackupBundle {
         format: BACKUP_FORMAT.to_string(),
@@ -156,6 +171,7 @@ pub fn build_bundle(data_dir: &Path, app_version: &str, created_ms: u64) -> Resu
             word_freq: read_json(&data_dir.join(WORD_FREQ_FILE)),
             learned_lexicon: read_json(&data_dir.join(LEARNED_LEXICON_FILE)),
             progress_snapshots: read_json(&data_dir.join(PROGRESS_SNAPSHOTS_FILE)),
+            resolution_diary: read_diary(data_dir),
             motor_snapshots: read_dated_dir(&data_dir.join(SNAPSHOTS_DIR)),
             word_freq_snapshots: read_dated_dir(&data_dir.join(WORD_FREQ_SNAPSHOTS_DIR)),
         },
@@ -265,6 +281,7 @@ fn clear_learned(data_dir: &Path) -> io::Result<()> {
     remove_if_present(&data_dir.join(WORD_FREQ_FILE))?;
     remove_if_present(&data_dir.join(LEARNED_LEXICON_FILE))?;
     remove_if_present(&data_dir.join(PROGRESS_SNAPSHOTS_FILE))?;
+    remove_if_present(&data_dir.join(crate::resolution_diary::DIARY_FILE))?;
     remove_dir_if_present(&data_dir.join(SNAPSHOTS_DIR))?;
     remove_dir_if_present(&data_dir.join(WORD_FREQ_SNAPSHOTS_DIR))?;
     Ok(())
@@ -315,6 +332,20 @@ pub fn apply_bundle(bundle: &BackupBundle, data_dir: &Path) -> Result<(), String
     }
     write_dated(&data_dir.join(SNAPSHOTS_DIR), &bundle.data.motor_snapshots)?;
     write_dated(&data_dir.join(WORD_FREQ_SNAPSHOTS_DIR), &bundle.data.word_freq_snapshots)?;
+    if let Some(rows) = &bundle.data.resolution_diary {
+        let mut body = String::new();
+        for r in rows {
+            body.push_str(
+                &serde_json::to_string(r).map_err(|e| format!("serialize diary row: {e}"))?,
+            );
+            body.push('\n');
+        }
+        durable_write(
+            &data_dir.join(crate::resolution_diary::DIARY_FILE),
+            body.as_bytes(),
+        )
+        .map_err(|e| format!("write diary: {e}"))?;
+    }
     Ok(())
 }
 
@@ -326,6 +357,10 @@ pub fn delete_all_data(data_dir: &Path) -> Result<(), String> {
     clear_learned(data_dir).map_err(|e| format!("delete learned: {e}"))?;
     remove_if_present(&data_dir.join(GUESS_ACCURACY_FILE)).map_err(|e| format!("delete diagnostics: {e}"))?;
     remove_if_present(&data_dir.join(SHADOW_LOG_FILE)).map_err(|e| format!("delete log: {e}"))?;
+    // The per-install diary id goes too (a fresh start is a fresh identity); the
+    // opt-in flag stays — it's the user's consent choice, not learned data.
+    remove_if_present(&data_dir.join(crate::resolution_diary::DEVICE_ID_FILE))
+        .map_err(|e| format!("delete device id: {e}"))?;
     Ok(())
 }
 
@@ -343,6 +378,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    #[test]
+    fn diary_round_trips_through_a_bundle_and_a_v1_bundle_restores_clean() {
+        use crate::resolution_diary::{DEVICE_ID_FILE, DIARY_FILE};
+        let src = temp_dir("diary-src");
+        write(&src, "motor_map.json", &motor_json());
+        let row = json!({"v":1,"id":"d-1-1","ts":1700000000000u64,"dev":"devdevdev","typed":"teh","target":"the","outcome":"taken"});
+        std::fs::write(src.join(DIARY_FILE), format!("{}\n", row)).unwrap();
+        let bytes = build_bundle(&src, "t", 1).unwrap();
+        let bundle = parse_bundle(&bytes).unwrap();
+        assert_eq!(bundle.schema_version, 2);
+        assert_eq!(
+            bundle.data.resolution_diary.as_ref().map(|v| v.len()),
+            Some(1)
+        );
+
+        let dst = temp_dir("diary-dst");
+        std::fs::write(dst.join(DIARY_FILE), "stale\n").unwrap();
+        apply_bundle(&bundle, &dst).unwrap();
+        let back = std::fs::read_to_string(dst.join(DIARY_FILE)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(back.trim()).unwrap(),
+            row,
+            "diary row survives verbatim"
+        );
+
+        // A v1 bundle (no diary member) restores cleanly and leaves the diary empty.
+        let v1 = json!({"format": BACKUP_FORMAT, "schema_version": 1, "data": {"motor_map": motor_json()}});
+        let b1 = parse_bundle(&serde_json::to_vec(&v1).unwrap()).unwrap();
+        validate_core(&b1).unwrap();
+        apply_bundle(&b1, &dst).unwrap();
+        assert!(
+            !dst.join(DIARY_FILE).exists(),
+            "v1 restore = true replace: no stale diary"
+        );
+
+        // Delete-all drops the diary + the per-install device id, keeps the flag.
+        std::fs::write(dst.join(DIARY_FILE), format!("{}\n", row)).unwrap();
+        std::fs::write(dst.join(DEVICE_ID_FILE), "abcdef0123456789abcdef0123456789").unwrap();
+        std::fs::write(dst.join(crate::resolution_diary::DIARY_FLAG), "").unwrap();
+        delete_all_data(&dst).unwrap();
+        assert!(!dst.join(DIARY_FILE).exists());
+        assert!(!dst.join(DEVICE_ID_FILE).exists());
+        assert!(
+            dst.join(crate::resolution_diary::DIARY_FLAG).exists(),
+            "consent flag is not learned data"
+        );
     }
 
     // A motor map carries decay timestamps; they must survive the round-trip
