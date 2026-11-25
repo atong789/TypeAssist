@@ -18,9 +18,12 @@
 //!   when the bubble ends; retyped is only known later (≤30 s). The reader folds the
 //!   pair so one bubble counts **once** (as retyped), including after a merge.
 //!
-//! **Privacy (Principles #8 / content-blind).** Words are stored, so this is
-//! **opt-in, OFF by default** (flag file `resolution_diary.on`, or
-//! `TYPEASSIST_RESOLUTION_DIARY=1`), strictly on-device, with **hard retention**
+//! **Privacy (Principles #8 / content-blind).** Words are stored, so collection is
+//! **consent-gated: no recorded choice = off.** It starts only when onboarding
+//! **completes** (the user has just read the consent line) — [`record_consent`] writes
+//! the `resolution_diary.on` flag — or when the user turns it on in Settings; the
+//! Settings switch can stop it anytime (an explicit `resolution_diary.off` marker
+//! then blocks re-consent). Strictly on-device, with **hard retention**
 //! ([`RETENTION_MS`], 14 days) and a **byte cap** ([`MAX_BYTES`]). No app id, no
 //! context, no position: exactly the four content fields above. Turning it off
 //! deletes the log. Merging is a user-initiated file import — never network.
@@ -43,8 +46,10 @@ use std::path::{Path, PathBuf};
 
 pub const DIARY_FILE: &str = "resolution_diary.jsonl";
 pub const DIARY_FLAG: &str = "resolution_diary.on";
+/// Explicit opt-out marker. Distinguishes "turned it off" from "never chose": consent
+/// (onboarding completion) never re-enables over it.
+pub const DIARY_OFF_FLAG: &str = "resolution_diary.off";
 pub const DEVICE_ID_FILE: &str = "device_id";
-const DIARY_ENV: &str = "TYPEASSIST_RESOLUTION_DIARY";
 
 /// Events older than this are pruned (14 days: two full weeks for week-over-week).
 pub const RETENTION_MS: u64 = 14 * 24 * 60 * 60 * 1000;
@@ -293,9 +298,11 @@ pub fn summarize(
 
 // ---- file-level helpers (a data dir in, no engine state) ------------------
 
-/// Is collection switched on for this data dir?
+/// Is collection switched on for this data dir? Only the `on` flag counts — written
+/// solely by [`record_consent`] (onboarding completed) or the Settings switch. There
+/// is deliberately **no** env-var or other back door around consent.
 pub fn is_enabled(dir: &Path) -> bool {
-    std::env::var_os(DIARY_ENV).is_some_and(|v| v == "1") || dir.join(DIARY_FLAG).exists()
+    dir.join(DIARY_FLAG).exists()
 }
 
 fn read_events(dir: &Path) -> (Vec<DiaryEvent>, usize) {
@@ -398,6 +405,21 @@ fn load_or_create_device_id(dir: &Path, now: u64) -> Option<String> {
     std::fs::create_dir_all(dir).ok()?;
     durable_write(&path, id.as_bytes()).ok()?;
     Some(id)
+}
+
+/// Record the user's consent — called when onboarding **completes** (the user has
+/// just read the consent line on its last step). Creates the `on` flag unless the
+/// user has explicitly turned the diary off (`off` flag present): an explicit
+/// opt-out always wins, so a replayed onboarding can't re-enable it. Returns
+/// whether collection is now on. **No recorded choice = off** (nothing else ever
+/// writes the `on` flag except this and the Settings switch).
+pub fn record_consent(dir: &Path) -> Result<bool, String> {
+    if dir.join(DIARY_OFF_FLAG).exists() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("create data dir: {e}"))?;
+    std::fs::write(dir.join(DIARY_FLAG), b"").map_err(|e| format!("record consent: {e}"))?;
+    Ok(true)
 }
 
 /// Engine-side writer. Default = disabled (no dir), so tests/other callers that use
@@ -512,10 +534,20 @@ impl ResolutionDiary {
             return Err("no data directory".into());
         };
         let flag = dir.join(DIARY_FLAG);
+        let off_flag = dir.join(DIARY_OFF_FLAG);
         if on {
             std::fs::create_dir_all(&dir).map_err(|e| format!("create data dir: {e}"))?;
+            match std::fs::remove_file(&off_flag) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("enable: {e}")),
+            }
             std::fs::write(&flag, b"").map_err(|e| format!("enable: {e}"))?;
         } else {
+            // Record the explicit opt-out FIRST so a failure below can't leave the
+            // diary on with the user's "off" half-applied.
+            std::fs::create_dir_all(&dir).map_err(|e| format!("create data dir: {e}"))?;
+            std::fs::write(&off_flag, b"").map_err(|e| format!("disable: {e}"))?;
             for p in [flag, dir.join(DIARY_FILE)] {
                 match std::fs::remove_file(&p) {
                     Ok(()) => {}
@@ -527,6 +559,13 @@ impl ResolutionDiary {
             self.appended = 0;
         }
         Ok(())
+    }
+
+    /// Onboarding completed ⇒ consent recorded ⇒ collection starts (unless the user
+    /// explicitly opted out earlier — see [`record_consent`]).
+    pub fn consent(&mut self) -> Result<bool, String> {
+        let dir = self.dir.clone().ok_or("no data directory")?;
+        record_consent(&dir)
     }
 
     /// Merge an incoming diary file (engine = sole writer).
@@ -722,6 +761,115 @@ mod tests {
         assert!(d
             .record(DiaryOutcome::Taken, "teh", "the", None, NOW)
             .is_none());
+    }
+
+    // ---- consent gate (break-it lock) ----
+
+    fn fresh_diary(tag: &str) -> (PathBuf, ResolutionDiary) {
+        let dir = tmp(tag);
+        let d = ResolutionDiary::open(Some(dir.clone()), NOW);
+        (dir, d)
+    }
+
+    #[test]
+    fn fresh_install_without_onboarding_collects_nothing() {
+        // Break-it (negative): no recorded choice = off, however many bubbles resolve.
+        let (dir, mut d) = fresh_diary("consent-none");
+        for i in 0..5 {
+            assert!(d
+                .record(DiaryOutcome::Taken, "teh", "the", None, NOW + i)
+                .is_none());
+            assert!(d
+                .record(DiaryOutcome::Ignored, "wrod", "word", None, NOW + i)
+                .is_none());
+        }
+        assert!(!d.enabled());
+        assert!(!dir.join(DIARY_FILE).exists(), "no log without consent");
+        assert!(
+            !dir.join(DEVICE_ID_FILE).exists(),
+            "no device id without consent"
+        );
+        assert!(!dir.join(DIARY_FLAG).exists());
+        assert_eq!(d.counts(), (0, 0));
+    }
+
+    #[test]
+    fn completing_onboarding_starts_collection() {
+        // Break-it (positive): consent recorded → the very next resolution is logged.
+        let (dir, mut d) = fresh_diary("consent-yes");
+        assert!(
+            d.record(DiaryOutcome::Taken, "teh", "the", None, NOW)
+                .is_none(),
+            "off before consent"
+        );
+        assert_eq!(d.consent(), Ok(true));
+        assert!(d.enabled());
+        let id = d
+            .record(DiaryOutcome::Taken, "teh", "the", None, NOW + 1)
+            .expect("collects after consent");
+        let (rows, _) = parse_lines(&std::fs::read_to_string(dir.join(DIARY_FILE)).unwrap());
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the post-consent resolution is in the log"
+        );
+        assert_eq!(rows[0].id, id);
+    }
+
+    #[test]
+    fn consent_survives_a_restart() {
+        let (dir, mut d) = fresh_diary("consent-restart");
+        d.consent().unwrap();
+        let mut d2 = ResolutionDiary::open(Some(dir), NOW + 10);
+        assert!(d2
+            .record(DiaryOutcome::Ignored, "wrod", "word", None, NOW + 11)
+            .is_some());
+    }
+
+    #[test]
+    fn env_var_cannot_bypass_consent() {
+        // The old dev opt-in env var must not be a back door around consent.
+        let (dir, mut d) = fresh_diary("consent-env");
+        std::env::set_var("TYPEASSIST_RESOLUTION_DIARY", "1");
+        let got = d.record(DiaryOutcome::Taken, "teh", "the", None, NOW);
+        std::env::remove_var("TYPEASSIST_RESOLUTION_DIARY");
+        assert!(got.is_none());
+        assert!(!dir.join(DIARY_FILE).exists());
+    }
+
+    #[test]
+    fn settings_off_stops_collection_deletes_the_log_and_blocks_reconsent() {
+        let (dir, mut d) = fresh_diary("consent-off");
+        d.consent().unwrap();
+        d.record(DiaryOutcome::Taken, "teh", "the", None, NOW)
+            .unwrap();
+        d.set_enabled(false).unwrap();
+        assert!(!d.enabled());
+        assert!(
+            !dir.join(DIARY_FILE).exists(),
+            "turning it off erases the note"
+        );
+        assert!(d
+            .record(DiaryOutcome::Taken, "teh", "the", None, NOW + 1)
+            .is_none());
+        // A replayed/repeated onboarding must NOT override an explicit opt-out.
+        assert_eq!(d.consent(), Ok(false));
+        assert!(!d.enabled());
+        assert!(d
+            .record(DiaryOutcome::Taken, "teh", "the", None, NOW + 2)
+            .is_none());
+    }
+
+    #[test]
+    fn settings_on_after_off_resumes_collection() {
+        let (_dir, mut d) = fresh_diary("consent-reon");
+        d.consent().unwrap();
+        d.set_enabled(false).unwrap();
+        d.set_enabled(true).unwrap();
+        assert!(d.enabled());
+        assert!(d
+            .record(DiaryOutcome::Taken, "teh", "the", None, NOW)
+            .is_some());
     }
 
     // ---- retention + cap ----

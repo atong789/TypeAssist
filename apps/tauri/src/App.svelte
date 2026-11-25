@@ -78,6 +78,11 @@
   async function completeOnboarding() {
     route = "today";
     onboarded.set(true);
+    // Consent for the 14-day progress note: the user has just read the consent line
+    // on the last onboarding step and finished. THIS is the single place consent is
+    // recorded — every way out of onboarding (Get started, Restore) lands here. No
+    // recorded choice = no collection, so a failure (engine not up) fails safe: off.
+    invoke("record_diary_consent").catch(() => {});
     // Let the shell mount (tabEls + navRovingIndex update for "today"), then land
     // the focus ring on the Today nav item via the same deterministic nav focus
     // used on every tab switch.
@@ -420,8 +425,9 @@
           <h2 class="privacy-h">What I never keep</h2>
           <p class="privacy-p">
             Your sentences, your documents, and your passwords. I skip secure fields entirely,
-            ignore anything you paste or auto-fill, and keep no log of what you write. The count is
-            only ever single words and how often you use them — never the sentences they sit in —
+            ignore anything you paste or auto-fill, and keep no log of your sentences — only a quiet
+            14-day note of the words you slip on and what you did, so I can show your progress. The
+            count is only ever single words and how often you use them — never the sentences they sit in —
             and none of it ever leaves this Mac.
           </p>
         </section>

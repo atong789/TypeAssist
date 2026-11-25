@@ -388,6 +388,11 @@ pub enum EngineControl {
     /// the flag file) or off (**deletes the log** — opt-out erases). Engine = sole
     /// writer. Emits [`EVT_RESOLUTION_DIARY`].
     SetResolutionDiary { enabled: bool },
+    /// **Resolution diary — consent.** Onboarding completed: record consent so the
+    /// diary starts collecting (no-op if the user explicitly turned it off). The only
+    /// path besides the Settings switch that can turn collection on. Emits
+    /// [`EVT_RESOLUTION_DIARY`].
+    ConsentResolutionDiary,
     /// **Resolution diary — merge.** Import another Mac's exported diary file
     /// (user-chosen path): union by event id, 14-day retention, atomic rewrite,
     /// idempotent. Never network. Emits [`EVT_RESOLUTION_DIARY`] with the
@@ -5527,6 +5532,19 @@ pub fn spawn<R: Runtime>(
                                 }
                                 Err(e) => {
                                     tracing::warn!("RESOLUTION_DIARY toggle failed: {e}");
+                                    serde_json::json!({ "ok": false, "message": e, "enabled": bubbles.diary.enabled() })
+                                }
+                            };
+                            let _ = app_handle.emit(EVT_RESOLUTION_DIARY, payload);
+                        }
+                        EngineControl::ConsentResolutionDiary => {
+                            let payload = match bubbles.diary.consent() {
+                                Ok(on) => {
+                                    tracing::info!("RESOLUTION_DIARY consent recorded enabled={on}");
+                                    serde_json::json!({ "ok": true, "message": "", "enabled": on })
+                                }
+                                Err(e) => {
+                                    tracing::warn!("RESOLUTION_DIARY consent failed: {e}");
                                     serde_json::json!({ "ok": false, "message": e, "enabled": bubbles.diary.enabled() })
                                 }
                             };
