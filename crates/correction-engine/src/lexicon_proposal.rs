@@ -172,6 +172,60 @@ pub const LEARNED_LEXICON_FILE_VERSION: u32 = 1;
 struct LearnedLexiconFile {
     version: u32,
     words: Vec<LexiconProposal>,
+    /// Words the user explicitly **kept** (the Keep action): pinned `Confirmed` so
+    /// the proposer's normal gates can never demote them. Absent in older files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pinned: Vec<String>,
+    /// Words the user explicitly **removed**: a tombstone so the silent auto-grow
+    /// lane never re-learns a word the user said is not theirs. Absent in older files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removed: Vec<String>,
+    /// Words Jordan itself taught the macOS spellchecker (Keep). Remembered so
+    /// Remove / Reset / Delete-everything / Restore can un-teach exactly those — and
+    /// never touch a word the user added to the system dictionary on their own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    os_taught: Vec<String>,
+}
+
+/// Everything `learned_lexicon.json` holds. `pinned` / `removed` are lowercase.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LearnedState {
+    pub words: Vec<LexiconProposal>,
+    pub pinned: Vec<String>,
+    pub removed: Vec<String>,
+    pub os_taught: Vec<String>,
+}
+
+/// Strip surrounding matched quotes from a captured word so a quoted token
+/// (`'LooopClothing'`, `"word"`, `“word”`) is stored as the word itself. Repeats for
+/// nested pairs; leaves a lone/unmatched quote alone (`'tis`, `James'`) — those are
+/// part of the word. Trims whitespace first. Pure.
+pub fn clean_learned_word(raw: &str) -> String {
+    let mut s = raw.trim();
+    loop {
+        let mut chars = s.chars();
+        let (Some(first), Some(last)) = (chars.next(), s.chars().next_back()) else { break };
+        let matched = matches!(
+            (first, last),
+            ('\'', '\'') | ('"', '"') | ('\u{2018}', '\u{2019}') | ('\u{201C}', '\u{201D}')
+        );
+        if matched && s.chars().count() >= 2 {
+            s = s[first.len_utf8()..s.len() - last.len_utf8()].trim();
+        } else {
+            break;
+        }
+    }
+    s.to_string()
+}
+
+/// Why a Keep/Remove was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeachError {
+    /// Nothing left after trimming/stripping quotes.
+    Empty,
+    /// A US/UK spelling variant: membership follows the system locale, never the
+    /// learned set, so Keep can't (and mustn't) override it.
+    VariantWord,
 }
 
 /// What [`LexiconProposer::restore_confirmed`] did, for the host's log line.
@@ -181,14 +235,27 @@ pub struct RestoreReport {
     pub skipped: usize,
 }
 
-/// Durably write the confirmed words (atomic write via [`crate::persist`]).
+/// Durably write the confirmed words (atomic write via [`crate::persist`]) with no
+/// pinned/removed extras. Prefer [`save_learned_state`]; this stays for callers
+/// that only have words.
 pub fn save_learned_lexicon(
     path: &std::path::Path,
     words: &[LexiconProposal],
 ) -> std::io::Result<()> {
+    save_learned_state(
+        path,
+        &LearnedState { words: words.to_vec(), ..LearnedState::default() },
+    )
+}
+
+/// Durably write the full learned state (words + pinned + removed).
+pub fn save_learned_state(path: &std::path::Path, state: &LearnedState) -> std::io::Result<()> {
     let file = LearnedLexiconFile {
         version: LEARNED_LEXICON_FILE_VERSION,
-        words: words.to_vec(),
+        words: state.words.clone(),
+        pinned: state.pinned.clone(),
+        removed: state.removed.clone(),
+        os_taught: state.os_taught.clone(),
     };
     let bytes = serde_json::to_vec_pretty(&file)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -199,22 +266,29 @@ pub fn save_learned_lexicon(
 /// is moved aside via [`crate::persist::quarantine_corrupt`] (never deleted)
 /// and the lexicon starts empty — the engine must still start.
 pub fn load_learned_lexicon(path: &std::path::Path) -> Vec<LexiconProposal> {
+    load_learned_state(path).words
+}
+
+/// [`load_learned_lexicon`] plus the pinned / removed sets. Same quarantine rules.
+pub fn load_learned_state(path: &std::path::Path) -> LearnedState {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
-        Err(_) => return Vec::new(),
+        Err(_) => return LearnedState::default(),
     };
     match serde_json::from_slice::<LearnedLexiconFile>(&bytes) {
-        Ok(f) if f.version == LEARNED_LEXICON_FILE_VERSION => f.words,
+        Ok(f) if f.version == LEARNED_LEXICON_FILE_VERSION => {
+            LearnedState { words: f.words, pinned: f.pinned, removed: f.removed, os_taught: f.os_taught }
+        }
         Ok(f) => {
             crate::persist::quarantine_corrupt(
                 path,
                 format!("learned_lexicon version {} unsupported", f.version),
             );
-            Vec::new()
+            LearnedState::default()
         }
         Err(e) => {
             crate::persist::quarantine_corrupt(path, e);
-            Vec::new()
+            LearnedState::default()
         }
     }
 }
@@ -231,7 +305,12 @@ pub fn read_learned_words(path: &std::path::Path) -> Vec<String> {
     };
     match serde_json::from_slice::<LearnedLexiconFile>(&bytes) {
         Ok(f) if f.version == LEARNED_LEXICON_FILE_VERSION => {
-            let mut words: Vec<String> = f.words.into_iter().map(|p| p.word).filter(|w| !w.is_empty()).collect();
+            let mut words: Vec<String> = f
+                .words
+                .into_iter()
+                .map(|p| clean_learned_word(&p.word))
+                .filter(|w| !w.is_empty())
+                .collect();
             words.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
             words.dedup();
             words
@@ -251,9 +330,10 @@ pub fn persist_if_dirty(
     if !proposer.take_dirty() {
         return Ok(None);
     }
-    let words = proposer.confirmed_proposals();
-    match save_learned_lexicon(path, &words) {
-        Ok(()) => Ok(Some(words.len())),
+    let state = proposer.learned_state();
+    let n = state.words.len();
+    match save_learned_state(path, &state) {
+        Ok(()) => Ok(Some(n)),
         Err(e) => {
             proposer.dirty = true;
             Err(e)
@@ -485,6 +565,14 @@ pub struct LexiconProposer {
     /// Set on any learn/unlearn and on [`Self::reset_all`]; the host clears it
     /// with [`Self::take_dirty`] when it writes `learned_lexicon.json`.
     dirty: bool,
+    /// Words the user explicitly **kept** (lowercase). Pinned `Confirmed`: no
+    /// eligibility gate, re-evaluation or retraction can demote or remove them.
+    pinned: HashSet<String>,
+    /// Words the user explicitly **removed** (lowercase) — a tombstone: the silent
+    /// auto-grow lane never re-learns them. Cleared by Keep.
+    removed: HashSet<String>,
+    /// Words Jordan taught the macOS spellchecker (exact casing as taught).
+    os_taught: std::collections::BTreeSet<String>,
 }
 
 impl std::fmt::Debug for LexiconProposer {
@@ -542,6 +630,9 @@ impl LexiconProposer {
             learned_at_ms: HashMap::new(),
             credit_paused: false,
             dirty: false,
+            pinned: HashSet::new(),
+            removed: HashSet::new(),
+            os_taught: std::collections::BTreeSet::new(),
         }
     }
 
@@ -649,7 +740,18 @@ impl LexiconProposer {
             return ProposalUpdate::empty();
         }
 
-        let word = record.original_text.clone();
+        // Quote cleanup (data bug fix): the captured core can carry surrounding quotes
+        // (`'LooopClothing'`). The record's `original_text` must stay raw — the
+        // resolver matches it against the anchor span — so clean HERE, at the point
+        // a word becomes a lexicon key.
+        let word = clean_learned_word(&record.original_text);
+        if word.is_empty() {
+            return ProposalUpdate::empty();
+        }
+        // Tombstone: a word the user removed is never silently re-learned.
+        if self.removed.contains(&word.to_ascii_lowercase()) {
+            return ProposalUpdate::empty();
+        }
 
         // Learner guard (v0.3.0 locale gate): never learn a VarCon spelling
         // variant. Once L5 sets a locale the opposite-locale spelling is
@@ -806,7 +908,8 @@ impl LexiconProposer {
                 Some(p) => (p.lane.clone(), p.motor_verdict, p.occasions, p.tier),
                 None => continue,
             };
-            let new_tier = recompute_tier(
+            let pinned = self.pinned.contains(&word.to_ascii_lowercase());
+            let new_tier = if pinned { ProposalTier::Confirmed } else { recompute_tier(
                 &word,
                 &lane,
                 motor_verdict,
@@ -815,7 +918,7 @@ impl LexiconProposer {
                 norvig_freq,
                 rescue_active,
                 occasions,
-            );
+            ) };
             // Persist the recomputed proximity/plausibility even if
             // the tier didn't move — the panel reflects the live
             // verdict.
@@ -873,6 +976,9 @@ impl LexiconProposer {
         self.proposals.clear();
         self.record_contributions.clear();
         self.learned_at_ms.clear();
+        self.pinned.clear();
+        self.removed.clear();
+        self.os_taught.clear();
         self.lex.clear_learned();
         // The persisted file must follow the wipe, or a restart would bring
         // the reset words straight back.
@@ -921,11 +1027,24 @@ impl LexiconProposer {
     pub fn restore_confirmed(&mut self, saved: Vec<LexiconProposal>) -> RestoreReport {
         let mut report = RestoreReport::default();
         for mut p in saved {
+            // Migration: an entry saved with surrounding quotes (`'LooopClothing'`,
+            // from before capture was cleaned) is re-seated as the clean word and the
+            // file is marked for rewrite, so the bad entry is fixed on disk too.
+            let cleaned = clean_learned_word(&p.word);
+            if cleaned != p.word {
+                p.word = cleaned;
+                self.dirty = true;
+            }
+            let key = p.word.to_ascii_lowercase();
+            let pinned = self.pinned.contains(&key);
             if p.word.is_empty()
-                || self.lex.is_in_clean(&p.word)
+                || (!pinned && self.lex.is_in_clean(&p.word))
                 || crate::spelling_variant::is_variant_word(&p.word)
+                || self.removed.contains(&key)
+                || self.proposals.keys().any(|w| w.eq_ignore_ascii_case(&p.word))
             {
                 report.skipped += 1;
+                self.dirty = true; // disk still holds an entry that no longer belongs
                 continue;
             }
             p.tier = ProposalTier::Confirmed;
@@ -938,10 +1057,167 @@ impl LexiconProposer {
         report
     }
 
+    /// Everything `learned_lexicon.json` persists: the `Confirmed` words plus the
+    /// pinned (kept) and removed (tombstoned) sets, sorted for a stable file.
+    pub fn learned_state(&self) -> LearnedState {
+        let mut pinned: Vec<String> = self.pinned.iter().cloned().collect();
+        pinned.sort();
+        let mut removed: Vec<String> = self.removed.iter().cloned().collect();
+        removed.sort();
+        LearnedState {
+            words: self.confirmed_proposals(),
+            pinned,
+            removed,
+            os_taught: self.os_taught.iter().cloned().collect(),
+        }
+    }
+
+    /// Restart re-seat of the full saved state: tombstones and pins first (so the
+    /// word restore honours them), then the words (cleaning any quoted legacy entry).
+    pub fn restore_state(&mut self, state: LearnedState) -> RestoreReport {
+        for w in &state.removed {
+            let k = clean_learned_word(w).to_ascii_lowercase();
+            if !k.is_empty() {
+                self.removed.insert(k);
+            }
+        }
+        for w in &state.pinned {
+            let k = clean_learned_word(w).to_ascii_lowercase();
+            if !k.is_empty() {
+                self.pinned.insert(k);
+            }
+        }
+        for w in &state.os_taught {
+            let w = clean_learned_word(w);
+            if !w.is_empty() {
+                self.os_taught.insert(w);
+            }
+        }
+        let report = self.restore_confirmed(state.words);
+        // A pinned word with no saved proposal (hand-edited / partial file) is still
+        // the user's word: synthesize it so it is learned and persists.
+        let missing: Vec<String> = self
+            .pinned
+            .iter()
+            .filter(|k| !self.proposals.keys().any(|w| w.eq_ignore_ascii_case(k)))
+            .cloned()
+            .collect();
+        for k in missing {
+            let _ = self.keep_word(&k, 0);
+        }
+        report
+    }
+
+    /// Record that Jordan taught the macOS spellchecker `word` (call only after the
+    /// OS accepted it). Persisted, so a later Remove/Reset can un-teach it.
+    pub fn mark_os_taught(&mut self, word: &str) {
+        let w = clean_learned_word(word);
+        if !w.is_empty() && self.os_taught.insert(w) {
+            self.dirty = true;
+        }
+    }
+
+    /// Forget that Jordan taught the OS `word` (call after un-teaching it).
+    pub fn clear_os_taught(&mut self, word: &str) {
+        let w = clean_learned_word(word);
+        let before = self.os_taught.len();
+        self.os_taught.retain(|x| !x.eq_ignore_ascii_case(&w));
+        if self.os_taught.len() != before {
+            self.dirty = true;
+        }
+    }
+
+    /// The words Jordan taught the macOS spellchecker, sorted.
+    pub fn os_taught_words(&self) -> Vec<String> {
+        self.os_taught.iter().cloned().collect()
+    }
+
+    pub fn is_pinned(&self, word: &str) -> bool {
+        self.pinned.contains(&clean_learned_word(word).to_ascii_lowercase())
+    }
+
+    pub fn is_removed(&self, word: &str) -> bool {
+        self.removed.contains(&clean_learned_word(word).to_ascii_lowercase())
+    }
+
+    /// **Keep** — the user says "this word is mine". Adds it to the learned lexicon
+    /// as a pinned `Confirmed` word (a known word of the user's: no gate, re-evaluation
+    /// or retraction can demote it), clears any tombstone, and marks the learned file
+    /// dirty. Returns the clean stored word. Idempotent. A spelling-variant word is
+    /// rejected — the locale gate decides those (see [`crate::spelling_variant`]).
+    pub fn keep_word(&mut self, raw: &str, now: u64) -> Result<String, TeachError> {
+        let clean = clean_learned_word(raw);
+        if clean.is_empty() {
+            return Err(TeachError::Empty);
+        }
+        if crate::spelling_variant::is_variant_word(&clean) {
+            return Err(TeachError::VariantWord);
+        }
+        let key = clean.to_ascii_lowercase();
+        self.removed.remove(&key);
+        self.pinned.insert(key.clone());
+        let word = self
+            .proposals
+            .keys()
+            .find(|w| w.eq_ignore_ascii_case(&clean))
+            .cloned()
+            .unwrap_or_else(|| clean.clone());
+        let signal = linguistic_signal(&word, self.lex, now, &self.learned_at_ms);
+        let norvig_freq = self.lex.frequency(&word);
+        let p = self.proposals.entry(word.clone()).or_insert_with(|| LexiconProposal {
+            word: word.clone(),
+            lane: Lane::Fast,
+            motor_verdict: MotorVerdict::Clean,
+            tier: ProposalTier::Confirmed,
+            occasions: 0,
+            last_motor_evidence: None,
+            last_record_id: 0,
+            last_seen_ms: now,
+            plausibility: signal.plausibility,
+            proximity: signal.proximity,
+            norvig_freq,
+            version: LEXICON_PROPOSAL_VERSION,
+        });
+        p.tier = ProposalTier::Confirmed;
+        self.learned_at_ms.insert(key, now);
+        self.lex.learn(&word);
+        self.dirty = true;
+        for _ in 0..MAX_RE_EVAL_ITERATIONS {
+            if !self.re_evaluate_all_proposals() {
+                break;
+            }
+        }
+        Ok(word)
+    }
+
+    /// **Remove** — the undo of Keep (or of an auto-learned word): drops the word
+    /// from the learned lexicon and the pinned set, and tombstones it so the silent
+    /// auto-grow lane doesn't quietly re-learn what the user just removed (only an
+    /// explicit Keep clears the tombstone). Returns the clean word. Idempotent.
+    pub fn forget_word(&mut self, raw: &str) -> Result<String, TeachError> {
+        let clean = clean_learned_word(raw);
+        if clean.is_empty() {
+            return Err(TeachError::Empty);
+        }
+        let key = clean.to_ascii_lowercase();
+        self.pinned.remove(&key);
+        self.proposals.retain(|w, _| !w.eq_ignore_ascii_case(&clean));
+        self.learned_at_ms.remove(&key);
+        self.lex.unlearn(&clean);
+        self.removed.insert(key);
+        self.dirty = true;
+        for _ in 0..MAX_RE_EVAL_ITERATIONS {
+            if !self.re_evaluate_all_proposals() {
+                break;
+            }
+        }
+        Ok(clean)
+    }
+
     // ---- Internal helpers --------------------------------------------
 
     fn credit_kept_contribution(&mut self, record: &LogRecord) {
-        let word = record.original_text.clone();
+        let word = clean_learned_word(&record.original_text);
         let lane = lane_for(record);
         let motor_verdict = motor_verdict_for(record);
         let last_motor_evidence = slip_score_for(record);
@@ -960,6 +1236,7 @@ impl LexiconProposer {
         } = linguistic_signal(&word, self.lex, last_seen_ms, &self.learned_at_ms);
         let norvig_freq = self.lex.frequency(&word);
         let rescue_active = self.casing_baseline().rescue_active;
+        let pinned = self.pinned.contains(&word.to_ascii_lowercase());
 
         let entry = self.proposals.entry(word.clone()).or_insert_with(|| {
             LexiconProposal {
@@ -987,29 +1264,37 @@ impl LexiconProposer {
         entry.plausibility = plausibility;
         entry.proximity = proximity;
         entry.norvig_freq = norvig_freq;
-        entry.tier = recompute_tier(
-            &entry.word,
-            &entry.lane,
-            entry.motor_verdict,
-            entry.plausibility,
-            entry.proximity,
-            entry.norvig_freq,
-            rescue_active,
-            entry.occasions,
-        );
+        entry.tier = if pinned {
+            ProposalTier::Confirmed
+        } else {
+            recompute_tier(
+                &entry.word,
+                &entry.lane,
+                entry.motor_verdict,
+                entry.plausibility,
+                entry.proximity,
+                entry.norvig_freq,
+                rescue_active,
+                entry.occasions,
+            )
+        };
     }
 
     fn retract_kept_contribution(&mut self, word: &str) {
         // Resolve the casing baseline BEFORE the mutable borrow on the
         // proposal — `casing_baseline()` borrows &self.
         let rescue_active = self.casing_baseline().rescue_active;
+        let pinned = self.pinned.contains(&word.to_ascii_lowercase());
         let mut should_remove = false;
         if let Some(p) = self.proposals.get_mut(word) {
             // Saturating: a previously-credited Kept must have a count
             // ≥ 1; the saturating sub is just defensive against a
             // double-undo bug we'd rather not crash on.
             p.occasions = p.occasions.saturating_sub(1);
-            if p.occasions == 0 {
+            if pinned {
+                // A kept word is never demoted or removed by a retraction.
+                p.tier = ProposalTier::Confirmed;
+            } else if p.occasions == 0 {
                 should_remove = true;
             } else {
                 p.tier = recompute_tier(
@@ -2687,6 +2972,216 @@ mod tests {
     fn simulate_restart() -> LexiconProposer {
         Lexicon::shared().clear_learned();
         LexiconProposer::new()
+    }
+
+    // ---- Teach-back locks (Track 1 auto-grow, Keep, Remove, quote cleanup) -----
+
+    /// `n` clean-motor Kept occasions of `word` (literal counts — NOT the threshold
+    /// constant — so sabotaging the constant is caught).
+    fn kept_n(p: &mut LexiconProposer, ledger: &mut DecisionLedger, word: &str, n: usize) {
+        for _ in 0..n {
+            let id = append_fast(ledger, word, clean_motor(word));
+            let kept = flip_outcome(ledger, id, Outcome::Kept);
+            p.note_record(&kept);
+        }
+    }
+
+    fn persist_state(p: &mut LexiconProposer, path: &std::path::Path) {
+        p.mark_dirty();
+        persist_if_dirty(p, path).unwrap();
+    }
+
+    #[test]
+    fn track1_a_novel_word_typed_three_times_auto_learns_two_does_not() {
+        let _g = serial_setup();
+        let lex = Lexicon::shared();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        kept_n(&mut p, &mut ledger, "Soumyo", 2);
+        assert!(!lex.is_learned("Soumyo"), "2 occasions must NOT learn");
+        assert!(p.confirmed_proposals().is_empty());
+        kept_n(&mut p, &mut ledger, "Soumyo", 1);
+        assert!(lex.is_learned("Soumyo"), "the 3rd occasion learns it");
+        assert_eq!(p.confirmed_proposals().len(), 1);
+    }
+
+    #[test]
+    fn quote_cleanup_new_captures_are_stored_clean() {
+        let _g = serial_setup();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        // The record carries the raw quoted core, exactly as the tokenizer emits it.
+        kept_n(&mut p, &mut ledger, "'Soumyo'", 3);
+        let words: Vec<String> = p.confirmed_proposals().into_iter().map(|c| c.word).collect();
+        assert_eq!(words, vec!["Soumyo".to_string()], "stored without the surrounding quotes");
+        assert!(Lexicon::shared().is_learned("Soumyo"));
+        assert!(!Lexicon::shared().is_learned("'soumyo'"), "no quoted key");
+    }
+
+    #[test]
+    fn quote_cleanup_only_strips_matched_surrounding_quotes() {
+        for (raw, want) in [
+            ("'LooopClothing'", "LooopClothing"),
+            ("\"word\"", "word"),
+            ("\u{2018}word\u{2019}", "word"),
+            ("\u{201C}word\u{201D}", "word"),
+            ("''word''", "word"),
+            ("  'word'  ", "word"),
+            ("'tis", "'tis"),
+            ("James'", "James'"),
+            ("don't", "don't"),
+            ("''", ""),
+        ] {
+            assert_eq!(clean_learned_word(raw), want, "raw {raw:?}");
+        }
+    }
+
+    #[test]
+    fn quote_cleanup_migrates_an_existing_quoted_entry_on_restore_and_rewrites_the_file() {
+        let _g = serial_setup();
+        let path = scratch_path("migrate-quotes");
+        // Build a real saved entry, then give it the legacy quoted word (the live bug).
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        confirm(&mut p, &mut ledger, "Soumyo");
+        let mut legacy = p.confirmed_proposals();
+        legacy[0].word = "'Soumyo'".to_string();
+        save_learned_lexicon(&path, &legacy).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("'Soumyo'"), "precondition: bad entry on disk");
+
+        let mut p2 = simulate_restart();
+        let report = p2.restore_state(load_learned_state(&path));
+        assert_eq!(report.restored, 1);
+        assert!(Lexicon::shared().is_learned("Soumyo"), "learned under the clean word");
+        assert!(!Lexicon::shared().is_learned("'soumyo'"));
+        // The migration marks the file dirty, so the next flush rewrites it clean.
+        assert_eq!(persist_if_dirty(&mut p2, &path).unwrap(), Some(1));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("'Soumyo'"), "bad entry gone from disk: {text}");
+        assert_eq!(read_learned_words(&path), vec!["Soumyo".to_string()]);
+    }
+
+    #[test]
+    fn keep_adds_the_word_pins_it_and_it_survives_restart_and_a_slip_veto() {
+        let _g = serial_setup();
+        let path = scratch_path("keep");
+        let lex = Lexicon::shared();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        assert!(!lex.is_known("Krutrimish"));
+        assert_eq!(p.keep_word("'Krutrimish'", 5).unwrap(), "Krutrimish", "cleaned on the way in");
+        assert!(lex.is_learned("Krutrimish"), "a): in the learned lexicon");
+        assert!(p.is_pinned("Krutrimish"));
+        persist_state(&mut p, &path);
+        assert_eq!(read_learned_words(&path), vec!["Krutrimish".to_string()]);
+
+        // Restart: still learned + pinned.
+        let mut p2 = simulate_restart();
+        assert!(!lex.is_known("Krutrimish"), "precondition: a restart forgets memory");
+        p2.restore_state(load_learned_state(&path));
+        assert!(lex.is_learned("Krutrimish") && p2.is_pinned("Krutrimish"));
+
+        // A pinned word is never demoted — even when the typing looks slip-like (which
+        // would Hold an ordinary word) — and a retraction can't remove it.
+        for _ in 0..3 {
+            let id = append_fast(&mut ledger, "Krutrimish", slip_motor("Krutrimish"));
+            let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+            p2.note_record(&kept);
+        }
+        assert!(lex.is_learned("Krutrimish"), "pinned: the slip signature must not demote a kept word");
+        let id = append_fast(&mut ledger, "Krutrimish", clean_motor("Krutrimish"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+        p2.note_record(&kept);
+        let corrected = flip_outcome(&mut ledger, id, Outcome::CorrectedToOther);
+        p2.note_record(&corrected); // retraction
+        assert!(lex.is_learned("Krutrimish"), "pinned: a retraction must not remove a kept word");
+
+        // Fresh Keep (0 occasions): one Kept then a retraction takes occasions to 0, which
+        // would REMOVE an ordinary proposal — a pinned one must survive that.
+        p2.keep_word("Zorbuxish", 7).unwrap();
+        let id = append_fast(&mut ledger, "Zorbuxish", clean_motor("Zorbuxish"));
+        let kept = flip_outcome(&mut ledger, id, Outcome::Kept);
+        p2.note_record(&kept);
+        let corrected = flip_outcome(&mut ledger, id, Outcome::CorrectedToOther);
+        p2.note_record(&corrected);
+        assert!(lex.is_learned("Zorbuxish"), "pinned: occasions reaching 0 must not remove a kept word");
+        assert!(p2.confirmed_proposals().iter().any(|c| c.word == "Zorbuxish"));
+    }
+
+    #[test]
+    fn keep_stops_the_wrong_fix_in_both_lanes_lexicon_membership_alone_is_not_enough() {
+        use crate::kill_switch::{classify, shadow_convergence_scan, ObserveReason, PatternReadiness};
+        use crate::motor_map::MotorMap;
+        use crate::word_pattern::WordPatternStore;
+        use crate::Outcome as O;
+        let _g = serial_setup();
+        let lex = Lexicon::shared();
+        let mm = MotorMap::new();
+        // Strong history: the user corrected `wprd → word` 13× (above even the real-word bar).
+        let mut store = WordPatternStore::new();
+        for _ in 0..13 {
+            store.observe_correction(O::CorrectedToOther, "wprd", "word", 1_000);
+        }
+        // BEFORE: both lanes would offer the fix.
+        assert!(matches!(classify("wprd", "word", &store, lex, &mm), PatternReadiness::Suggest { .. }));
+        assert!(shadow_convergence_scan("wprd", lex, &mm).convergent);
+
+        // Merely making it a *known word* (what lexicon membership alone does) is NOT
+        // enough for the learned lane: a known word with ≥12 corrections still clears
+        // the real-word bar. This is why Keep needs the learned-word gate.
+        lex.learn("wprd");
+        assert!(lex.is_known("wprd"));
+        // …so use the real Keep (pinned learned word) and assert both lanes stop:
+        let mut p = LexiconProposer::new();
+        p.keep_word("wprd", 9).unwrap();
+        assert_eq!(
+            classify("wprd", "word", &store, lex, &mm),
+            PatternReadiness::Observe { reason: ObserveReason::LearnedWord },
+            "b) learned lane stops"
+        );
+        assert!(!shadow_convergence_scan("wprd", lex, &mm).convergent, "b) bold lane stops (known word, no candidates)");
+
+        // Remove lifts it: the user said it's not theirs, so Jordan may fix it again.
+        p.forget_word("wprd").unwrap();
+        assert!(matches!(classify("wprd", "word", &store, lex, &mm), PatternReadiness::Suggest { .. }));
+        assert!(shadow_convergence_scan("wprd", lex, &mm).convergent);
+    }
+
+    #[test]
+    fn remove_drops_the_word_and_a_tombstone_stops_silent_relearning() {
+        let _g = serial_setup();
+        let path = scratch_path("remove");
+        let lex = Lexicon::shared();
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        p.keep_word("Soumyo", 1).unwrap();
+        persist_state(&mut p, &path);
+        assert_eq!(p.forget_word("Soumyo").unwrap(), "Soumyo");
+        assert!(!lex.is_learned("Soumyo"), "a): gone from the learned lexicon");
+        assert!(!p.is_pinned("Soumyo"));
+        persist_state(&mut p, &path);
+        assert!(read_learned_words(&path).is_empty(), "gone from the file");
+
+        // The silent auto-grow lane must not quietly undo the user's Remove…
+        kept_n(&mut p, &mut ledger, "Soumyo", 3);
+        assert!(!lex.is_learned("Soumyo"), "tombstoned: typing it 3x must not re-learn it");
+        // …and that survives a restart.
+        let mut p2 = simulate_restart();
+        p2.restore_state(load_learned_state(&path));
+        kept_n(&mut p2, &mut ledger, "Soumyo", 3);
+        assert!(!lex.is_learned("Soumyo"), "tombstone is persisted");
+        // An explicit Keep is the only thing that lifts it.
+        p2.keep_word("Soumyo", 2).unwrap();
+        assert!(lex.is_learned("Soumyo") && !p2.is_removed("Soumyo"));
+    }
+
+    #[test]
+    fn teach_errors_are_refusals_not_silent_noops() {
+        let _g = serial_setup();
+        let mut p = LexiconProposer::new();
+        assert_eq!(p.keep_word("  ''  ", 1), Err(TeachError::Empty));
+        assert_eq!(p.forget_word(""), Err(TeachError::Empty));
+        assert!(p.confirmed_proposals().is_empty());
     }
 
     #[test]

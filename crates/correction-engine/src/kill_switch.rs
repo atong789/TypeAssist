@@ -305,6 +305,12 @@ pub enum ObserveReason {
     /// The user has undone this pattern's suggestion [`UNDO_BRAKE_STRIKES`]
     /// times in a row — suppressed until it rebuilds (the 3-strike brake).
     BrakeTripped,
+    /// The typed word is in the user's **learned lexicon** — a word they own (kept
+    /// explicitly, or learned from their own repeated typing). Jordan never suggests
+    /// changing a word the user has told it is theirs, however much historical
+    /// evidence the pattern store holds for `typed → something`. Removing the word
+    /// from the lexicon lifts this.
+    LearnedWord,
 }
 
 /// The pre-computed facts the policy decides on — injected so the decision is
@@ -660,7 +666,26 @@ pub fn classify(
     lexicon: &Lexicon,
     motor_map: &MotorMap,
 ) -> PatternReadiness {
+    if is_learned_word(typed, lexicon) {
+        return PatternReadiness::Observe { reason: ObserveReason::LearnedWord };
+    }
     classify_pattern(&build_facts(typed, target, store, lexicon, motor_map))
+}
+
+/// The typed word is one the user owns (learned lexicon). Gates **every** classify
+/// entry point so the Impact ledger, the shadow log and the live bubble all agree.
+fn is_learned_word(typed: &str, lexicon: &Lexicon) -> bool {
+    lexicon.is_learned(&crate::word_pattern::normalize_word(typed))
+}
+
+/// Overlay the learned-word gate on an explain (readiness only; the numbers stay
+/// as computed so the shadow log can still show what the bar would have been).
+fn gate_explain(mut ex: ClassifyExplain, typed: &str, lexicon: &Lexicon) -> ClassifyExplain {
+    if is_learned_word(typed, lexicon) {
+        ex.readiness = PatternReadiness::Observe { reason: ObserveReason::LearnedWord };
+        ex.surfaced_early = false;
+    }
+    ex
 }
 
 /// Like [`classify`] but returns the full [`ClassifyExplain`] — affectedness,
@@ -673,7 +698,11 @@ pub fn classify_explained(
     lexicon: &Lexicon,
     motor_map: &MotorMap,
 ) -> ClassifyExplain {
-    classify_pattern_explained(&build_facts(typed, target, store, lexicon, motor_map))
+    gate_explain(
+        classify_pattern_explained(&build_facts(typed, target, store, lexicon, motor_map)),
+        typed,
+        lexicon,
+    )
 }
 
 /// Shadow-curve variant of [`classify_explained`]: the **length-scaled** evidence
@@ -690,7 +719,11 @@ pub fn classify_explained_scaled(
     lexicon: &Lexicon,
     motor_map: &MotorMap,
 ) -> ClassifyExplain {
-    classify_pattern_explained_scaled(&build_facts_scaled(typed, target, store, lexicon, motor_map))
+    gate_explain(
+        classify_pattern_explained_scaled(&build_facts_scaled(typed, target, store, lexicon, motor_map)),
+        typed,
+        lexicon,
+    )
 }
 
 // ---- Shadow convergence model (dictionary-driven, observe-only) ------------

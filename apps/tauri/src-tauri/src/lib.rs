@@ -9,8 +9,10 @@ mod engine;
 mod login_item;
 #[cfg(target_os = "macos")]
 mod menu_focus;
+mod os_dictionary;
 mod consent_lock;
 mod progress_reads;
+mod teach;
 mod resolution_diary;
 
 use allow_list::AllowList;
@@ -745,6 +747,33 @@ fn read_pattern_outcomes() -> Result<progress_reads::PatternOutcomesRead, String
     Ok(progress_reads::pattern_outcomes(&dir))
 }
 
+/// Tauri command: **Keep** — "this word is mine". Adds it to the learned lexicon as a
+/// pinned known word (Jordan stops offering a fix for it) and teaches the macOS
+/// spellchecker so its red squiggle goes. Writes no diary row. Engine-routed (sole
+/// writer); emits `lexicon://changed` (a `TeachReport`) + `engine://learned-snapshot`.
+#[tauri::command]
+fn keep_word(word: String, app: AppHandle) -> Result<(), String> {
+    let sender = app
+        .try_state::<EngineControlSender>()
+        .ok_or_else(|| "engine not started".to_string())?;
+    sender
+        .send(EngineControl::KeepWord { word })
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
+/// Tauri command: **Remove** — undo a Keep / drop a learned word. Removes it from the
+/// lexicon (tombstoned against silent re-learning) and un-teaches the macOS
+/// spellchecker so the squiggle returns. Engine-routed; emits `lexicon://changed`.
+#[tauri::command]
+fn remove_word(word: String, app: AppHandle) -> Result<(), String> {
+    let sender = app
+        .try_state::<EngineControlSender>()
+        .ok_or_else(|| "engine not started".to_string())?;
+    sender
+        .send(EngineControl::RemoveWord { word })
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
 /// Tauri command: onboarding completed — record consent so the resolution diary
 /// starts collecting (the ONLY non-Settings path that can turn it on). Routed
 /// through the engine (sole writer). Uses `try_state` so a not-yet-started engine
@@ -1397,6 +1426,8 @@ pub fn run() {
             delete_all_data,
             read_resolution_diary,
             read_learned_lexicon,
+            keep_word,
+            remove_word,
             read_pattern_outcomes,
             set_resolution_diary,
             record_diary_consent,
