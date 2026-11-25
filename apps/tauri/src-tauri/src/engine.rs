@@ -35,7 +35,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::path::{Path, PathBuf};
 
+use crate::os_dictionary::MacSpellBackend;
 use crate::resolution_diary::{DiaryOutcome, ResolutionDiary};
+use crate::teach;
 use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
 use correction_engine::{
     classify_slip, decide, has_motor_evidence, measure_token_motor, normalize_word,
@@ -215,6 +217,8 @@ pub const EVT_CORRECTION_APPLIED: &str = "corrections://applied";
 pub const EVT_CORRECTION_DISMISSED: &str = "corrections://dismissed";
 /// Resolution diary toggled / imported. Payload `{ ok, message, enabled, merge? }`.
 pub const EVT_RESOLUTION_DIARY: &str = "resolution-diary://changed";
+/// A learned word was Kept or Removed (teach-back). Payload: [`teach::TeachReport`].
+pub const EVT_LEXICON_TEACH: &str = "lexicon://changed";
 
 /// **Data layer.** Result of a restore-from-backup. Payload `{ ok: bool,
 /// message: String }`: on success `message` is the chosen filename's worth of
@@ -393,6 +397,15 @@ pub enum EngineControl {
     /// path besides the Settings switch that can turn collection on. Emits
     /// [`EVT_RESOLUTION_DIARY`].
     ConsentResolutionDiary,
+    /// **Teach-back — Keep.** "This word is mine": add `word` to the learned lexicon
+    /// as a pinned known word (Jordan stops offering a fix for it) and teach the macOS
+    /// spellchecker so its red squiggle goes. Writes no diary row. Emits
+    /// [`EVT_LEXICON_TEACH`] + a fresh [`EVT_LEARNED_SNAPSHOT`].
+    KeepWord { word: String },
+    /// **Teach-back — Remove.** The undo: drop `word` from the learned lexicon (and
+    /// tombstone it against silent re-learning) and un-teach the macOS spellchecker so
+    /// the squiggle returns. Emits [`EVT_LEXICON_TEACH`] + [`EVT_LEARNED_SNAPSHOT`].
+    RemoveWord { word: String },
     /// **Resolution diary — merge.** Import another Mac's exported diary file
     /// (user-chosen path): union by event id, 14-day retention, atomic rewrite,
     /// idempotent. Never network. Emits [`EVT_RESOLUTION_DIARY`] with the
@@ -3570,7 +3583,7 @@ pub fn spawn<R: Runtime>(
         let mut lex_last_persisted: usize = 0;
         let mut lex_restored_at_start: u64 = 0;
         if let Some(p) = learned_lexicon_path.as_deref() {
-            let report = proposer.restore_confirmed(correction_engine::load_learned_lexicon(p));
+            let report = proposer.restore_state(correction_engine::load_learned_state(p));
             lex_last_persisted = report.restored;
             lex_restored_at_start = report.restored as u64;
             if report.skipped > 0 {
@@ -5347,6 +5360,11 @@ pub fn spawn<R: Runtime>(
                             // engine retained the truth). After this:
                             // proposer state empty, lex.learned empty,
                             // is_known back to bundled-only.
+                            // Words Jordan taught macOS go back too (squiggles return).
+                            teach::unteach_all(
+                                &mut proposer,
+                                &mut MacSpellBackend::new(app_handle.clone()),
+                            );
                             proposer.reset_all();
                             // The reset is persisted by the next flush (an empty
                             // lexicon file), so a restart can't bring the words back.
@@ -5537,6 +5555,37 @@ pub fn spawn<R: Runtime>(
                             };
                             let _ = app_handle.emit(EVT_RESOLUTION_DIARY, payload);
                         }
+                        EngineControl::KeepWord { word } => {
+                            let report = teach::keep_word(
+                                &mut proposer,
+                                &mut MacSpellBackend::new(app_handle.clone()),
+                                learned_lexicon_path.as_deref(),
+                                &word,
+                                now_ms(),
+                            );
+                            if let Some(n) = report.saved_words {
+                                lex_last_persisted = n;
+                                funnel.lex_saves += 1;
+                            }
+                            tracing::info!("LEXICON_KEEP ok={} os_ok={:?} saved={:?}", report.ok, report.os_ok, report.saved_words);
+                            let _ = app_handle.emit(EVT_LEARNED_SNAPSHOT, proposer.learned_snapshot());
+                            let _ = app_handle.emit(EVT_LEXICON_TEACH, &report);
+                        }
+                        EngineControl::RemoveWord { word } => {
+                            let report = teach::remove_word(
+                                &mut proposer,
+                                &mut MacSpellBackend::new(app_handle.clone()),
+                                learned_lexicon_path.as_deref(),
+                                &word,
+                            );
+                            if let Some(n) = report.saved_words {
+                                lex_last_persisted = n;
+                                funnel.lex_saves += 1;
+                            }
+                            tracing::info!("LEXICON_REMOVE ok={} os_ok={:?} saved={:?}", report.ok, report.os_ok, report.saved_words);
+                            let _ = app_handle.emit(EVT_LEARNED_SNAPSHOT, proposer.learned_snapshot());
+                            let _ = app_handle.emit(EVT_LEXICON_TEACH, &report);
+                        }
                         EngineControl::ConsentResolutionDiary => {
                             let payload = match bubbles.diary.consent(now_ms()) {
                                 Ok(on) => {
@@ -5576,13 +5625,19 @@ pub fn spawn<R: Runtime>(
                                     // The runtime lexicon isn't carried in the
                                     // bundle — start it clean so is_known relearns
                                     // rather than carrying the pre-restore session.
+                                    // Words Jordan taught macOS before this replace must not
+                                    // be left behind in the system dictionary.
+                                    teach::unteach_all(
+                                        &mut proposer,
+                                        &mut MacSpellBackend::new(app_handle.clone()),
+                                    );
                                     proposer.reset_all();
                                     // The bundle carries the learned lexicon (when the
                                     // backup has one) and `apply_bundle` wrote it back to
                                     // disk — re-seat it so restored words are known again.
                                     if let Some(p) = learned_lexicon_path.as_deref() {
-                                        let report = proposer.restore_confirmed(
-                                            correction_engine::load_learned_lexicon(p),
+                                        let report = proposer.restore_state(
+                                            correction_engine::load_learned_state(p),
                                         );
                                         lex_last_persisted = report.restored;
                                         if report.skipped > 0 {
@@ -5620,6 +5675,11 @@ pub fn spawn<R: Runtime>(
                                 &mut word_patterns,
                             ) {
                                 Ok(()) => {
+                                    // Words Jordan taught macOS go back too.
+                                    teach::unteach_all(
+                                        &mut proposer,
+                                        &mut MacSpellBackend::new(app_handle.clone()),
+                                    );
                                     proposer.reset_all();
                                     // `delete_all_data` already removed the lexicon file;
                                     // don't let the reset's dirty flag write an empty one
@@ -6247,6 +6307,30 @@ mod tests {
             t.add_self_matched();
         }
         assert_eq!(t.self_matched, 1, "ignored bubble then exact retype must count");
+    }
+
+    #[test]
+    fn keep_stops_the_live_bubble_lane_and_remove_restores_it() {
+        // `shadow_suggestion` is the learned lane the live bubble fires from.
+        use crate::os_dictionary::fake::FakeSpell;
+        let _g = crate::teach::test_lock();
+        let lex = Lexicon::shared();
+        lex.clear_learned();
+        let mm = MotorMap::new();
+        let mut store = WordPatternStore::new();
+        for _ in 0..13 {
+            store.observe_correction(Outcome::CorrectedToOther, "wprd", "word", 1_000);
+        }
+        assert!(shadow_suggestion("wprd", &store, lex, &mm).is_some(), "precondition: the lane would fire");
+
+        let mut p = correction_engine::LexiconProposer::new();
+        let mut os = FakeSpell::default();
+        crate::teach::keep_word(&mut p, &mut os, None, "wprd", 5);
+        assert!(shadow_suggestion("wprd", &store, lex, &mm).is_none(), "Keep: Jordan stops offering the wrong fix");
+
+        crate::teach::remove_word(&mut p, &mut os, None, "wprd");
+        assert!(shadow_suggestion("wprd", &store, lex, &mm).is_some(), "Remove lifts it");
+        lex.clear_learned();
     }
 
     #[test]
