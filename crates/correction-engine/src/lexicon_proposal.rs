@@ -219,6 +219,27 @@ pub fn load_learned_lexicon(path: &std::path::Path) -> Vec<LexiconProposal> {
     }
 }
 
+/// **Read-only** view of the saved learned words, for a UI read ("Your words").
+/// Unlike [`load_learned_lexicon`] this NEVER moves a bad file aside: a read
+/// command must not mutate the data dir (the engine is the sole writer), so a
+/// missing, corrupt or wrong-version file simply reads as empty. Case is
+/// preserved; sorted case-insensitively; de-duplicated. Only the learned
+/// (Confirmed) set lives in this file — not the `word_freq` vocabulary tally.
+pub fn read_learned_words(path: &std::path::Path) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    match serde_json::from_slice::<LearnedLexiconFile>(&bytes) {
+        Ok(f) if f.version == LEARNED_LEXICON_FILE_VERSION => {
+            let mut words: Vec<String> = f.words.into_iter().map(|p| p.word).filter(|w| !w.is_empty()).collect();
+            words.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
+            words.dedup();
+            words
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// The host's flush step: if the learned set changed since the last flush,
 /// durably write it. Returns `Ok(Some(n))` when `n` words were written,
 /// `Ok(None)` when nothing was dirty. On a write error the dirty flag is put
@@ -2666,6 +2687,28 @@ mod tests {
     fn simulate_restart() -> LexiconProposer {
         Lexicon::shared().clear_learned();
         LexiconProposer::new()
+    }
+
+    #[test]
+    fn read_learned_words_returns_the_real_persisted_set_and_never_mutates() {
+        let _g = serial_setup();
+        let path = scratch_path("read-words");
+        let mut ledger = DecisionLedger::new();
+        let mut p = LexiconProposer::new();
+        confirm(&mut p, &mut ledger, "Soumyo");
+        confirm(&mut p, &mut ledger, "kubernetis");
+        assert_eq!(persist_if_dirty(&mut p, &path).unwrap(), Some(2));
+        assert_eq!(read_learned_words(&path), vec!["kubernetis".to_string(), "Soumyo".to_string()]);
+        // Missing file → empty, no file created.
+        let missing = scratch_path("read-words-missing");
+        let _ = std::fs::remove_file(&missing);
+        assert!(read_learned_words(&missing).is_empty());
+        assert!(!missing.exists());
+        // Corrupt file → empty AND left exactly where it is (a read must not quarantine).
+        let bad = scratch_path("read-words-bad");
+        std::fs::write(&bad, b"{ not json").unwrap();
+        assert!(read_learned_words(&bad).is_empty());
+        assert_eq!(std::fs::read(&bad).unwrap(), b"{ not json", "a read must not move or rewrite the file");
     }
 
     #[test]

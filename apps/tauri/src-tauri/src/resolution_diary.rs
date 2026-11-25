@@ -216,6 +216,11 @@ pub struct WindowSummary {
 pub struct DiarySummary {
     /// Whether collection is switched on right now.
     pub enabled: bool,
+    /// When collection began (epoch ms) — the moment consent was given or the user
+    /// switched the note on. **Durable**: stored in the `on` flag itself, so it does
+    /// NOT move as old rows prune (unlike `oldest_ts`). `None` while off / never
+    /// consented. Feeds the "collecting since" line.
+    pub tracking_since: Option<u64>,
     /// Earliest / latest retained event (None = nothing recorded yet).
     pub oldest_ts: Option<u64>,
     pub newest_ts: Option<u64>,
@@ -287,6 +292,7 @@ pub fn summarize(
     let end = now.saturating_add(FUTURE_TOLERANCE_MS);
     DiarySummary {
         enabled,
+        tracking_since: None, // filled by `read_summary` (needs the data dir)
         oldest_ts: events.iter().map(|e| e.ts).min(),
         newest_ts: events.iter().map(|e| e.ts).max(),
         total_events: events.len(),
@@ -315,7 +321,38 @@ fn read_events(dir: &Path) -> (Vec<DiaryEvent>, usize) {
 /// Read-only summary for the Progress UI. Never writes.
 pub fn read_summary(dir: &Path, now: u64) -> DiarySummary {
     let (events, skipped) = read_events(dir);
-    summarize(events, now, is_enabled(dir), skipped)
+    let mut s = summarize(events, now, is_enabled(dir), skipped);
+    s.tracking_since = tracking_since(dir);
+    s
+}
+
+/// The durable "collecting since" timestamp, or `None` if the diary is off.
+/// Stored as epoch-ms text inside the `on` flag at the moment collection began
+/// ([`write_on_flag`]). A flag with no readable stamp (written by an earlier build)
+/// falls back to its own file-creation time — still the moment it was switched on,
+/// and unaffected by pruning.
+pub fn tracking_since(dir: &Path) -> Option<u64> {
+    let flag = dir.join(DIARY_FLAG);
+    let text = std::fs::read_to_string(&flag).ok()?;
+    if let Ok(ms) = text.trim().parse::<u64>() {
+        return Some(ms);
+    }
+    let modified = std::fs::metadata(&flag).and_then(|m| m.modified()).ok()?;
+    modified.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64)
+}
+
+/// Write the `on` flag stamped with `now` — but only if collection isn't already on
+/// with a readable stamp, so a repeat consent / repeat switch-on never moves the
+/// "collecting since" time.
+fn write_on_flag(dir: &Path, now: u64) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("create data dir: {e}"))?;
+    let flag = dir.join(DIARY_FLAG);
+    if let Ok(text) = std::fs::read_to_string(&flag) {
+        if text.trim().parse::<u64>().is_ok() {
+            return Ok(());
+        }
+    }
+    std::fs::write(&flag, now.to_string()).map_err(|e| format!("record consent: {e}"))
 }
 
 /// Export the retained events to `dest` (read-only on the data dir; the user picked
@@ -413,12 +450,11 @@ fn load_or_create_device_id(dir: &Path, now: u64) -> Option<String> {
 /// opt-out always wins, so a replayed onboarding can't re-enable it. Returns
 /// whether collection is now on. **No recorded choice = off** (nothing else ever
 /// writes the `on` flag except this and the Settings switch).
-pub fn record_consent(dir: &Path) -> Result<bool, String> {
+pub fn record_consent(dir: &Path, now: u64) -> Result<bool, String> {
     if dir.join(DIARY_OFF_FLAG).exists() {
         return Ok(false);
     }
-    std::fs::create_dir_all(dir).map_err(|e| format!("create data dir: {e}"))?;
-    std::fs::write(dir.join(DIARY_FLAG), b"").map_err(|e| format!("record consent: {e}"))?;
+    write_on_flag(dir, now)?;
     Ok(true)
 }
 
@@ -529,7 +565,7 @@ impl ResolutionDiary {
     }
 
     /// Turn collection on/off. Off **deletes the log** (opt-out erases).
-    pub fn set_enabled(&mut self, on: bool) -> Result<(), String> {
+    pub fn set_enabled(&mut self, on: bool, now: u64) -> Result<(), String> {
         let Some(dir) = self.dir.clone() else {
             return Err("no data directory".into());
         };
@@ -542,7 +578,7 @@ impl ResolutionDiary {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("enable: {e}")),
             }
-            std::fs::write(&flag, b"").map_err(|e| format!("enable: {e}"))?;
+            write_on_flag(&dir, now)?;
         } else {
             // Record the explicit opt-out FIRST so a failure below can't leave the
             // diary on with the user's "off" half-applied.
@@ -563,9 +599,9 @@ impl ResolutionDiary {
 
     /// Onboarding completed ⇒ consent recorded ⇒ collection starts (unless the user
     /// explicitly opted out earlier — see [`record_consent`]).
-    pub fn consent(&mut self) -> Result<bool, String> {
+    pub fn consent(&mut self, now: u64) -> Result<bool, String> {
         let dir = self.dir.clone().ok_or("no data directory")?;
-        record_consent(&dir)
+        record_consent(&dir, now)
     }
 
     /// Merge an incoming diary file (engine = sole writer).
@@ -751,11 +787,11 @@ mod tests {
     fn opt_out_deletes_the_log_and_the_flag() {
         let dir = tmp("optout");
         let mut d = ResolutionDiary::open(Some(dir.clone()), NOW);
-        d.set_enabled(true).unwrap();
+        d.set_enabled(true, NOW).unwrap();
         d.record(DiaryOutcome::Taken, "teh", "the", None, NOW)
             .unwrap();
         assert!(dir.join(DIARY_FILE).exists());
-        d.set_enabled(false).unwrap();
+        d.set_enabled(false, NOW).unwrap();
         assert!(!dir.join(DIARY_FILE).exists(), "opt-out erases the log");
         assert!(!d.enabled());
         assert!(d
@@ -802,7 +838,7 @@ mod tests {
                 .is_none(),
             "off before consent"
         );
-        assert_eq!(d.consent(), Ok(true));
+        assert_eq!(d.consent(NOW), Ok(true));
         assert!(d.enabled());
         let id = d
             .record(DiaryOutcome::Taken, "teh", "the", None, NOW + 1)
@@ -819,7 +855,7 @@ mod tests {
     #[test]
     fn consent_survives_a_restart() {
         let (dir, mut d) = fresh_diary("consent-restart");
-        d.consent().unwrap();
+        d.consent(NOW).unwrap();
         let mut d2 = ResolutionDiary::open(Some(dir), NOW + 10);
         assert!(d2
             .record(DiaryOutcome::Ignored, "wrod", "word", None, NOW + 11)
@@ -840,10 +876,10 @@ mod tests {
     #[test]
     fn settings_off_stops_collection_deletes_the_log_and_blocks_reconsent() {
         let (dir, mut d) = fresh_diary("consent-off");
-        d.consent().unwrap();
+        d.consent(NOW).unwrap();
         d.record(DiaryOutcome::Taken, "teh", "the", None, NOW)
             .unwrap();
-        d.set_enabled(false).unwrap();
+        d.set_enabled(false, NOW).unwrap();
         assert!(!d.enabled());
         assert!(
             !dir.join(DIARY_FILE).exists(),
@@ -853,7 +889,7 @@ mod tests {
             .record(DiaryOutcome::Taken, "teh", "the", None, NOW + 1)
             .is_none());
         // A replayed/repeated onboarding must NOT override an explicit opt-out.
-        assert_eq!(d.consent(), Ok(false));
+        assert_eq!(d.consent(NOW), Ok(false));
         assert!(!d.enabled());
         assert!(d
             .record(DiaryOutcome::Taken, "teh", "the", None, NOW + 2)
@@ -863,13 +899,84 @@ mod tests {
     #[test]
     fn settings_on_after_off_resumes_collection() {
         let (_dir, mut d) = fresh_diary("consent-reon");
-        d.consent().unwrap();
-        d.set_enabled(false).unwrap();
-        d.set_enabled(true).unwrap();
+        d.consent(NOW).unwrap();
+        d.set_enabled(false, NOW).unwrap();
+        d.set_enabled(true, NOW).unwrap();
         assert!(d.enabled());
         assert!(d
             .record(DiaryOutcome::Taken, "teh", "the", None, NOW)
             .is_some());
+    }
+
+    // ---- tracking_since (durable "collecting since") — read lock ----
+
+    const T_CONSENT: u64 = NOW - 20 * DAY; // consent given 20 days before "now"
+
+    #[test]
+    fn tracking_since_is_the_moment_consent_was_given() {
+        let (dir, mut d) = fresh_diary("since-consent");
+        assert_eq!(tracking_since(&dir), None, "never consented → no 'since'");
+        assert_eq!(read_summary(&dir, NOW).tracking_since, None);
+        d.consent(T_CONSENT).unwrap();
+        assert_eq!(tracking_since(&dir), Some(T_CONSENT));
+        assert_eq!(read_summary(&dir, NOW).tracking_since, Some(T_CONSENT), "returned by the read the UI calls");
+    }
+
+    #[test]
+    fn tracking_since_is_in_the_summary_json_the_ui_reads() {
+        let (dir, mut d) = fresh_diary("since-json");
+        d.consent(T_CONSENT).unwrap();
+        let v = serde_json::to_value(read_summary(&dir, NOW)).unwrap();
+        assert_eq!(v["tracking_since"], T_CONSENT);
+        assert_eq!(v["enabled"], true);
+    }
+
+    #[test]
+    fn tracking_since_does_not_move_when_rows_prune() {
+        // The whole point vs oldest_ts: pruning old rows moves oldest_ts forward, but
+        // "collecting since" must stay at the consent moment.
+        let (dir, mut d) = fresh_diary("since-prune");
+        d.consent(T_CONSENT).unwrap();
+        d.record(DiaryOutcome::Taken, "teh", "the", None, T_CONSENT + 1).unwrap(); // 20 days old: outside retention
+        d.record(DiaryOutcome::Ignored, "wrod", "word", None, NOW - DAY).unwrap(); // recent
+        d.prune(NOW); // age prune drops the 20-day-old row
+        let s = read_summary(&dir, NOW);
+        assert_eq!(s.total_events, 1, "precondition: the old row was pruned");
+        assert_eq!(s.oldest_ts, Some(NOW - DAY), "oldest_ts moved forward with the prune");
+        assert_eq!(s.tracking_since, Some(T_CONSENT), "tracking_since must NOT move with the prune");
+    }
+
+    #[test]
+    fn tracking_since_survives_restart_more_rows_and_a_replayed_consent() {
+        let (dir, mut d) = fresh_diary("since-stable");
+        d.consent(T_CONSENT).unwrap();
+        d.record(DiaryOutcome::Taken, "teh", "the", None, NOW - DAY).unwrap();
+        let mut d2 = ResolutionDiary::open(Some(dir.clone()), NOW);
+        d2.record(DiaryOutcome::Taken, "wrod", "word", None, NOW).unwrap();
+        assert_eq!(tracking_since(&dir), Some(T_CONSENT), "restart + more rows don't move it");
+        // A replayed onboarding / repeat switch-on must not reset the clock.
+        d2.consent(NOW).unwrap();
+        d2.set_enabled(true, NOW).unwrap();
+        assert_eq!(tracking_since(&dir), Some(T_CONSENT), "repeat consent must not move it");
+    }
+
+    #[test]
+    fn tracking_since_resets_on_a_fresh_switch_on_and_is_none_while_off() {
+        let (dir, mut d) = fresh_diary("since-offon");
+        d.consent(T_CONSENT).unwrap();
+        d.set_enabled(false, NOW - 5 * DAY).unwrap();
+        assert_eq!(tracking_since(&dir), None, "off → nothing is being collected 'since' anything");
+        d.set_enabled(true, NOW - DAY).unwrap();
+        assert_eq!(tracking_since(&dir), Some(NOW - DAY), "a new collection period starts at the switch-on");
+    }
+
+    #[test]
+    fn a_flag_with_no_stamp_falls_back_to_when_it_was_switched_on() {
+        // Flag written by an earlier build (empty): still a real "since", not None.
+        let (dir, _d) = fresh_diary("since-legacy");
+        on(&dir);
+        let got = tracking_since(&dir).expect("falls back to the flag's own creation time");
+        assert!(got > 1_000_000_000_000, "a real epoch-ms time, got {got}");
     }
 
     // ---- retention + cap ----
