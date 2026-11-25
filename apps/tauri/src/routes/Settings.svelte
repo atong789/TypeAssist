@@ -82,8 +82,32 @@
     invoke("open_login_items_settings").catch(() => {});
   }
 
+  // ---- 14-day progress note (the resolution diary) — a consent-gated, on-device
+  // note of the words the user slips on and what they did with each suggestion.
+  // Read on mount (the engine is the sole writer) and kept in sync via
+  // resolution-diary://changed. Turning it OFF deletes the note and stops it for good
+  // (until switched back on here) — the user can stop it anytime.
+  interface DiaryEcho {
+    ok: boolean;
+    enabled: boolean;
+  }
+  let diaryEnabled = false;
+  function toggleDiary() {
+    const next = !diaryEnabled;
+    diaryEnabled = next; // optimistic; the engine echo confirms (or reverts)
+    invoke("set_resolution_diary", { enabled: next }).catch(() => {
+      diaryEnabled = !next;
+    });
+  }
+
   onMount(() => {
     loadLoginItem();
+    invoke<{ enabled: boolean }>("read_resolution_diary")
+      .then((s) => (diaryEnabled = !!s?.enabled))
+      .catch(() => {});
+    const offDiary = listen<DiaryEcho>("resolution-diary://changed", (e) => {
+      if (e.payload) diaryEnabled = !!e.payload.enabled;
+    });
     invoke<AllowListState>("read_allow_list")
       .then((al) => (correctionEnabled = !!al?.correction_enabled))
       .catch(() => {});
@@ -93,6 +117,7 @@
     });
     return () => {
       off.then((f) => f());
+      offDiary.then((f) => f());
     };
   });
 
@@ -204,6 +229,30 @@
       aria-checked={correctionEnabled}
       aria-label="Corrections"
       on:click={toggleCorrections}
+    >
+      <span class="knob" aria-hidden="true"></span>
+    </button>
+  </div>
+</section>
+
+<!-- 14-day progress note — consent-gated (starts when onboarding completes); this
+     switch is the way to stop it anytime. Turning it off deletes the note. -->
+<section class="group">
+  <div class="row">
+    <div class="row-text">
+      <div class="row-title">14-day progress note</div>
+      <p class="row-desc">
+        A quiet note of the words you slip on and whether you took the word I offered — never your
+        passwords, never the sentences around them, and never off this Mac. Turning it off deletes it.
+      </p>
+    </div>
+    <button
+      class="switch"
+      class:on={diaryEnabled}
+      role="switch"
+      aria-checked={diaryEnabled}
+      aria-label="14-day progress note"
+      on:click={toggleDiary}
     >
       <span class="knob" aria-hidden="true"></span>
     </button>

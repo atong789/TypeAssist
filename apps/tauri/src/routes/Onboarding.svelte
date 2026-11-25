@@ -325,8 +325,10 @@
       {:else}
         <h1 class="ob-hi">{name.trim() ? `All set, ${name.trim()}.` : "All set."}</h1>
         <p class="ob-lede">
-          Just type the way you always do — I’ll start learning straight away. Whenever you want a
-          warm-up or a look at your progress, you’ll find me in the menu bar.
+          Just type the way you always do — I’ll start learning straight away. To show you your
+          progress, I keep a quiet 14-day note of the words you slip on and whether you took the word
+          I offered — never your passwords, never the sentences around them, and never off this Mac.
+          Whenever you want a warm-up or a look at your progress, you’ll find me in the menu bar.
         </p>
         <button class="ob-btn-primary" bind:this={getStartedBtn} on:click={finish}>Get started</button>
       {/if}

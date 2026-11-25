@@ -9,6 +9,7 @@ mod engine;
 mod login_item;
 #[cfg(target_os = "macos")]
 mod menu_focus;
+mod consent_lock;
 mod resolution_diary;
 
 use allow_list::AllowList;
@@ -724,6 +725,20 @@ fn set_resolution_diary(
         .map_err(|e| format!("engine control channel closed: {e}"))
 }
 
+/// Tauri command: onboarding completed — record consent so the resolution diary
+/// starts collecting (the ONLY non-Settings path that can turn it on). Routed
+/// through the engine (sole writer). Uses `try_state` so a not-yet-started engine
+/// returns an error (consent simply isn't recorded ⇒ stays off) instead of panicking.
+#[tauri::command]
+fn record_diary_consent(app: AppHandle) -> Result<(), String> {
+    let sender = app
+        .try_state::<EngineControlSender>()
+        .ok_or_else(|| "engine not started — consent not recorded".to_string())?;
+    sender
+        .send(EngineControl::ConsentResolutionDiary)
+        .map_err(|e| format!("engine control channel closed: {e}"))
+}
+
 /// Tauri command: merge another Mac's exported diary file (union by event id).
 /// Engine-routed; emits `resolution-diary://changed` with the merge report.
 #[tauri::command]
@@ -1362,6 +1377,7 @@ pub fn run() {
             delete_all_data,
             read_resolution_diary,
             set_resolution_diary,
+            record_diary_consent,
             import_resolution_diary,
             export_resolution_diary
         ])
