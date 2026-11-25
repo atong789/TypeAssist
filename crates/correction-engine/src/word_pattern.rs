@@ -167,6 +167,22 @@ pub enum OutcomeReading {
     Tracked(PatternOutcomes),
 }
 
+/// One pattern's bubble-outcome tallies, decayed to the store's read time.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PatternOutcomeRow {
+    pub typed: String,
+    pub target: String,
+    pub outcomes: PatternOutcomes,
+}
+
+/// All patterns' outcome tallies, or an honest "not tracked" (see
+/// [`WordPatternStore::outcome_ledger`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutcomeLedger {
+    Untracked,
+    Tracked { since: Timestamp, rows: Vec<PatternOutcomeRow> },
+}
+
 /// One learned `typed → target` correction pattern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatternStat {
@@ -518,6 +534,34 @@ impl WordPatternStore {
             Some(o) => OutcomeReading::Tracked(o),
             None => OutcomeReading::NoneSince(since),
         }
+    }
+
+    /// Every pattern's bubble-outcome tallies (decayed to [`Self::last_now`]), for
+    /// the Progress "most offered, least taken" read. Includes **outcome-only**
+    /// entries (a bubble was shown but no correction was ever observed — e.g. a
+    /// dictionary-lane suggestion), which [`Self::snapshots`] deliberately hides:
+    /// those are exactly the ignored suggestions the view needs. Honours the same
+    /// untracked rule as [`Self::outcome_reading`]: tracking never started, or the
+    /// integrity reconcile flagged it broken ⇒ [`OutcomeLedger::Untracked`] (never
+    /// a list of zeros). Read-only; order is the store's — callers rank.
+    pub fn outcome_ledger(&self) -> OutcomeLedger {
+        let Some(since) = self.outcomes_tracking_since else {
+            return OutcomeLedger::Untracked;
+        };
+        if self.outcomes_integrity_broken_since.is_some() {
+            return OutcomeLedger::Untracked;
+        }
+        let rows = self
+            .patterns
+            .iter()
+            .filter_map(|s| {
+                s.outcomes.map(|mut o| {
+                    o.scale(s.decay_factor(self.last_now));
+                    PatternOutcomeRow { typed: s.typed.clone(), target: s.target.clone(), outcomes: o }
+                })
+            })
+            .collect();
+        OutcomeLedger::Tracked { since, rows }
     }
 
     /// Read one pattern's view, decayed to [`Self::last_now`]. `None` if the
@@ -1108,5 +1152,61 @@ mod tests {
         assert_eq!(edit_distance("the", "the"), 0);
         assert_eq!(edit_distance("", "the"), 3);
         assert_eq!(edit_distance("cat", "elephant"), 6); // match a+t, sub c, insert 5
+    }
+
+    // ---- Outcome ledger read (Progress "most offered, least taken") -----------
+
+    fn row<'a>(rows: &'a [PatternOutcomeRow], typed: &str, target: &str) -> &'a PatternOutcomes {
+        &rows.iter().find(|r| r.typed == typed && r.target == target).expect("row present").outcomes
+    }
+
+    #[test]
+    fn outcome_ledger_returns_every_tally_including_outcome_only_pairs() {
+        let mut store = WordPatternStore::new();
+        store.start_outcome_tracking(T0);
+        // A learned pattern with a full set of outcomes…
+        observe_n(&mut store, "teh", "the", 3, T0);
+        for ev in [OutcomeEvent::Shown, OutcomeEvent::Shown, OutcomeEvent::Shown, OutcomeEvent::Accepted, OutcomeEvent::SelfMatched, OutcomeEvent::Undone] {
+            assert!(store.record_outcome(ev, "teh", "the", T0));
+        }
+        // …and an OUTCOME-ONLY pair (bubble shown, never observed as a correction):
+        // hidden from snapshots()/Impact, but it is exactly an ignored suggestion.
+        assert!(store.record_outcome(OutcomeEvent::Shown, "detoure", "detour", T0));
+        assert!(store.snapshot("detoure", "detour").is_none(), "precondition: outcome-only is hidden from snapshots");
+
+        let OutcomeLedger::Tracked { since, rows } = store.outcome_ledger() else { panic!("tracked") };
+        assert_eq!(since, T0);
+        let teh = row(&rows, "teh", "the");
+        assert_eq!((teh.shown, teh.accepted, teh.self_matched, teh.undone), (3.0, 1.0, 1.0, 1.0));
+        let det = row(&rows, "detoure", "detour");
+        assert_eq!((det.shown, det.accepted, det.self_matched, det.undone), (1.0, 0.0, 0.0, 0.0));
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn outcome_ledger_is_decayed_like_the_per_pattern_reading() {
+        let mut store = WordPatternStore::new();
+        store.start_outcome_tracking(T0);
+        store.record_outcome(OutcomeEvent::Shown, "teh", "the", T0);
+        // Another pattern is observed one half-life later → last_now advances.
+        store.observe_correction(Outcome::CorrectedToOther, "wrod", "word", T0 + HALF_LIFE);
+        let OutcomeLedger::Tracked { rows, .. } = store.outcome_ledger() else { panic!("tracked") };
+        assert!((row(&rows, "teh", "the").shown - 0.5).abs() < 1e-3, "one half-life later → half weight");
+        let OutcomeReading::Tracked(per) = store.outcome_reading("teh", "the") else { panic!("tracked") };
+        assert!((per.shown - row(&rows, "teh", "the").shown).abs() < 1e-6, "ledger == per-pattern reading");
+    }
+
+    #[test]
+    fn outcome_ledger_is_untracked_never_a_list_of_zeros() {
+        // Tracking never started.
+        let mut store = WordPatternStore::new();
+        observe_n(&mut store, "teh", "the", 2, T0);
+        assert_eq!(store.outcome_ledger(), OutcomeLedger::Untracked);
+        // Tracking started, then the integrity reconcile flagged it broken.
+        store.start_outcome_tracking(T0);
+        store.record_outcome(OutcomeEvent::Shown, "teh", "the", T0);
+        assert!(matches!(store.outcome_ledger(), OutcomeLedger::Tracked { .. }));
+        store.flag_outcomes_broken(T0 + 1);
+        assert_eq!(store.outcome_ledger(), OutcomeLedger::Untracked);
     }
 }

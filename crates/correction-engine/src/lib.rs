@@ -59,7 +59,7 @@ pub use kill_switch::{
 };
 pub use lexicon::{Lexicon, LEXICON_VERSION};
 pub use lexicon_proposal::{
-    load_learned_lexicon, persist_if_dirty as lexicon_persist_if_dirty, save_learned_lexicon, HoldReason, Lane, LexiconProposal, LexiconProposer,
+    load_learned_lexicon, persist_if_dirty as lexicon_persist_if_dirty, read_learned_words, save_learned_lexicon, HoldReason, Lane, LexiconProposal, LexiconProposer,
     MotorVerdict, ProposalTier, ProposalUpdate, RestoreReport, LEARNED_LEXICON_FILE_VERSION,
     LEXICON_PROPOSAL_VERSION,
 };
@@ -97,7 +97,7 @@ pub use trigram::{target_is_recordable, TrigramModel};
 pub use word_freq::{WordFreq, WORD_FREQ_VERSION};
 pub use word_pattern::{
     edit_distance, normalize_word, OutcomeEvent, OutcomeReading, PatternObserveReport, PatternOutcomes,
-    PatternSnapshot, PatternStat,
+    OutcomeLedger, PatternOutcomeRow, PatternSnapshot, PatternStat,
     WordPatternStore, MAX_PATTERN_EDIT_DISTANCE, MAX_PATTERN_LENGTH_DIFF, PATTERN_PERSIST_EVERY,
     UNDO_BRAKE_STRIKES, WORD_PATTERN_VERSION,
 };

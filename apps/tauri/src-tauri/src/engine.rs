@@ -5525,7 +5525,7 @@ pub fn spawn<R: Runtime>(
                             let _ = app_handle.emit(EVT_CORRECTION_STATE, allow_list.clone());
                         }
                         EngineControl::SetResolutionDiary { enabled } => {
-                            let payload = match bubbles.diary.set_enabled(enabled) {
+                            let payload = match bubbles.diary.set_enabled(enabled, now_ms()) {
                                 Ok(()) => {
                                     tracing::info!("RESOLUTION_DIARY enabled={enabled}");
                                     serde_json::json!({ "ok": true, "message": "", "enabled": enabled })
@@ -5538,7 +5538,7 @@ pub fn spawn<R: Runtime>(
                             let _ = app_handle.emit(EVT_RESOLUTION_DIARY, payload);
                         }
                         EngineControl::ConsentResolutionDiary => {
-                            let payload = match bubbles.diary.consent() {
+                            let payload = match bubbles.diary.consent(now_ms()) {
                                 Ok(on) => {
                                     tracing::info!("RESOLUTION_DIARY consent recorded enabled={on}");
                                     serde_json::json!({ "ok": true, "message": "", "enabled": on })

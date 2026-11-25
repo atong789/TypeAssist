@@ -10,6 +10,7 @@ mod login_item;
 #[cfg(target_os = "macos")]
 mod menu_focus;
 mod consent_lock;
+mod progress_reads;
 mod resolution_diary;
 
 use allow_list::AllowList;
@@ -725,6 +726,25 @@ fn set_resolution_diary(
         .map_err(|e| format!("engine control channel closed: {e}"))
 }
 
+/// Tauri command: the learned set (`learned_lexicon.json`) — the words Jordan
+/// treats as the user's own, for the "Your words" list. On-demand and read-only
+/// (never the `word_freq` tally; never touches the file). Empty if none yet.
+#[tauri::command]
+fn read_learned_lexicon() -> Result<Vec<String>, String> {
+    let dir = typeassist_data_dir().ok_or("no data directory (HOME unset)".to_string())?;
+    Ok(progress_reads::learned_words(&dir))
+}
+
+/// Tauri command: all-time per-pattern bubble tallies (`shown`, `accepted`,
+/// `self_matched`, `undone` + `typed`/`target`), most-ignored first, for the
+/// "most offered, least taken" view. `state: "untracked"` means no number may be
+/// inferred (never zeros). Read-only.
+#[tauri::command]
+fn read_pattern_outcomes() -> Result<progress_reads::PatternOutcomesRead, String> {
+    let dir = typeassist_data_dir().ok_or("no data directory (HOME unset)".to_string())?;
+    Ok(progress_reads::pattern_outcomes(&dir))
+}
+
 /// Tauri command: onboarding completed — record consent so the resolution diary
 /// starts collecting (the ONLY non-Settings path that can turn it on). Routed
 /// through the engine (sole writer). Uses `try_state` so a not-yet-started engine
@@ -1376,6 +1396,8 @@ pub fn run() {
             apply_restore,
             delete_all_data,
             read_resolution_diary,
+            read_learned_lexicon,
+            read_pattern_outcomes,
             set_resolution_diary,
             record_diary_consent,
             import_resolution_diary,
