@@ -55,6 +55,14 @@ Emitted on every **deliberate (non-auto-repeat) space keyDown**, carrying the ad
 { "type": "space_observed", "total": 42 }
 ```
 
+### `web_host`
+
+**TF-08b weld suppression.** Reports whether the focused field lives inside a web/contenteditable host — an `AXWebArea` ancestor **or** (fallback) the frontmost app is a browser. The AXWebArea walk covers normal contenteditable (Gmail) and Electron; the browser-bundle fallback rescues **Google Docs**, whose canvas editor keeps an offscreen input target with a degraded AX subtree that the walk can't reach. In such a host a competing **web** autocorrect can shrink a word a beat before the user's accept, so the core's dead-reckoned delete over-deletes into the previous word (the weld). The core pairs this with a length-delta test (`len(typed) != len(target)`) and **withholds only length-changing corrections in web hosts**, ceding that word to the host. `web` is the **raw** fact; the core applies the `weld_suppress` toggle (read engine-side from `~/.typeassist/inject_config`, default off). A **level** signal, re-evaluated on the adapter heartbeat and emitted only when it flips. Content-free (Principle #8): a single bool, never the app id or field role.
+
+```json
+{ "type": "web_host", "web": true }
+```
+
 ### `shift_tap`
 
 An **isolated Shift tap** — Shift pressed and released with no other key in between (either Shift, reachable one-handed). The accept gesture for a pending correction suggestion (the M3 bubble). The adapter derives it from `.flagsChanged` transitions and cancels the in-progress tap on any real key / mouse-down, so a `Shift+key` chord never produces it. Content-free.

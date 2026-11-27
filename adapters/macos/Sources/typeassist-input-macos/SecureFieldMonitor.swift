@@ -247,6 +247,48 @@ final class SecureFieldMonitor {
             FileHandle.standardError.write(
                 Data("SECURE_FIELD_FOCUS \(secure ? "ENTER" : "LEAVE") tid=\(threadID())\n".utf8))
         }
+        // TF-08b: re-evaluate the web-host signal on the same focus-eval cadence
+        // (focus / app change — never per keystroke). Emitted OUTSIDE the lock.
+        updateWebHost()
+    }
+
+    /// Last DETAIL string and last EMITTED bit, tracked separately so the
+    /// validation log and the engine signal debounce independently.
+    private var lastWebHostDetail: String?
+    private var lastWebHostEmit: Bool?
+
+    /// TF-08b weld suppression: evaluate whether the focused field is a web host
+    /// and emit the bit to the engine when the effective value flips.
+    ///
+    /// **Driven by the heartbeat, not only focus notifications.** Google Docs is a
+    /// canvas editor whose offscreen input target never changes, so
+    /// `kAXFocusedUIElementChangedNotification` doesn't fire while you type there
+    /// (and a faceless sidecar may miss NSWorkspace app-activate) — which left
+    /// `web_host` stuck at its startup value. `main.swift` calls this on the
+    /// heartbeat timer (the one primitive proven to fire here), so the signal
+    /// tracks the frontmost app within one interval. Still also called on the
+    /// focus-eval hook as a fast path; both run on the main thread, so the two
+    /// `last*` fields need no lock.
+    ///
+    /// Emits the **raw** web-host fact — the `weld_suppress` toggle is applied
+    /// engine-side, NOT here: a faceless L1 adapter must not depend on reading
+    /// `~/.typeassist/inject_config` (its spawned environment's `HOME` / data-dir
+    /// need not match where the user wrote the file — the bug that left `emit`
+    /// false). The engine owns the data dir authoritatively, so it reads the toggle.
+    /// The `WEB_HOST_EVAL` line logs on any change to the computed DETAIL (bundle /
+    /// role chain / is_web); the engine bit is emitted when `is_web` flips (a level
+    /// signal). Content-free — a single bool crosses the wire.
+    func updateWebHost() {
+        let (isWeb, detail) = Accessibility.webHostDetail()
+        if lastWebHostDetail != detail {
+            lastWebHostDetail = detail
+            FileHandle.standardError.write(
+                Data("WEB_HOST_EVAL is_web=\(isWeb) \(detail) tid=\(threadID())\n".utf8))
+        }
+        if lastWebHostEmit != isWeb {
+            lastWebHostEmit = isWeb
+            bridge.emit(.webHost(web: isWeb))
+        }
     }
 
     /// True iff the app's focused UI element is a secure / password text field.

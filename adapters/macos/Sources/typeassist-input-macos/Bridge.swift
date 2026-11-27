@@ -56,6 +56,13 @@ enum InputEvent {
     /// spaces it actually receives to flag a dropped space. Observe-only;
     /// content-free (a count, never the character). See `InputEvent::SpaceObserved`.
     case spaceObserved(total: UInt64)
+    /// **Web/contenteditable host (TF-08b, weld suppression).** `web=true` when the
+    /// focused field is a web host — inside an `AXWebArea` OR the frontmost app is a
+    /// browser (the fallback for Google Docs' canvas editor, whose AX subtree
+    /// defeats the walk). Raw fact; the engine applies the `weld_suppress` toggle
+    /// and the length-delta test. Level signal, emitted when it flips (re-evaluated
+    /// on the heartbeat). Content-free. See `InputEvent::WebHost`.
+    case webHost(web: Bool)
 }
 
 enum OutboundCommand {
@@ -156,6 +163,8 @@ final class Bridge {
             payload = ["type": "autorepeat_dropped"]
         case let .spaceObserved(total):
             payload = ["type": "space_observed", "total": total]
+        case let .webHost(web):
+            payload = ["type": "web_host", "web": web]
         }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
               let s = String(data: data, encoding: .utf8) else {

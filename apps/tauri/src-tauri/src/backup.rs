@@ -89,6 +89,11 @@ pub struct BackupData {
     pub learned_lexicon: Option<Value>,
     #[serde(default)]
     pub progress_snapshots: Option<Value>,
+    /// Early space-drift record (`space_drift.json`): aggregate shown/taken/ignored
+    /// counts only — no words, no timing. Optional (older bundles lack it; a restore
+    /// then leaves the record empty, i.e. the strict starting bar).
+    #[serde(default)]
+    pub space_drift: Option<Value>,
     /// Resolution-diary events (schema v2+): the per-event rows, as plain JSON
     /// objects. Absent in a v1 bundle (a restore then leaves the diary empty).
     #[serde(default)]
@@ -171,6 +176,7 @@ pub fn build_bundle(data_dir: &Path, app_version: &str, created_ms: u64) -> Resu
             word_freq: read_json(&data_dir.join(WORD_FREQ_FILE)),
             learned_lexicon: read_json(&data_dir.join(LEARNED_LEXICON_FILE)),
             progress_snapshots: read_json(&data_dir.join(PROGRESS_SNAPSHOTS_FILE)),
+            space_drift: read_json(&data_dir.join(correction_engine::SPACE_DRIFT_FILE)),
             resolution_diary: read_diary(data_dir),
             motor_snapshots: read_dated_dir(&data_dir.join(SNAPSHOTS_DIR)),
             word_freq_snapshots: read_dated_dir(&data_dir.join(WORD_FREQ_SNAPSHOTS_DIR)),
@@ -281,6 +287,7 @@ fn clear_learned(data_dir: &Path) -> io::Result<()> {
     remove_if_present(&data_dir.join(WORD_FREQ_FILE))?;
     remove_if_present(&data_dir.join(LEARNED_LEXICON_FILE))?;
     remove_if_present(&data_dir.join(PROGRESS_SNAPSHOTS_FILE))?;
+    remove_if_present(&data_dir.join(correction_engine::SPACE_DRIFT_FILE))?;
     remove_if_present(&data_dir.join(crate::resolution_diary::DIARY_FILE))?;
     remove_dir_if_present(&data_dir.join(SNAPSHOTS_DIR))?;
     remove_dir_if_present(&data_dir.join(WORD_FREQ_SNAPSHOTS_DIR))?;
@@ -329,6 +336,9 @@ pub fn apply_bundle(bundle: &BackupBundle, data_dir: &Path) -> Result<(), String
     }
     if let Some(v) = &bundle.data.progress_snapshots {
         write_value(&data_dir.join(PROGRESS_SNAPSHOTS_FILE), v)?;
+    }
+    if let Some(v) = &bundle.data.space_drift {
+        write_value(&data_dir.join(correction_engine::SPACE_DRIFT_FILE), v)?;
     }
     write_dated(&data_dir.join(SNAPSHOTS_DIR), &bundle.data.motor_snapshots)?;
     write_dated(&data_dir.join(WORD_FREQ_SNAPSHOTS_DIR), &bundle.data.word_freq_snapshots)?;
@@ -509,6 +519,28 @@ mod tests {
         assert!(!dir.join(SHADOW_LOG_FILE).exists());
         // allow_list is config — the engine resets it separately, not here.
         assert!(dir.join("allow_list.json").exists());
+    }
+
+    #[test]
+    fn space_drift_record_rides_the_backup_and_is_cleared_with_the_rest() {
+        let src = temp_dir("drift-src");
+        std::fs::write(
+            src.join(correction_engine::SPACE_DRIFT_FILE),
+            r#"{"version":1,"early":{"shown":6,"taken":5,"ignored":1}}"#,
+        )
+        .unwrap();
+        let bytes = build_bundle(&src, "t", 1).unwrap();
+        let bundle = parse_bundle(&bytes).unwrap();
+        assert!(bundle.data.space_drift.is_some(), "backup must carry the drift record");
+        let dst = temp_dir("drift-dst");
+        apply_bundle(&bundle, &dst).unwrap();
+        let back = correction_engine::load_space_drift_stats(&dst.join(correction_engine::SPACE_DRIFT_FILE));
+        assert_eq!((back.shown, back.taken, back.ignored), (6, 5, 1));
+        // A bundle without it restores to the strict starting bar (true replace).
+        let none = serde_json::json!({"format": BACKUP_FORMAT, "schema_version": CURRENT_SCHEMA_VERSION, "data": {}});
+        let b2 = parse_bundle(&serde_json::to_vec(&none).unwrap()).unwrap();
+        apply_bundle(&b2, &dst).unwrap();
+        assert!(!dst.join(correction_engine::SPACE_DRIFT_FILE).exists(), "restore replaces — no stale record");
     }
 
     #[test]
