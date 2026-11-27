@@ -5,6 +5,7 @@
 
 mod allow_list;
 mod backup;
+mod drift_ledger;
 mod engine;
 mod login_item;
 #[cfg(target_os = "macos")]

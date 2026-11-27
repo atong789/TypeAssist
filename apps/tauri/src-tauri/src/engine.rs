@@ -36,6 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::path::{Path, PathBuf};
 
 use crate::os_dictionary::MacSpellBackend;
+use crate::drift_ledger::DriftLedger;
 use crate::resolution_diary::{DiaryOutcome, ResolutionDiary};
 use crate::teach;
 use behavioural_model::{BehaviouralModel, InputEvent, OutboundCommand};
@@ -622,6 +623,37 @@ struct CorrectionSuggestedEvent {
     highlight: Vec<usize>,
 }
 
+/// **Early space-drift (Build 3a)** — the exact edit for a re-split that replaces a
+/// SPAN (the space + the right token) rather than one word. `None` on every
+/// ordinary one-word suggestion, which keeps using the word geometry below.
+///
+/// The delete starts AT THE SPACE, so the left word's own letters are never
+/// touched: `no␠tthink·` → delete 8 (`␠tthink·`), retype `t␠think·`. The undo pair
+/// is the exact inverse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpanEdit {
+    delete_count: u32,
+    replacement: String,
+    undo_delete: u32,
+    undo_replacement: String,
+}
+
+impl SpanEdit {
+    /// Build the edit for a detected Early drift. `right_len` is the right token's
+    /// char length (`tok.end - tok.start`); `boundary` is the char that sealed it.
+    fn early_drift(d: &correction_engine::EarlyDrift, right_len: usize, boundary: char) -> Self {
+        let replacement = format!("{} {}{}", d.moved, d.right_fixed, boundary);
+        let original = format!(" {}{}", d.right, boundary);
+        Self {
+            // the space + the right fragment + the boundary
+            delete_count: (1 + right_len + 1) as u32,
+            undo_delete: replacement.chars().count() as u32,
+            replacement,
+            undo_replacement: original,
+        }
+    }
+}
+
 /// A correction the engine is currently SUGGESTING (the bubble is up), retained
 /// until the user accepts it with an isolated Shift tap. Stays ACCEPTABLE for a
 /// generous window even after the user types ON, via an ANCHORED replace keyed
@@ -658,6 +690,8 @@ struct PendingSuggestion {
     /// `immediate` check (`after_len == outer_trail_len + 1`) and the extra delete.
     outer_trail_len: usize,
     armed_at_ms: u64,
+    /// `Some` for an Early space-drift re-split (span edit); `None` = one word.
+    span_edit: Option<SpanEdit>,
 }
 
 /// How long a suggestion stays up if the user neither accepts (Shift) nor types —
@@ -720,6 +754,8 @@ struct BubbleLedger {
     /// The diary id of the ignored row the LAST successful `note_correction`
     /// matched — read once by the caller to link its `retyped` row.
     last_matched_diary_id: Option<String>,
+    /// Early space-drift record + reconcile counters (Build 3a).
+    drift: DriftLedger,
 }
 
 impl BubbleLedger {
@@ -764,6 +800,25 @@ impl BubbleLedger {
         self.note_ended_with_id(start, typed, target, now, id);
     }
 
+    /// [`Self::end_unaccepted`] for a bubble that may be an Early space-drift offer:
+    /// a drift offer's end is ALSO recorded on the drift ledger (the reconcile's
+    /// other side + the per-user record that moves the bar). Every unaccepted end
+    /// of a bubble — timeout, next keystroke, backspace, a declined/failed accept —
+    /// goes through here.
+    fn end_unaccepted_bubble(
+        &mut self,
+        start: usize,
+        typed: &str,
+        target: &str,
+        is_drift: bool,
+        now: u64,
+    ) {
+        if is_drift {
+            self.drift.note_ignored();
+        }
+        self.end_unaccepted(start, typed, target, now);
+    }
+
     /// `true` iff this correction is the user self-matching an ignored bubble.
     /// `typed`/`corrected` are normalized words; `start` is the corrected word's
     /// slot start in the line.
@@ -792,6 +847,88 @@ impl BubbleLedger {
     }
 }
 
+/// The Early-drift join between the tokenizer and the offer: at the seal of
+/// `tok`, ask the pure detector (with the left word taken from
+/// `tokenizer.tokens()[len-2]`) and COUNT the answer (Principle #7). Returns the
+/// detected drift with its span edit, or `None` after recording why it declined.
+/// A found drift with the Corrections gate off is counted as `gate_off` — no
+/// bubble. Pulled out of the engine loop so the live path and the tests run the
+/// SAME code.
+fn early_drift_hit(
+    tokenizer: &Tokenizer,
+    tok: &correction_engine::Token,
+    lexicon: &Lexicon,
+    ledger: &mut DriftLedger,
+    gate_on: bool,
+    boundary: char,
+    web_host: Option<bool>,
+) -> Option<(correction_engine::EarlyDrift, SpanEdit)> {
+    let toks = tokenizer.tokens();
+    // The just-sealed token is the last one; its left neighbour is the one before.
+    let left = (toks.len() >= 2 && toks.last().is_some_and(|t| t.start == tok.start))
+        .then(|| &toks[toks.len() - 2]);
+    match correction_engine::detect_early_space_drift(left, tok, lexicon, ledger.bar()) {
+        Ok(_) if web_host != Some(false) => {
+            // NATIVE-ONLY. A found re-split on a web / contenteditable surface
+            // (`Some(true)`) — or one whose surface is not yet known (`None`, fail
+            // closed) — is withheld, and counted under its own reason. Gated HERE, on
+            // the drift path only: the one-word lanes are untouched everywhere.
+            ledger.note_rejected(if web_host.is_some() {
+                correction_engine::DriftReject::WebHost
+            } else {
+                correction_engine::DriftReject::SurfaceUnknown
+            });
+            None
+        }
+        Ok(d) => {
+            if !gate_on {
+                ledger.note_gate_off();
+            }
+            let edit = SpanEdit::early_drift(&d, tok.end - tok.start, boundary);
+            Some((d, edit))
+        }
+        Err(r) => {
+            ledger.note_rejected(r);
+            None
+        }
+    }
+}
+
+/// The pending suggestion for an Early drift. `word_len`/`word_end` describe the
+/// RIGHT token, so the caret-at-rest accept gate and every dismissal rule are the
+/// ones the one-word suggestion uses.
+fn drift_pending(
+    d: &correction_engine::EarlyDrift,
+    edit: SpanEdit,
+    boundary: char,
+    word_len: usize,
+    word_end: usize,
+    now: u64,
+) -> PendingSuggestion {
+    PendingSuggestion {
+        typed: d.typed_span(),
+        target: d.target_span(),
+        boundary,
+        word_len,
+        word_end,
+        lead: String::new(),
+        trail: String::new(),
+        outer_trail_len: 0,
+        armed_at_ms: now,
+        span_edit: Some(edit),
+    }
+}
+
+/// Normalise a bubble's `typed` / `target` for the ledgers. One word → exactly
+/// `normalize_word`; a two-word span (Early drift) keeps its single inner space,
+/// which `normalize_word` alone would strip (`no tthink` → `notthink`).
+fn bubble_key(s: &str) -> String {
+    s.split_whitespace()
+        .map(normalize_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// End a pending bubble that was NOT accepted: remember it (in memory, for the
 /// self-match tie) and hide the cue. Returns whether one was pending.
 fn end_pending_bubble<R: Runtime>(
@@ -801,10 +938,11 @@ fn end_pending_bubble<R: Runtime>(
 ) -> bool {
     match pending.take() {
         Some(ps) => {
-            bubbles.end_unaccepted(
+            bubbles.end_unaccepted_bubble(
                 ps.word_end.saturating_sub(ps.word_len),
-                &normalize_word(&ps.typed),
-                &normalize_word(&ps.target),
+                &bubble_key(&ps.typed),
+                &bubble_key(&ps.target),
+                ps.span_edit.is_some(),
                 now_ms(),
             );
             let _ = app.emit(EVT_CORRECTION_DISMISSED, ());
@@ -909,6 +1047,8 @@ struct LastCorrection {
     /// undo only ever fires with the caret exactly where the accept left it.
     after_len: usize,
     fired_at_ms: u64,
+    /// The span edit's undo pair, when the accepted fix was an Early drift.
+    span_edit: Option<SpanEdit>,
 }
 
 /// QA-17 (5a) — peel a MATCHED leading+trailing run of straight ASCII single
@@ -942,6 +1082,9 @@ fn strip_matched_quotes(core: &str) -> (String, String, String) {
 /// boundary` when there is no surrounding punctuation. Pure + tested so the
 /// geometry is verifiable without driving the engine loop.
 fn immediate_accept_injection(ps: &PendingSuggestion) -> (u32, String) {
+    if let Some(e) = &ps.span_edit {
+        return (e.delete_count, e.replacement.clone());
+    }
     let delete_count = (ps.word_len + ps.outer_trail_len + 1) as u32;
     let replacement = format!("{}{}{}{}", ps.lead, ps.target, ps.trail, ps.boundary);
     (delete_count, replacement)
@@ -952,6 +1095,9 @@ fn immediate_accept_injection(ps: &PendingSuggestion) -> (u32, String) {
 /// boundary` and retype the original `lead+typed+trail+boundary`, restoring the
 /// surrounding quotes. Pure + tested.
 fn immediate_revert_injection(lc: &LastCorrection) -> (u32, String) {
+    if let Some(e) = &lc.span_edit {
+        return (e.undo_delete, e.undo_replacement.clone());
+    }
     let delete_count = (lc.lead.chars().count()
         + lc.target.chars().count()
         + lc.trail.chars().count()
@@ -3002,6 +3148,39 @@ fn append_shadow_log(path: &Path, now: u64, s: &ShadowSuggestion) {
     }
 }
 
+/// Early space-drift (Build 3a) shadow line. Written whenever the drift check
+/// WOULD offer a re-split (gate on or off), so the pair rule can be calibrated from
+/// real use: the two frequencies, the bar in force, and what the competing
+/// single-word (bold) lane would have said. Same words the other shadow lines
+/// already log; no timing, no app, no context.
+fn append_shadow_drift_log(
+    path: &Path,
+    now: u64,
+    d: &correction_engine::EarlyDrift,
+    bar: correction_engine::DriftBar,
+    competing: Option<&str>,
+) {
+    use std::io::Write;
+    let line = format!(
+        "{now} would-suggest(drift)  {} -> {}  left_freq={}  left_fixed_freq={}  right_fixed_freq={}  bar={:?}  competing={}\n",
+        d.typed_span(),
+        d.target_span(),
+        d.left_freq,
+        d.left_fixed_freq,
+        d.right_fixed_freq,
+        bar,
+        competing.unwrap_or("-"),
+    );
+    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                tracing::warn!("shadow drift log write failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("shadow drift log open failed: {e}"),
+    }
+}
+
 /// Append one **bold** convergence line to the shadow log: a non-word that
 /// converges on exactly one base-dictionary word (the dictionary-driven,
 /// first-sighting signal). Distinct `would-suggest(bold)` tag, and includes the
@@ -3755,6 +3934,11 @@ pub fn spawn<R: Runtime>(
         // `tick_resolver`; read by the fire gate; reset on focus change; decayed
         // by the watchdog.
         let mut competitor_sense = CompetitorSense::default();
+        // Early space-drift is NATIVE-ONLY: the latest surface verdict from L1
+        // (`InputEvent::WebHost`, a single content-free bool — the focused field is a
+        // web / contenteditable host or not). `None` until L1 has reported (and again
+        // after a sidecar restart) — the drift check fails closed on `None`.
+        let mut web_host: Option<bool> = None;
         // Daily-snapshot bookkeeping (Principle #6): the calendar date whose
         // snapshot we've already handled this run, seeded from the newest dated
         // file on disk so the first event of a *new* calendar day is detected
@@ -3829,6 +4013,8 @@ pub fn spawn<R: Runtime>(
         // Ignored-bubble memory for SELF_MATCHED (in-memory only, text never persisted).
         let mut bubbles =
             BubbleLedger::with_diary(ResolutionDiary::open(typeassist_dir(), now_ms()));
+        // Early space-drift (Build 3a): the per-user record + reconcile counters.
+        bubbles.drift = DriftLedger::open(typeassist_dir());
         // UK English (v0.3.0): the spelling variant a suggestion should use for a
         // variant word, set from the OS locale by L5 via
         // `EngineControl::SetSpellingVariant`. Defaults to American until L5
@@ -4149,6 +4335,16 @@ pub fn spawn<R: Runtime>(
                     match parsed {
                         InputEvent::Ready => {
                             tracing::info!("sidecar ready — engine listening");
+                            // A fresh sidecar has not reported its surface yet.
+                            web_host = None;
+                        }
+                        InputEvent::WebHost { web } => {
+                            // Level signal from L1 (re-evaluated on its heartbeat; only a
+                            // flip is logged). Gates Early space-drift to native fields.
+                            if web_host != Some(web) {
+                                web_host = Some(web);
+                                tracing::info!("WEB_HOST web={web}");
+                            }
                         }
                         InputEvent::AutorepeatDropped => {
                             // L1 dropped a non-backspace auto-repeat keystroke.
@@ -4296,9 +4492,14 @@ pub fn spawn<R: Runtime>(
                                 // the accept doesn't land (noted unaccepted below).
                                 let ended_slot = (
                                     ps.word_end.saturating_sub(ps.word_len),
-                                    normalize_word(&ps.typed),
-                                    normalize_word(&ps.target),
+                                    bubble_key(&ps.typed),
+                                    bubble_key(&ps.target),
                                 );
+                                // Early space-drift: a two-word span edit. Its outcomes
+                                // go to the drift ledger + diary, NEVER to the one-word
+                                // pattern store (a pair key would pollute the Impact
+                                // ledger).
+                                let is_drift = ps.span_edit.is_some();
                                 let mut accepted_ok = false;
                                 // `after_len` = chars from the word's end to the
                                 // caret now (the boundary + anything typed since).
@@ -4437,7 +4638,11 @@ pub fn spawn<R: Runtime>(
                                         funnel.corrections_applied += 1;
                                         tally.add_accepted();
                                         accepted_ok = true;
-                                        record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Accepted, &ended_slot.1, &ended_slot.2, now_ms());
+                                        if is_drift {
+                                            bubbles.drift.note_taken();
+                                        } else {
+                                            record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Accepted, &ended_slot.1, &ended_slot.2, now_ms());
+                                        }
                                         bubbles.diary.record(DiaryOutcome::Taken, &ended_slot.1, &ended_slot.2, None, now_ms());
                                         tracing::info!(
                                             "CORRECTION_APPLIED typed={:?} target={:?} delete_count={} boundary={:?} after_len={}",
@@ -4467,6 +4672,7 @@ pub fn spawn<R: Runtime>(
                                             immediate,
                                             after_len,
                                             fired_at_ms: now_ms(),
+                                            span_edit: ps.span_edit,
                                         });
                                         // The tap suppresses the injection echo, so the
                                         // engine never sees the text change — reset the
@@ -4491,10 +4697,11 @@ pub fn spawn<R: Runtime>(
                                 // aborted / declined / failed accept ended the bubble
                                 // unaccepted — it can still be self-matched.
                                 if !accepted_ok {
-                                    bubbles.end_unaccepted(
+                                    bubbles.end_unaccepted_bubble(
                                         ended_slot.0,
                                         &ended_slot.1,
                                         &ended_slot.2,
+                                        is_drift,
                                         now_ms(),
                                     );
                                 }
@@ -4666,6 +4873,7 @@ pub fn spawn<R: Runtime>(
                                     );
                                     funnel.dump();
                                     bubbles.diary.dump();
+                                    bubbles.drift.dump(pending_suggestion.is_some());
                                     dump_classifications(&word_patterns, &motor_map);
                                     funnel.reset(now_ms());
                                     continue;
@@ -4742,7 +4950,11 @@ pub fn spawn<R: Runtime>(
                                     };
                                     if reverted {
                                         funnel.corrections_undone += 1;
-                                        record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Undone, &lc.typed, &lc.target, now_ms());
+                                        if lc.span_edit.is_some() {
+                                            bubbles.drift.note_undone();
+                                        } else {
+                                            record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Undone, &lc.typed, &lc.target, now_ms());
+                                        }
                                         tracing::info!(
                                             "CORRECTION_UNDONE typed={:?} target={:?} after_len={}",
                                             lc.typed,
@@ -4975,6 +5187,23 @@ pub fn spawn<R: Runtime>(
                                                         let (inner, q_lead, q_trail) =
                                                             strip_matched_quotes(&tok.core);
                                                         let outer_trail = tok.trailing.clone();
+                                                        // Early space-drift (Build 3a) — runs BEFORE both lanes.
+                                                        // At the seal of the right-hand token (`tthink`) the left
+                                                        // word (`no`) is already `tokenizer.tokens()[len-2]`; if
+                                                        // sliding the space one slot right yields two valid words
+                                                        // and the pair rule beats the single-word fix, the re-split
+                                                        // wins. Otherwise it declines (counted, with a reason) and
+                                                        // the lanes below run exactly as before. STRUCTURAL ONLY —
+                                                        // no timing is read. Offer only; never auto-applied.
+                                                        let drift_hit = early_drift_hit(
+                                                            &tokenizer,
+                                                            &tok,
+                                                            lexicon,
+                                                            &mut bubbles.drift,
+                                                            allow_list.correction_enabled,
+                                                            c,
+                                                            web_host,
+                                                        );
                                                         // Lever 2 — LEARNED lane first. `shadow_suggestion` is a
                                                         // cheap lookup over the user's own confirmed `typed → target`
                                                         // patterns; only when it has nothing do we run the dictionary
@@ -4986,7 +5215,33 @@ pub fn spawn<R: Runtime>(
                                                         // target — where they differ, the learned pattern is the more
                                                         // personal signal.) Raw suggestion: `inner` keeps the user's
                                                         // case (punctuation stripped, QA-17), target lowercase.
-                                                        let raw: Option<(String, String)> = if let Some(sh) =
+                                                        let raw: Option<(String, String)> = if let Some((d, _)) = &drift_hit {
+                                                            // The competing single-word result, for the shadow
+                                                            // log only (never fires when the re-split wins).
+                                                            let competing = correction_engine::shadow_convergence_scan(
+                                                                &inner,
+                                                                lexicon,
+                                                                &motor_map,
+                                                            )
+                                                            .target;
+                                                            if let Some(p) = shadow_log_path() {
+                                                                append_shadow_drift_log(
+                                                                    &p,
+                                                                    now_ms(),
+                                                                    d,
+                                                                    bubbles.drift.bar(),
+                                                                    competing.as_deref(),
+                                                                );
+                                                            }
+                                                            fire_meta = format!(
+                                                                "lane=space_drift_early left_freq={} left_fixed_freq={} right_fixed_freq={} competing={}",
+                                                                d.left_freq,
+                                                                d.left_fixed_freq,
+                                                                d.right_fixed_freq,
+                                                                competing.as_deref().unwrap_or("-")
+                                                            );
+                                                            Some((d.typed_span(), d.target_span()))
+                                                        } else if let Some(sh) =
                                                             shadow_suggestion(&inner, &word_patterns, lexicon, &motor_map)
                                                         {
                                                             if let Some(p) = shadow_log_path() {
@@ -5024,9 +5279,10 @@ pub fn spawn<R: Runtime>(
                                                         // Contraction filter: drop apostrophe-only /
                                                         // possessive fixes — Auto-Correct's job, not
                                                         // ours (we own motor garbles).
-                                                        let apostrophe_suppressed = raw
-                                                            .as_ref()
-                                                            .is_some_and(|(t, g)| is_apostrophe_fix(t, g));
+                                                        let apostrophe_suppressed = drift_hit.is_none()
+                                                            && raw
+                                                                .as_ref()
+                                                                .is_some_and(|(t, g)| is_apostrophe_fix(t, g));
                                                         let suggestion = if apostrophe_suppressed { None } else { raw };
                                                         // Watch Dog Not Attack Dog (M3 autocorrect
                                                         // coexistence): when a competing corrector is
@@ -5038,7 +5294,11 @@ pub fn spawn<R: Runtime>(
                                                         // value — never suppressed). No app/settings read
                                                         // (Principle #8); the shadow intent log above still
                                                         // recorded what he WOULD suggest.
-                                                        let competitor_deferred = competitor_sense
+                                                        // (A re-split is never host-redundant — a host
+                                                        // autocorrect doesn't slide spaces — so the stand-down
+                                                        // never applies to it.)
+                                                        let competitor_deferred = drift_hit.is_none()
+                                                            && competitor_sense
                                                             .is_deferring(now_ms())
                                                             && suggestion.as_ref().is_some_and(|(t, g)| {
                                                                 correction_engine::is_host_redundant(t, g, lexicon)
@@ -5072,7 +5332,14 @@ pub fn spawn<R: Runtime>(
                                                                 // full pending here (QA-17 punct carried through
                                                                 // `lead`/`trail`/`outer_trail_len`) while the
                                                                 // stripped-off quotes are still in scope.
-                                                                fire = suggestion.map(|(t, g)| {
+                                                                fire = if let Some((d, edit)) = drift_hit.clone() {
+                                                                    // Early space-drift: the pending carries the SPAN
+                                                                    // edit. `word_len`/`word_end` still describe the
+                                                                    // right token, so the caret-at-rest accept gate and
+                                                                    // every dismissal rule are the ones the one-word
+                                                                    // suggestion uses.
+                                                                    Some(drift_pending(&d, edit, c, word_len, word_end, now_ms()))
+                                                                } else { suggestion.map(|(t, g)| {
                                                                     // UK English (v0.3.0): rewrite the
                                                                     // suggested spelling to the system
                                                                     // locale's variant (color↔colour) —
@@ -5100,8 +5367,9 @@ pub fn spawn<R: Runtime>(
                                                                             .chars()
                                                                             .count(),
                                                                         armed_at_ms: now_ms(),
+                                                                        span_edit: None,
                                                                     }
-                                                                });
+                                                                }) };
                                                             }
                                                         }
                                                     }
@@ -5161,7 +5429,11 @@ pub fn spawn<R: Runtime>(
                                                             timestamp_ms,
                                                         );
                                                         tally.add_bubble_shown();
-                                                        record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Shown, &ps.typed, &ps.target, now_ms());
+                                                        if ps.span_edit.is_some() {
+                                                            bubbles.drift.note_offered();
+                                                        } else {
+                                                            record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Shown, &ps.typed, &ps.target, now_ms());
+                                                        }
                                                         log_bubble_debug(now_ms(), &ps.typed, &ps.target, &fire_meta);
                                                         pending_suggestion = Some(ps);
                                                     }
@@ -5646,6 +5918,11 @@ pub fn spawn<R: Runtime>(
                                             proposer.take_dirty();
                                         }
                                     }
+                                    // The bundle may carry the Early space-drift record
+                                    // (`apply_bundle` wrote it back) — re-read it so the
+                                    // bar follows the restored record, and a bundle
+                                    // without one leaves the strict starting bar.
+                                    bubbles.drift.reload_record();
                                     tracing::info!("DATA_RESTORED from {path}");
                                     let _ = app_handle.emit(
                                         EVT_DATA_RESTORED,
@@ -5693,6 +5970,9 @@ pub fn spawn<R: Runtime>(
                                     allow_list.patterns.clear();
                                     last_correction = None;
                                     end_pending_bubble(&mut pending_suggestion, &mut bubbles, &app_handle);
+                                    // After the pending bubble is settled (so the reconcile
+                                    // stays whole): forget the Early space-drift record.
+                                    bubbles.drift.reset();
                                     persist_and_emit_allow_list(
                                         &app_handle,
                                         &allow_list,
@@ -5883,6 +6163,7 @@ pub fn spawn<R: Runtime>(
                         );
                         funnel.dump();
                         bubbles.diary.dump();
+                                    bubbles.drift.dump(pending_suggestion.is_some());
                         // Read-only kill-switch observability (no injection).
                         dump_classifications(&word_patterns, &motor_map);
                         // Observe-only guesser accuracy readout (no injection).
@@ -6243,6 +6524,7 @@ mod tests {
             trail: format!("{q_trail}{outer_trail}"),
             outer_trail_len: outer_trail.chars().count(),
             armed_at_ms: 0,
+            span_edit: None,
         }
     }
 
@@ -6256,6 +6538,7 @@ mod tests {
             immediate: true,
             after_len: ps.outer_trail_len + 1,
             fired_at_ms: 0,
+            span_edit: ps.span_edit.clone(),
         }
     }
 
@@ -6307,6 +6590,196 @@ mod tests {
             t.add_self_matched();
         }
         assert_eq!(t.self_matched, 1, "ignored bubble then exact retype must count");
+    }
+
+    // ---- Early space-drift (Build 3a) ------------------------------------
+    //
+    // These run the SAME seam the live loop runs: a real `Tokenizer` fed the
+    // keystream, `early_drift_hit` at the seal, `drift_pending`, and the accept /
+    // revert geometry applied to a simulated field.
+
+    /// Feed a keystream through a real tokenizer; return it plus the token the
+    /// last boundary sealed — exactly what the engine holds at the seal.
+    fn drift_seal(line: &str) -> (Tokenizer, correction_engine::Token, char) {
+        let mut t = Tokenizer::new();
+        let mut last = None;
+        let mut boundary = ' ';
+        for c in line.chars() {
+            if let Some(tok) = t.observe_char(c) {
+                last = Some(tok);
+                boundary = c;
+            }
+        }
+        (t, last.expect("a token sealed"), boundary)
+    }
+
+    #[test]
+    fn early_drift_end_to_end_through_the_real_seam() {
+        let (t, tok, b) = drift_seal("no tthink ");
+        let mut ledger = DriftLedger::default();
+        let (d, edit) = early_drift_hit(&t, &tok, Lexicon::shared(), &mut ledger, true, b, Some(false))
+            .expect("no tthink → not think");
+        assert_eq!(d.typed_span(), "no tthink");
+        assert_eq!(d.target_span(), "not think");
+        let ps = drift_pending(&d, edit, b, tok.end - tok.start, tok.end, 0);
+        assert_eq!((ps.typed.as_str(), ps.target.as_str()), ("no tthink", "not think"));
+        // Accept: the field before the caret reads `no tthink `.
+        let (dc, repl) = immediate_accept_injection(&ps);
+        assert_eq!(dc, 8, "deletes the space + tthink + boundary — never the left word");
+        assert_eq!(repl, "t think ");
+        let after = apply_inject("no tthink ", dc, &repl);
+        assert_eq!(after, "not think ");
+        // Esc undo restores the original exactly.
+        let lc = last_correction_for(&ps);
+        let (dc2, repl2) = immediate_revert_injection(&lc);
+        assert_eq!(apply_inject(&after, dc2, &repl2), "no tthink ");
+    }
+
+    #[test]
+    fn early_drift_geometry_keeps_text_before_the_left_word_and_casing() {
+        for (line, field_fixed) in [
+            ("so no tthink ", "so not think "),
+            ("No tthink ", "Not think "),
+        ] {
+            let (t, tok, b) = drift_seal(line);
+            let mut ledger = DriftLedger::default();
+            let (d, edit) = early_drift_hit(&t, &tok, Lexicon::shared(), &mut ledger, true, b, Some(false))
+                .unwrap_or_else(|| panic!("{line:?} should re-split"));
+            let ps = drift_pending(&d, edit, b, tok.end - tok.start, tok.end, 0);
+            let (dc, repl) = immediate_accept_injection(&ps);
+            assert_eq!(apply_inject(line, dc, &repl), field_fixed);
+        }
+    }
+
+    #[test]
+    fn early_drift_declines_are_counted_and_the_lanes_run_unchanged() {
+        // `no there`: both valid → quiet.
+        let (t, tok, b) = drift_seal("no there ");
+        let mut ledger = DriftLedger::default();
+        assert!(early_drift_hit(&t, &tok, Lexicon::shared(), &mut ledger, true, b, Some(false)).is_none());
+        // `I tthink`: single-letter left.
+        let (t, tok, b) = drift_seal("I tthink ");
+        assert!(early_drift_hit(&t, &tok, Lexicon::shared(), &mut ledger, true, b, Some(false)).is_none());
+        assert!(ledger.mismatch(false).is_none(), "declines reconcile: checked == Σ rejected");
+        // The learned/bold lanes still see `tthink` → `think` untouched.
+        let scan = correction_engine::shadow_convergence_scan("tthink", Lexicon::shared(), &MotorMap::new());
+        assert_eq!(scan.target.as_deref(), Some("think"), "the competing single-word fix is unaffected");
+    }
+
+    #[test]
+    fn early_drift_is_native_only_and_fails_closed() {
+        let lex = Lexicon::shared();
+        let (t, tok, b) = drift_seal("no tthink ");
+        // Native field → fires.
+        let mut ledger = DriftLedger::default();
+        assert!(early_drift_hit(&t, &tok, lex, &mut ledger, true, b, Some(false)).is_some());
+        // Web / contenteditable host (Google Docs, Gmail, any browser tab) → withheld.
+        let mut ledger = DriftLedger::default();
+        assert!(early_drift_hit(&t, &tok, lex, &mut ledger, true, b, Some(true)).is_none());
+        // Surface not yet reported (or sidecar restarted) → fail closed.
+        assert!(early_drift_hit(&t, &tok, lex, &mut ledger, true, b, None).is_none());
+        assert!(ledger.mismatch(false).is_none(), "withheld offers reconcile as named rejections");
+        // The same text with the gate evaluated on a native surface still offers, and
+        // the single-word lanes never consult the surface at all.
+        let scan = correction_engine::shadow_convergence_scan("tthink", lex, &MotorMap::new());
+        assert_eq!(scan.target.as_deref(), Some("think"), "one-word correction is unchanged on any surface");
+    }
+
+    #[test]
+    fn early_drift_with_the_gate_off_is_counted_and_not_offered() {
+        let (t, tok, b) = drift_seal("no tthink ");
+        let mut ledger = DriftLedger::default();
+        assert!(early_drift_hit(&t, &tok, Lexicon::shared(), &mut ledger, false, b, Some(false)).is_some());
+        assert!(ledger.mismatch(false).is_none(), "gate_off is its own reconciled bucket");
+    }
+
+    #[test]
+    fn early_drift_diary_row_keeps_the_two_word_span() {
+        // `normalize_word` alone would strip the space (`notthink`); the bubble key
+        // must keep it so the row reads as the slipped span.
+        assert_eq!(bubble_key("no tthink"), "no tthink");
+        assert_eq!(bubble_key("teh"), normalize_word("teh"), "one word: unchanged");
+        let dir = std::env::temp_dir().join(format!("tcd-drift-diary-{:?}", std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(crate::resolution_diary::DIARY_FLAG), b"").unwrap();
+        let mut b = BubbleLedger::with_diary(ResolutionDiary::open(Some(dir.clone()), 1_000));
+        b.diary.record(DiaryOutcome::Taken, &bubble_key("no tthink"), &bubble_key("not think"), None, 2_000);
+        let (rows, _) = crate::resolution_diary::parse_lines(
+            &std::fs::read_to_string(dir.join(crate::resolution_diary::DIARY_FILE)).unwrap(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].typed.as_str(), rows[0].target.as_str()), ("no tthink", "not think"));
+        assert_eq!(rows[0].outcome, DiaryOutcome::Taken);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ignored_drift_offer_is_recorded_everywhere_it_must_be() {
+        let dir = std::env::temp_dir().join(format!("tcd-drift-ign-{:?}", std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(crate::resolution_diary::DIARY_FLAG), b"").unwrap();
+        let mut b = BubbleLedger::with_diary(ResolutionDiary::open(Some(dir.clone()), 1_000));
+        b.drift = DriftLedger::open(Some(dir.clone()));
+        b.drift.note_offered();
+        b.end_unaccepted_bubble(3, &bubble_key("no tthink"), &bubble_key("not think"), true, 2_000);
+        // (1) the reconcile closes, (2) the per-user record moved, (3) the diary row.
+        assert!(b.drift.mismatch(false).is_none(), "an ended offer must close the reconcile");
+        assert_eq!(b.drift.stats().ignored, 1, "the record must see the ignore");
+        let (rows, _) = crate::resolution_diary::parse_lines(
+            &std::fs::read_to_string(dir.join(crate::resolution_diary::DIARY_FILE)).unwrap(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].typed.as_str(), rows[0].outcome), ("no tthink", DiaryOutcome::Ignored));
+        // A one-word bubble leaves the drift ledger alone.
+        let mut b2 = BubbleLedger::default();
+        b2.end_unaccepted_bubble(3, "teh", "the", false, 2_000);
+        assert_eq!(b2.drift.stats().ignored, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn early_drift_outcomes_are_wired_at_every_join_and_skip_the_pattern_store() {
+        // Source-level join lock (like `consent_lock.rs`): the live loop is not
+        // unit-drivable, so assert each outcome site is wired to the drift ledger and
+        // that the one-word pattern store is only reached on the `else` of that
+        // branch — an unwired join, or a pair key leaking into Impact, fails here.
+        let src = include_str!("engine.rs");
+        let live = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        for call in [
+            "bubbles.drift.note_offered()",  // shown
+            "bubbles.drift.note_taken()",    // accepted
+            "bubbles.drift.note_undone()",   // Esc revert
+            "end_unaccepted_bubble(",        // ended unaccepted (timeout/keystroke/backspace)
+        ] {
+            assert!(live.contains(call), "unwired join: {call} missing from the live engine");
+        }
+        // Native-only: the surface verdict is received from L1 and passed into the
+        // drift join (a dropped `WebHost` arm or an un-passed argument fails here).
+        assert!(
+            live.contains("InputEvent::WebHost { web } => {")
+                && live.contains("if web_host != Some(web) {\n                                web_host = Some(web);"),
+            "L1 web-host signal not consumed"
+        );
+        assert!(live.contains("                                                            web_host,\n                                                        );"), "drift join not given the surface verdict");
+        // Precedence: the drift check runs BEFORE both lanes, and a hit wins the
+        // `raw` chain ahead of the learned lane.
+        let hit_at = live.find("let drift_hit = early_drift_hit(").expect("drift check present");
+        let raw_at = live
+            .find("let raw: Option<(String, String)> = if let Some((d, _)) = &drift_hit {")
+            .expect("drift wins the raw chain first");
+        let learned_at = live.find("shadow_suggestion(&inner, &word_patterns").expect("learned lane present");
+        assert!(hit_at < raw_at && raw_at < learned_at, "drift must be checked and win BEFORE the lanes");
+        // No pattern-store write for the pair on the shown/accepted/undone paths.
+        for (guard, store_call) in [
+            ("if ps.span_edit.is_some() {\n                                                            bubbles.drift.note_offered();\n                                                        } else {", "OutcomeEvent::Shown"),
+            ("if is_drift {\n                                            bubbles.drift.note_taken();\n                                        } else {", "OutcomeEvent::Accepted"),
+            ("if lc.span_edit.is_some() {\n                                            bubbles.drift.note_undone();\n                                        } else {", "OutcomeEvent::Undone"),
+        ] {
+            let at = live.find(guard).unwrap_or_else(|| panic!("guard for {store_call} missing"));
+            assert!(live[at..at + 600].contains(store_call), "{store_call} must sit on the else branch");
+        }
     }
 
     #[test]

@@ -32,6 +32,7 @@ pub mod persist;
 pub mod resolver;
 pub mod score;
 pub mod slip_class;
+pub mod space_drift;
 pub mod spelling_variant;
 pub mod tokenizer;
 pub mod trigram;
@@ -87,6 +88,11 @@ pub use resolver::{
 pub use score::{
     confidence_for, score_candidates, Confidence, ConfidenceReport, EditType, ScoredCandidate,
     CONFIDENCE_HIGH_FLOOR, CONFIDENCE_LOW_FLOOR, CONFIDENCE_MEDIUM_FLOOR, SCORE_VERSION,
+};
+pub use space_drift::{
+    detect_early as detect_early_space_drift, load_stats as load_space_drift_stats,
+    save_stats as save_space_drift_stats, Bar as DriftBar, DriftReject, DriftStats, EarlyDrift,
+    SPACE_DRIFT_FILE,
 };
 pub use spelling_variant::{localize as localize_spelling, SpellingVariant};
 pub use slip_class::{

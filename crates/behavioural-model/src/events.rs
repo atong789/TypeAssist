@@ -83,6 +83,24 @@ pub enum InputEvent {
     /// Content-free (Principle #8/#9): a count, never the character, its timing,
     /// or the focused app.
     SpaceObserved { total: u64 },
+    /// **Web/contenteditable host signal (TF-08b, weld suppression).** The L1
+    /// adapter reports whether the focused field lives inside a web content area
+    /// (an `AXWebArea` ancestor — browser tabs and Electron web views, never a
+    /// native text field). In such a host a competing **web** autocorrect (Google
+    /// Docs/Gmail) can shrink a word a beat before Jordan's accept, so Jordan's
+    /// dead-reckoned delete count over-deletes into the previous word (the weld).
+    /// The engine pairs this with a length-delta test (`len(typed) != len(target)`,
+    /// the exact weld-risk set) to WITHHOLD only length-changing corrections in web
+    /// hosts — ceding that one word to the host. Same-length slips, and every slip
+    /// in native apps, are untouched.
+    ///
+    /// A **level** signal, re-emitted (on the adapter's heartbeat re-eval) only
+    /// when it flips. `web` is the **raw** web-host fact — the `weld_suppress`
+    /// toggle is applied engine-side, not by the adapter (a faceless L1 adapter
+    /// must not depend on reading the user's config dir). The pre-signal default is
+    /// `false` (fire as today). Content-free (Principle #8): a single bool, never
+    /// the app id or field role that derived it.
+    WebHost { web: bool },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -250,6 +268,18 @@ mod tests {
         let e = InputEvent::SpaceObserved { total: 42 };
         let json = serde_json::to_string(&e).unwrap();
         assert_eq!(json, r#"{"type":"space_observed","total":42}"#);
+        let back: InputEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn web_host_event_round_trips() {
+        // TF-08b: L1 reports whether the focused field is a web/contenteditable
+        // host (weld suppression). snake_case tag + `web` field must match the
+        // Swift bridge's `web_host` encoding.
+        let e = InputEvent::WebHost { web: true };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(json, r#"{"type":"web_host","web":true}"#);
         let back: InputEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
     }

@@ -115,6 +115,105 @@ enum Accessibility {
         up.post(tap: .cgSessionEventTap)
     }
 
+    // MARK: - TF-08b web-host detection (weld suppression gate)
+    //
+    // In a web/contenteditable host (Google Docs/Gmail in any browser, on any
+    // arch), a competing WEB autocorrect can shrink a word a beat before Jordan's
+    // accept, so her dead-reckoned delete count over-deletes into the previous word
+    // — the weld. Read-back can't rescue it (content-blind wall + TF-08's phantom
+    // caret), and Jordan is web-blind to the competitor. So the engine WITHHOLDS
+    // only length-changing corrections (`len(typed) != len(target)`, the exact
+    // weld-risk set) in web hosts, ceding that word to the host. This is the L1
+    // half: report whether the focused field is a web host.
+    //
+    // "Web host" = the focused element has an `AXWebArea` ancestor. That role marks
+    // rendered web content in WebKit (Safari) and Chromium (Chrome/Edge/Electron),
+    // and is ABSENT for native fields (TextEdit/Notes are `AXTextArea` with no web
+    // ancestor) — so this fires in browsers/Electron and never in native apps,
+    // regardless of arch (Chrome-web welds on Silicon too). Content-blind: reads
+    // element ROLES only, never text.
+
+    private static let webAncestorMaxHops = 12
+
+    /// Browser bundle ids — the FALLBACK web-host signal for canvas/iframe editors
+    /// (Google Docs) whose degraded AX subtree defeats the AXWebArea ancestor walk.
+    /// Docs/Gmail/any web tab runs in one of these, and the bundle id is readable
+    /// regardless of how the page vends AX. (Electron web apps still detect via the
+    /// AXWebArea walk, so they don't need to be listed.)
+    private static let browserBundleIDs: Set<String> = [
+        "com.apple.Safari", "com.apple.SafariTechnologyPreview",
+        "com.google.Chrome", "com.google.Chrome.canary", "com.google.Chrome.beta",
+        "com.microsoft.edgemac", "com.brave.Browser", "com.brave.Browser.beta",
+        "org.mozilla.firefox", "com.operasoftware.Opera", "com.vivaldi.Vivaldi",
+        "company.thebrowser.Browser", "com.kagi.kagimacOS",
+        "com.duckduckgo.macos.browser",
+    ]
+
+    /// Whether the focused field is a web content host, plus a rich detail string
+    /// for the validation log. Two signals, OR'd:
+    ///   1. **AXWebArea ancestor** — walk the focused element's `AXParent` chain for
+    ///      an `AXWebArea` (rendered web content). Works for normal contenteditable
+    ///      (Gmail) and Electron; runtime-derived. But **Google Docs** is a
+    ///      canvas-rendered editor whose input target sits in an offscreen iframe
+    ///      with a degraded AX subtree, so the walk dead-ends before AXWebArea.
+    ///   2. **Browser bundle id** (fallback) — the frontmost app is a known browser.
+    ///      Rescues Docs (and any web surface the walk misses) since the bundle id
+    ///      doesn't depend on the page's AX tree.
+    /// Content-blind: reads element ROLES / SUBROLES and the app bundle id (an
+    /// ephemeral, never-persisted read — Principle #8), never text. The `detail`
+    /// records the full role chain + why the walk stopped, so a dev run confirms
+    /// exactly where Docs' AX chain breaks.
+    static func webHostDetail() -> (isWeb: Bool, detail: String) {
+        primeAXConnection()
+        guard let front = NSWorkspace.shared.frontmostApplication else {
+            return (false, "no-frontmost")
+        }
+        let bundle = front.bundleIdentifier ?? "?"
+        let isBrowser = browserBundleIDs.contains(bundle)
+
+        func roleSub(_ e: AXUIElement) -> String {
+            let r = (copyAttr(e, kAXRoleAttribute as String) as? String) ?? "?"
+            let s = (copyAttr(e, kAXSubroleAttribute as String) as? String) ?? "-"
+            return s == "-" ? r : "\(r)/\(s)"
+        }
+
+        guard let f = copyAttr(
+                AXUIElementCreateApplication(front.processIdentifier),
+                kAXFocusedUIElementAttribute as String),
+              CFGetTypeID(f) == AXUIElementGetTypeID() else {
+            // No focused element to walk — the browser fallback still decides.
+            return (isBrowser, "bundle=\(bundle) browser=\(isBrowser) focused=none")
+        }
+
+        var el = f as! AXUIElement
+        var chain = [roleSub(el)]
+        var foundWebArea = false
+        var stop = "depth-cap"
+        for _ in 0..<webAncestorMaxHops {
+            guard let p = copyAttr(el, kAXParentAttribute as String),
+                  CFGetTypeID(p) == AXUIElementGetTypeID() else {
+                stop = "nil-parent"
+                break
+            }
+            let parent = p as! AXUIElement
+            chain.append(roleSub(parent))
+            if (copyAttr(parent, kAXRoleAttribute as String) as? String) == "AXWebArea" {
+                foundWebArea = true
+                stop = "found-AXWebArea"
+                break
+            }
+            el = parent
+        }
+
+        let isWeb = foundWebArea || isBrowser
+        let method = foundWebArea ? "webarea" : (isBrowser ? "browser-fallback" : "none")
+        return (
+            isWeb,
+            "bundle=\(bundle) browser=\(isBrowser) method=\(method) stop=\(stop) "
+                + "chain=\(chain.joined(separator: ">"))"
+        )
+    }
+
     // MARK: - Phase 0 / M3 overlay feasibility probe
 
     private static var axPrimed = false

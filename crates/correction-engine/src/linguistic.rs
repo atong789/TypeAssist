@@ -326,7 +326,7 @@ fn segmentable_helper(chars: &[char], lex: &Lexicon) -> bool {
 /// short words. Carve-out for short high-freq words: `the` (3 chars),
 /// `of` / `to` (2 chars) are real functional roots; `so` / `um` / `yo`
 /// (also 2 chars but moderate freq) are not.
-fn is_valid_segment(word: &str, lex: &Lexicon) -> bool {
+pub(crate) fn is_valid_segment(word: &str, lex: &Lexicon) -> bool {
     if !lex.is_known(word) {
         return false;
     }
