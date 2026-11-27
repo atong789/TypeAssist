@@ -1291,6 +1291,25 @@ struct Funnel {
     /// engine WOULD have surfaced but withheld so it doesn't double-correct the
     /// host. Idiosyncratic fixes are never counted here (they always fire).
     competitor_deferred: u64,
+    /// **TF-08 host-scoped suppression (Principle #7).** Times Jordan went
+    /// watch-only on a would-fire suggestion because L1 reported the focused field
+    /// as an injection dead zone (Safari web/contenteditable on Intel — phantom AX
+    /// caret; a synthetic fix can't land). A deliberate, visible drop: the engine
+    /// WOULD have surfaced the bubble but withheld it (no cue) rather than garble
+    /// the field. Kept observing/learning regardless. Distinct from
+    /// `competitor_deferred` (host-redundant deferral); the dead zone withholds
+    /// ALL fixes, not just redundant ones.
+    dead_zone_suppressed: u64,
+    /// **TF-08b weld suppression (Principle #7).** Times Jordan withheld a
+    /// would-fire suggestion because it was **length-changing** (`len(typed) !=
+    /// len(target)`) **in a web/contenteditable host** (L1 `WebHost`) — the exact
+    /// case that welds when the host's own autocorrect shrinks the word before
+    /// accept. A deliberate, visible drop: the bubble is withheld (no cue) and the
+    /// word ceded to the host rather than garbled. Distinct from
+    /// `competitor_deferred`: this needs no sensed competitor and gates on the
+    /// length-delta, not host-redundancy. Same-length slips and native-app slips
+    /// never land here.
+    weld_suppressed: u64,
     /// **L1 space-drop detection (Principle #7, QA-15 Step 1 — observe-only).**
     /// `space_observed` is the latest cumulative space-keyDown total the L1 tap
     /// reported ([`InputEvent::SpaceObserved`]); `space_accepted` is the spaces
@@ -1354,7 +1373,8 @@ impl Funnel {
              corr_sug: {}, corr_oth: {}, abandoned: {}}}, c_motor_observations: {{kept: {}, \
              slip: {}}}, c_motor_saves: {}, c_word_patterns: {{observed: {}, skipped: {}}}, \
              c_word_pattern_saves: {}, c_corrections: {{applied: {}, undone: {}}}, \
-             c_competitor_deferred: {}, c_space: {{observed: {}, accepted: {}, \
+             c_competitor_deferred: {}, c_dead_zone_suppressed: {}, \
+             c_weld_suppressed: {}, c_space: {{observed: {}, accepted: {}, \
              drops_suspected: {}}}, c_outcomes_events_vs_recorded: {{shown: {}/{}, accepted: {}/{}, \
              self_matched: {}/{}, undone: {}/{}}}, c_lexicon: {{confirmed: {}, persisted: {}, saves: {}, \
              save_errors: {}, restored: {}}}, session_started_at: {} }}",
@@ -1376,6 +1396,8 @@ impl Funnel {
             self.corrections_applied,
             self.corrections_undone,
             self.competitor_deferred,
+            self.dead_zone_suppressed,
+            self.weld_suppressed,
             self.space_observed,
             self.space_accepted,
             self.space_drops_suspected,
@@ -1516,6 +1538,47 @@ fn typeassist_dir() -> Option<PathBuf> {
 /// `~/.typeassist/motor_map.json` — the live, periodically-saved map.
 fn motor_map_path() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("motor_map.json"))
+}
+
+/// TF-08 / TF-08b — read a boolean toggle from `~/.typeassist/inject_config`, HERE
+/// (engine-side) rather than in the L1 adapter: the engine owns the data dir
+/// authoritatively (same `typeassist_dir()` it reads `allow_list`/`word_patterns`
+/// from), whereas a faceless sidecar's spawned `HOME` need not match where the user
+/// wrote the file — the bug that left TF-08b's `emit` stuck false. Absent key /
+/// missing file / no HOME returns `default`. Read only when a suppression is
+/// otherwise in hand (the callers short-circuit), so the file touch is rare, never
+/// per-keystroke.
+fn inject_config_bool(key: &str, default: bool) -> bool {
+    let Some(dir) = typeassist_dir() else {
+        return default;
+    };
+    let Ok(text) = std::fs::read_to_string(dir.join("inject_config")) else {
+        return default;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == key {
+                return matches!(v.trim(), "on" | "1" | "true" | "yes");
+            }
+        }
+    }
+    default
+}
+
+/// TF-08b weld-suppression toggle (`weld_suppress`). **Default on** for 0.3.1 —
+/// `weld_suppress=off` reproduces the weld for A/B.
+fn weld_suppress_enabled() -> bool {
+    inject_config_bool("weld_suppress", true)
+}
+
+/// TF-08 Intel+Safari dead-zone toggle (`suppress`). **Default on** for 0.3.1 —
+/// `suppress=off` disables the dead-zone watch-only for A/B.
+fn dead_zone_suppress_enabled() -> bool {
+    inject_config_bool("suppress", true)
 }
 
 /// macOS Accessibility trust — a pure, no-prompt read of `AXIsProcessTrusted()`.
@@ -3937,8 +4000,17 @@ pub fn spawn<R: Runtime>(
         // Early space-drift is NATIVE-ONLY: the latest surface verdict from L1
         // (`InputEvent::WebHost`, a single content-free bool — the focused field is a
         // web / contenteditable host or not). `None` until L1 has reported (and again
-        // after a sidecar restart) — the drift check fails closed on `None`.
+        // after a sidecar restart) — the drift check fails closed on `None`. The
+        // TF-08b weld-suppression gate reads the SAME signal as `web_host == Some(true)`
+        // (unreported ⇒ `None` ⇒ fire as today, exactly the old `false` default).
         let mut web_host: Option<bool> = None;
+        // TF-08 host-scoped suppression: the latest injection dead-zone verdict
+        // from L1 (`InputEvent::InjectionZone`). `true` ⇒ the focused field is a
+        // place a synthetic correction can't land (Safari web/contenteditable on
+        // Intel — phantom AX caret), so the fire gate goes WATCH-ONLY there.
+        // Level signal, updated on focus change + heartbeat; default `false` so
+        // nothing changes for native fields, Chrome, or Apple Silicon.
+        let mut injection_dead_zone = false;
         // Daily-snapshot bookkeeping (Principle #6): the calendar date whose
         // snapshot we've already handled this run, seeded from the newest dated
         // file on disk so the first event of a *new* calendar day is detected
@@ -4368,6 +4440,17 @@ pub fn spawn<R: Runtime>(
                                     funnel.space_accepted,
                                     suspected,
                                 );
+                            }
+                        }
+                        InputEvent::InjectionZone { dead } => {
+                            // TF-08 host-scoped suppression: L1 reports whether the
+                            // focused field is an injection dead zone (Safari
+                            // web/contenteditable on Intel — phantom AX caret).
+                            // Level signal, so only a flip is logged. Drives the
+                            // watch-only fire gate; ingests nothing, counts nothing.
+                            if dead != injection_dead_zone {
+                                injection_dead_zone = dead;
+                                tracing::info!("INJECTION_ZONE dead={dead}");
                             }
                         }
                         InputEvent::PermissionRequired => {
@@ -5303,6 +5386,32 @@ pub fn spawn<R: Runtime>(
                                                             && suggestion.as_ref().is_some_and(|(t, g)| {
                                                                 correction_engine::is_host_redundant(t, g, lexicon)
                                                             });
+                                                        // TF-08b weld-risk: a LENGTH-CHANGING correction
+                                                        // (len(typed) != len(target)) — doubling/omission,
+                                                        // the exact set that welds when a web autocorrect
+                                                        // shrinks the word before accept. Same-length slips
+                                                        // (coordination + adjacent-key precision) are never
+                                                        // at risk. Content-free (a char-count delta).
+                                                        let weld_risk = suggestion
+                                                            .as_ref()
+                                                            .is_some_and(|(t, g)| {
+                                                                t.chars().count() != g.chars().count()
+                                                            });
+                                                        // TF-08b: withhold iff web host AND length-changing
+                                                        // AND the toggle is on. `&&` short-circuits, so the
+                                                        // config file is read ONLY on a would-weld (rare) —
+                                                        // never per keystroke. The toggle lives engine-side
+                                                        // (authoritative data dir); the sidecar reports only
+                                                        // the raw web-host fact.
+                                                        let weld_suppress =
+                                                            web_host == Some(true) && weld_risk && weld_suppress_enabled();
+                                                        // TF-08: withhold ALL fixes in the Intel+Safari dead
+                                                        // zone (not gated on weld_risk — the whole surface
+                                                        // can't take an injection). Toggle read engine-side,
+                                                        // short-circuited so the file is touched only in the
+                                                        // dead zone (rare), never per keystroke.
+                                                        let dead_zone_suppress =
+                                                            injection_dead_zone && dead_zone_suppress_enabled();
                                                         // FIRE_TIMING t1 — the fire decision is resolved (Some/None).
                                                         t1 = now_ms();
                                                         // The master gate turns a suggestion into a live bubble. Log the
@@ -5310,17 +5419,44 @@ pub fn spawn<R: Runtime>(
                                                         // `competitor_deferred` is a content-free verdict bool
                                                         // (Principle #8): it never names the app or the reason's source.
                                                         tracing::info!(
-                                                            "FIRE_DECISION word={:?} gate_on={} suggestion={:?} apostrophe_suppressed={} competitor_deferred={} t1={} t1_minus_t0_ms={}",
+                                                            "FIRE_DECISION word={:?} gate_on={} suggestion={:?} apostrophe_suppressed={} competitor_deferred={} dead_zone={} dead_zone_suppress={} web_host={} weld_risk={} weld_suppress={} t1={} t1_minus_t0_ms={}",
                                                             tok.core,
                                                             allow_list.correction_enabled,
                                                             suggestion.as_ref().map(|(t, g)| format!("{t}->{g}")),
                                                             apostrophe_suppressed,
                                                             competitor_deferred,
+                                                            injection_dead_zone,
+                                                            dead_zone_suppress,
+                                                            web_host == Some(true),
+                                                            weld_risk,
+                                                            weld_suppress,
                                                             t1,
                                                             t1.saturating_sub(t_recv),
                                                         );
                                                         if allow_list.correction_enabled {
-                                                            if competitor_deferred {
+                                                            if dead_zone_suppress {
+                                                                // TF-08 dead zone (Safari-web/Intel
+                                                                // phantom caret): a synthetic fix can't
+                                                                // land, so WATCH-ONLY — withhold the bubble
+                                                                // entirely (silent, no cue) while the
+                                                                // observation/learning below runs as normal.
+                                                                // Supersedes the competitor deferral (we
+                                                                // inject nothing, so nothing double-corrects).
+                                                                // A deliberate, counted drop (Principle #7);
+                                                                // `fire` stays None.
+                                                                funnel.dead_zone_suppressed += 1;
+                                                            } else if weld_suppress {
+                                                                // TF-08b: a length-changing correction in a
+                                                                // web host would weld (the host shrinks the
+                                                                // word before accept; Jordan's dead-reckoned
+                                                                // delete over-runs). WITHHOLD — cede this one
+                                                                // word to the host. Silent, no bubble. A
+                                                                // deliberate, counted drop (Principle #7);
+                                                                // `fire` stays None. Only length-changing
+                                                                // slips in web hosts land here — same-length
+                                                                // and native fire below unchanged.
+                                                                funnel.weld_suppressed += 1;
+                                                            } else if competitor_deferred {
                                                                 // A live bubble withheld to avoid
                                                                 // double-correcting the host — a deliberate,
                                                                 // counted drop (Principle #7). `fire` stays

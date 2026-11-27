@@ -122,10 +122,12 @@ let heartbeatTimer = CFRunLoopTimerCreateWithHandler(
     // Refresh the per-grant snapshot alongside proof-of-life so the UI catches
     // a runtime revoke (e.g. Input Monitoring pulled while running) too.
     emitPermissionStatus()
-    // TF-08b: re-evaluate the web-host signal on the proven heartbeat timer so it
-    // tracks the frontmost app within one interval — Google Docs' canvas editor
-    // never fires a focus-element change while typing, so the notification-driven
-    // hook alone left `web_host` stuck at its startup value. Emits only on a flip.
+    // TF-08 / TF-08b: re-evaluate the injection-dead-zone AND web-host signals on
+    // the proven heartbeat timer so they track the frontmost app within one interval
+    // — Google Docs' canvas editor never fires a focus-element change while typing,
+    // so the notification-driven hook alone left either signal stuck at its startup
+    // value. Both emit only on a flip.
+    secureMonitor.updateInjectionZone()
     secureMonitor.updateWebHost()
 }
 CFRunLoopAddTimer(CFRunLoopGetMain(), heartbeatTimer, .commonModes)
