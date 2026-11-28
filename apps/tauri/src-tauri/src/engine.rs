@@ -29,6 +29,8 @@
 //!   `engine://lexicon-proposal`    — per word, the C5b lexicon-learning proposal (lane, motor verdict,
 //!                                    tier, occasions). Observe-only — does not write is_known yet.
 
+use crate::accept_check::{segment_lengths, surface_after, AcceptLedger, INJECT_RESULT_TIMEOUT_MS};
+use behavioural_model::events::InjectStatus;
 use std::time::Instant;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1037,18 +1039,26 @@ struct LastCorrection {
     /// (`'what' ` → `'waht' `, `believe" ` → `beleive" `).
     lead: String,
     trail: String,
-    /// Whether the accept took the IMMEDIATE (caret-at-rest) path — the only
-    /// enabled one. The revert is caret-relative when true. (Replaces the old
-    /// `after_len == 1` test, which broke once a trailing quote made the rest
-    /// position `outer_trail_len + 1 > 1`.)
-    immediate: bool,
-    /// `after_len` from the accept, retained for the (still-gated-off) anchored
-    /// revert path. `last_correction` disarms on ANY non-Esc keystroke, so an Esc
-    /// undo only ever fires with the caret exactly where the accept left it.
+    /// Chars from the word's end to the caret at accept (logged on undo).
     after_len: usize,
     fired_at_ms: u64,
     /// The span edit's undo pair, when the accepted fix was an Early drift.
     span_edit: Option<SpanEdit>,
+}
+
+/// An injection the sidecar has been asked for and not yet answered. Nothing is
+/// counted as accepted or undone until it says it injected.
+struct InFlight {
+    id: u32,
+    /// Chars in the replacement — with the sidecar's delete count, the echo size.
+    replacement_len: u32,
+    sent_at_ms: u64,
+    request: InjectRequest,
+}
+
+enum InjectRequest {
+    Accept(PendingSuggestion),
+    Revert(LastCorrection),
 }
 
 /// QA-17 (5a) — peel a MATCHED leading+trailing run of straight ASCII single
@@ -1291,6 +1301,25 @@ struct Funnel {
     /// engine WOULD have surfaced but withheld so it doesn't double-correct the
     /// host. Idiosyncratic fixes are never counted here (they always fire).
     competitor_deferred: u64,
+    /// **TF-08 host-scoped suppression (Principle #7).** Times Jordan went
+    /// watch-only on a would-fire suggestion because L1 reported the focused field
+    /// as an injection dead zone (Safari web/contenteditable on Intel — phantom AX
+    /// caret; a synthetic fix can't land). A deliberate, visible drop: the engine
+    /// WOULD have surfaced the bubble but withheld it (no cue) rather than garble
+    /// the field. Kept observing/learning regardless. Distinct from
+    /// `competitor_deferred` (host-redundant deferral); the dead zone withholds
+    /// ALL fixes, not just redundant ones.
+    dead_zone_suppressed: u64,
+    /// **TF-08b weld suppression (Principle #7).** Times Jordan withheld a
+    /// would-fire suggestion because it was **length-changing** (`len(typed) !=
+    /// len(target)`) **in a web/contenteditable host** (L1 `WebHost`) — the exact
+    /// case that welds when the host's own autocorrect shrinks the word before
+    /// accept. A deliberate, visible drop: the bubble is withheld (no cue) and the
+    /// word ceded to the host rather than garbled. Distinct from
+    /// `competitor_deferred`: this needs no sensed competitor and gates on the
+    /// length-delta, not host-redundancy. Same-length slips and native-app slips
+    /// never land here.
+    weld_suppressed: u64,
     /// **L1 space-drop detection (Principle #7, QA-15 Step 1 — observe-only).**
     /// `space_observed` is the latest cumulative space-keyDown total the L1 tap
     /// reported ([`InputEvent::SpaceObserved`]); `space_accepted` is the spaces
@@ -1354,7 +1383,8 @@ impl Funnel {
              corr_sug: {}, corr_oth: {}, abandoned: {}}}, c_motor_observations: {{kept: {}, \
              slip: {}}}, c_motor_saves: {}, c_word_patterns: {{observed: {}, skipped: {}}}, \
              c_word_pattern_saves: {}, c_corrections: {{applied: {}, undone: {}}}, \
-             c_competitor_deferred: {}, c_space: {{observed: {}, accepted: {}, \
+             c_competitor_deferred: {}, c_dead_zone_suppressed: {}, \
+             c_weld_suppressed: {}, c_space: {{observed: {}, accepted: {}, \
              drops_suspected: {}}}, c_outcomes_events_vs_recorded: {{shown: {}/{}, accepted: {}/{}, \
              self_matched: {}/{}, undone: {}/{}}}, c_lexicon: {{confirmed: {}, persisted: {}, saves: {}, \
              save_errors: {}, restored: {}}}, session_started_at: {} }}",
@@ -1376,6 +1406,8 @@ impl Funnel {
             self.corrections_applied,
             self.corrections_undone,
             self.competitor_deferred,
+            self.dead_zone_suppressed,
+            self.weld_suppressed,
             self.space_observed,
             self.space_accepted,
             self.space_drops_suspected,
@@ -1516,6 +1548,47 @@ fn typeassist_dir() -> Option<PathBuf> {
 /// `~/.typeassist/motor_map.json` — the live, periodically-saved map.
 fn motor_map_path() -> Option<PathBuf> {
     typeassist_dir().map(|d| d.join("motor_map.json"))
+}
+
+/// TF-08 / TF-08b — read a boolean toggle from `~/.typeassist/inject_config`, HERE
+/// (engine-side) rather than in the L1 adapter: the engine owns the data dir
+/// authoritatively (same `typeassist_dir()` it reads `allow_list`/`word_patterns`
+/// from), whereas a faceless sidecar's spawned `HOME` need not match where the user
+/// wrote the file — the bug that left TF-08b's `emit` stuck false. Absent key /
+/// missing file / no HOME returns `default`. Read only when a suppression is
+/// otherwise in hand (the callers short-circuit), so the file touch is rare, never
+/// per-keystroke.
+fn inject_config_bool(key: &str, default: bool) -> bool {
+    let Some(dir) = typeassist_dir() else {
+        return default;
+    };
+    let Ok(text) = std::fs::read_to_string(dir.join("inject_config")) else {
+        return default;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == key {
+                return matches!(v.trim(), "on" | "1" | "true" | "yes");
+            }
+        }
+    }
+    default
+}
+
+/// TF-08b weld-suppression toggle (`weld_suppress`). **Default on** for 0.3.1 —
+/// `weld_suppress=off` reproduces the weld for A/B.
+fn weld_suppress_enabled() -> bool {
+    inject_config_bool("weld_suppress", true)
+}
+
+/// TF-08 Intel+Safari dead-zone toggle (`suppress`). **Default on** for 0.3.1 —
+/// `suppress=off` disables the dead-zone watch-only for A/B.
+fn dead_zone_suppress_enabled() -> bool {
+    inject_config_bool("suppress", true)
 }
 
 /// macOS Accessibility trust — a pure, no-prompt read of `AXIsProcessTrusted()`.
@@ -2971,25 +3044,17 @@ fn persist_and_emit_allow_list<R: Runtime>(
     let _ = app.emit(EVT_CORRECTION_STATE, allow_list.clone());
 }
 
-/// Write an `InjectCorrection` to the sidecar's stdin: delete the last
-/// `delete_count` characters back from the caret, then type `replacement`
-/// (which already carries the trailing boundary char). The sidecar tags the
-/// synthesized CGEvents (`eventSourceUserData`) so the tap drops their echo —
-/// the engine never sees its own injection, so it can't re-learn or re-correct
-/// it. Returns whether the command was written (a dead stdin returns false).
-fn send_inject_correction(
+/// Write one command to the sidecar's stdin. An injection's echo comes back
+/// through the tap; the caller adds it to `pending_echo` once the sidecar says how
+/// much it deleted. Returns whether the command was written.
+fn send_command(
     child: &mut tauri_plugin_shell::process::CommandChild,
-    delete_count: u32,
-    replacement: String,
+    cmd: &OutboundCommand,
 ) -> bool {
-    let cmd = OutboundCommand::InjectCorrection {
-        delete_count,
-        replacement,
-    };
-    let mut line = match serde_json::to_string(&cmd) {
+    let mut line = match serde_json::to_string(cmd) {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!("failed to serialize InjectCorrection: {e}");
+            tracing::error!("failed to serialize sidecar command: {e}");
             return false;
         }
     };
@@ -2997,41 +3062,7 @@ fn send_inject_correction(
     match child.write(line.as_bytes()) {
         Ok(_) => true,
         Err(e) => {
-            tracing::warn!("InjectCorrection write to sidecar failed: {e}");
-            false
-        }
-    }
-}
-
-/// Anchored replace (M3 bubble accept-after-typing-on): Left × `left`,
-/// Backspace × `delete_count`, type `replacement`, Right × `right`. The whole
-/// burst echoes back through the tap; the caller adds `left + delete_count +
-/// replacement.chars() + right` to `pending_echo` to drop it.
-fn send_inject_anchored(
-    child: &mut tauri_plugin_shell::process::CommandChild,
-    left: u32,
-    delete_count: u32,
-    replacement: String,
-    right: u32,
-) -> bool {
-    let cmd = OutboundCommand::InjectAnchored {
-        left,
-        delete_count,
-        replacement,
-        right,
-    };
-    let mut line = match serde_json::to_string(&cmd) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("failed to serialize InjectAnchored: {e}");
-            return false;
-        }
-    };
-    line.push('\n');
-    match child.write(line.as_bytes()) {
-        Ok(_) => true,
-        Err(e) => {
-            tracing::warn!("InjectAnchored write to sidecar failed: {e}");
+            tracing::warn!("sidecar command write failed: {e}");
             false
         }
     }
@@ -3937,8 +3968,17 @@ pub fn spawn<R: Runtime>(
         // Early space-drift is NATIVE-ONLY: the latest surface verdict from L1
         // (`InputEvent::WebHost`, a single content-free bool — the focused field is a
         // web / contenteditable host or not). `None` until L1 has reported (and again
-        // after a sidecar restart) — the drift check fails closed on `None`.
+        // after a sidecar restart) — the drift check fails closed on `None`. The
+        // TF-08b weld-suppression gate reads the SAME signal as `web_host == Some(true)`
+        // (unreported ⇒ `None` ⇒ fire as today, exactly the old `false` default).
         let mut web_host: Option<bool> = None;
+        // TF-08 host-scoped suppression: the latest injection dead-zone verdict
+        // from L1 (`InputEvent::InjectionZone`). `true` ⇒ the focused field is a
+        // place a synthetic correction can't land (Safari web/contenteditable on
+        // Intel — phantom AX caret), so the fire gate goes WATCH-ONLY there.
+        // Level signal, updated on focus change + heartbeat; default `false` so
+        // nothing changes for native fields, Chrome, or Apple Silicon.
+        let mut injection_dead_zone = false;
         // Daily-snapshot bookkeeping (Principle #6): the calendar date whose
         // snapshot we've already handled this run, seeded from the newest dated
         // file on disk so the first event of a *new* calendar day is detected
@@ -4032,6 +4072,10 @@ pub fn spawn<R: Runtime>(
         // back-to-back (~1 ms apart), far faster than a human, so it always
         // drains before the next real key.
         let mut pending_echo: u32 = 0;
+        // The accept check: one request in flight at a time, every one counted.
+        let mut in_flight: Option<InFlight> = None;
+        let mut accept_ledger = AcceptLedger::default();
+        let mut next_inject_id: u32 = 0;
         // Progress Statistics: the current day's live word/slip tally, seeded
         // from disk so a mid-day restart resumes today's counts rather than
         // resetting them. The watchdog upserts + rolls it (see `tick_progress`).
@@ -4157,6 +4201,8 @@ pub fn spawn<R: Runtime>(
                             &mut sidecar_child,
                             &mut respawn_attempts,
                         ) {
+                            // A new sidecar has not reported its surface yet.
+                            web_host = None;
                             last_heartbeat_at = Some(Instant::now());
                         } else {
                             // Respawn refused or failed — rx is still
@@ -4335,8 +4381,8 @@ pub fn spawn<R: Runtime>(
                     match parsed {
                         InputEvent::Ready => {
                             tracing::info!("sidecar ready — engine listening");
-                            // A fresh sidecar has not reported its surface yet.
-                            web_host = None;
+                            // The surface was reported BEFORE this; keep it.
+                            web_host = surface_after(web_host, &parsed);
                         }
                         InputEvent::WebHost { web } => {
                             // Level signal from L1 (re-evaluated on its heartbeat; only a
@@ -4368,6 +4414,17 @@ pub fn spawn<R: Runtime>(
                                     funnel.space_accepted,
                                     suspected,
                                 );
+                            }
+                        }
+                        InputEvent::InjectionZone { dead } => {
+                            // TF-08 host-scoped suppression: L1 reports whether the
+                            // focused field is an injection dead zone (Safari
+                            // web/contenteditable on Intel — phantom AX caret).
+                            // Level signal, so only a flip is logged. Drives the
+                            // watch-only fire gate; ingests nothing, counts nothing.
+                            if dead != injection_dead_zone {
+                                injection_dead_zone = dead;
+                                tracing::info!("INJECTION_ZONE dead={dead}");
                             }
                         }
                         InputEvent::PermissionRequired => {
@@ -4479,6 +4536,109 @@ pub fn spawn<R: Runtime>(
                             // could no longer inject safely. Drop it and hide it.
                             end_pending_bubble(&mut pending_suggestion, &mut bubbles, &app_handle);
                         }
+                        InputEvent::InjectResult { id, status, deleted, reason } => {
+                            let Some(flight) = in_flight.take_if(|f| f.id == id) else {
+                                // Answered after we gave it up (already counted as
+                                // no_result), or not ours.
+                                tracing::warn!("INJECT_RESULT_STALE id={id} status={status:?}");
+                                continue;
+                            };
+                            accept_ledger.note_result(status, reason.as_deref());
+                            let injected = status != InjectStatus::Aborted;
+                            if injected {
+                                pending_echo += deleted + flight.replacement_len;
+                            }
+                            tracing::info!(
+                                "INJECT_RESULT status={status:?} delete_count={deleted} reason={reason:?}"
+                            );
+                            match flight.request {
+                                InjectRequest::Accept(ps) => {
+                                    let typed_key = bubble_key(&ps.typed);
+                                    let target_key = bubble_key(&ps.target);
+                                    let is_drift = ps.span_edit.is_some();
+                                    if !injected {
+                                        // Never claim a fix that didn't land.
+                                        let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                                        bubbles.end_unaccepted_bubble(
+                                            ps.word_end.saturating_sub(ps.word_len),
+                                            &typed_key,
+                                            &target_key,
+                                            is_drift,
+                                            now_ms(),
+                                        );
+                                        continue;
+                                    }
+                                    tracing::info!(
+                                        "CORRECTION_APPLIED typed={:?} target={:?} delete_count={deleted}",
+                                        ps.typed,
+                                        ps.target
+                                    );
+                                    funnel.corrections_applied += 1;
+                                    tally.add_accepted();
+                                    if is_drift {
+                                        bubbles.drift.note_taken();
+                                    } else {
+                                        record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Accepted, &typed_key, &target_key, now_ms());
+                                    }
+                                    bubbles.diary.record(DiaryOutcome::Taken, &typed_key, &target_key, None, now_ms());
+                                    let _ = app_handle.emit(
+                                        EVT_CORRECTION_APPLIED,
+                                        CorrectionAppliedEvent {
+                                            typed: ps.typed.clone(),
+                                            target: ps.target.clone(),
+                                            undo: false,
+                                        },
+                                    );
+                                    // Arm the 6s Esc-undo (revert only). Carry the
+                                    // punct (QA-17) so the revert restores the quotes.
+                                    last_correction = Some(LastCorrection {
+                                        after_len: ps.outer_trail_len + 1,
+                                        typed: ps.typed,
+                                        target: ps.target,
+                                        boundary: ps.boundary,
+                                        lead: ps.lead,
+                                        trail: ps.trail,
+                                        fired_at_ms: now_ms(),
+                                        span_edit: ps.span_edit,
+                                    });
+                                }
+                                InjectRequest::Revert(lc) => {
+                                    if !injected {
+                                        let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                                        continue;
+                                    }
+                                    funnel.corrections_undone += 1;
+                                    if lc.span_edit.is_some() {
+                                        bubbles.drift.note_undone();
+                                    } else {
+                                        record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Undone, &lc.typed, &lc.target, now_ms());
+                                    }
+                                    tracing::info!("CORRECTION_UNDONE after_len={}", lc.after_len);
+                                    // The bubble shows the revert direction.
+                                    let _ = app_handle.emit(
+                                        EVT_CORRECTION_APPLIED,
+                                        CorrectionAppliedEvent {
+                                            typed: lc.target.clone(),
+                                            target: lc.typed.clone(),
+                                            undo: true,
+                                        },
+                                    );
+                                }
+                            }
+                            // The tap's echo of our injection is dropped, so the
+                            // engine never sees the text change — reset the line.
+                            tokenizer.reset_line();
+                            line_buf.clear();
+                            line_dwells.clear();
+                            caret = 0;
+                            anchors.clear();
+                            let _ = app_handle.emit(EVT_LINE_RESET, ());
+                            let snap = anchors.snapshot();
+                            let _ = app_handle.emit(
+                                EVT_ANCHOR_SNAPSHOT,
+                                anchor_emit_payload(&snap, &line_buf),
+                            );
+                        }
                         InputEvent::ShiftTap { .. } => {
                             // M3 bubble ACCEPT — an isolated Shift tap applies the
                             // pending suggestion. This is the ONLY path that
@@ -4556,141 +4716,62 @@ pub fn spawn<R: Runtime>(
                                         ps.target
                                     );
                                     let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
-                                } else if !immediate && !anchored_ok {
+                                } else if !immediate {
+                                    // Anchored accept stays off: it has no length check.
                                     // Stale / beyond-cap / anchored-disabled / model
                                     // mismatch — NEVER inject. A wrong-place edit is
                                     // the one outcome we refuse.
                                     tracing::info!(
-                                        "CORRECTION_ACCEPT_DECLINED typed={:?} after_len={} word_end={} caret={} anchored_enabled={}",
+                                        "CORRECTION_ACCEPT_DECLINED typed={:?} after_len={} word_end={} caret={} anchored_eligible={}",
                                         ps.typed,
                                         after_len,
                                         ps.word_end,
                                         caret,
-                                        ANCHORED_ACCEPT_ENABLED
+                                        anchored_ok
                                     );
                                     let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
                                 } else {
-                                    // Capture the delete_count we actually emit so the
-                                    // CORRECTION_APPLIED line can show it (Principle #7:
-                                    // an over-delete must be VISIBLE in the funnel, never
-                                    // inferred). The immediate path's `+ 1` boundary char
-                                    // is the suspect in contenteditable hosts (Google Docs
-                                    // welded `and·perseverence` → `andperseverance`); the
-                                    // root cause is its own — see
-                                    // docs/qa-15-contenteditable-boundary-overdelete.md.
-                                    // Logging delete_count beside `typed` + `boundary`
-                                    // makes a leading/trailing boundary over-delete
-                                    // self-evident without re-deriving it by hand.
-                                    // Assigned unconditionally in both accept arms below
-                                    // before the CORRECTION_APPLIED read — no seed value.
-                                    let delete_count_emitted: u32;
-                                    let applied = if immediate {
-                                        // Immediate accept — caret at rest just past the
-                                        // word (+ any trailing punct). Proven no-arrow
-                                        // path: delete word + closing punct + boundary,
-                                        // retype the punctuation re-wrapped around target
-                                        // (QA-17). Reduces to word+boundary / target+
-                                        // boundary when there is no surrounding punct.
-                                        let (delete_count, replacement) =
-                                            immediate_accept_injection(&ps);
-                                        delete_count_emitted = delete_count;
-                                        let echo_len =
-                                            delete_count + replacement.chars().count() as u32;
-                                        if send_inject_correction(
-                                            &mut sidecar_child,
+                                    // Ask the sidecar to check the word's on-screen
+                                    // length and inject only if it can be trusted. A
+                                    // host rewrite sends no keystroke, so our delete
+                                    // count alone is not enough (`Nt think`). Nothing
+                                    // is counted as taken until it answers.
+                                    let (delete_count, replacement) =
+                                        immediate_accept_injection(&ps);
+                                    let replacement_len = replacement.chars().count() as u32;
+                                    let len_change = match &ps.span_edit {
+                                        // `t think·` replaces ` tthink·`: the right word
+                                        // changes by one less than the whole edit.
+                                        Some(_) => replacement_len as isize - delete_count as isize - 1,
+                                        None => ps.target.chars().count() as isize
+                                            - ps.typed.chars().count() as isize,
+                                    };
+                                    let (expected_len, alternate_len) = segment_lengths(
+                                        &line_buf,
+                                        ps.word_end.saturating_sub(ps.word_len),
+                                        ps.word_end,
+                                        ps.outer_trail_len,
+                                        len_change,
+                                    );
+                                    next_inject_id = next_inject_id.wrapping_add(1);
+                                    if send_command(
+                                        &mut sidecar_child,
+                                        &OutboundCommand::InjectChecked {
+                                            id: next_inject_id,
                                             delete_count,
                                             replacement,
-                                        ) {
-                                            pending_echo += echo_len;
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        // Anchored accept — the caret moved on. Reached
-                                        // only when anchored_ok verified the word is
-                                        // still at the anchored position. Positional
-                                        // replace: Left × after_len (to just after the
-                                        // word), Backspace × word_len, type target (no
-                                        // boundary), Right × after_len (restore caret).
-                                        let left = after_len as u32;
-                                        let delete_count = ps.word_len as u32;
-                                        delete_count_emitted = delete_count;
-                                        let right = after_len as u32;
-                                        let echo_len = left
-                                            + delete_count
-                                            + ps.target.chars().count() as u32
-                                            + right;
-                                        if send_inject_anchored(
-                                            &mut sidecar_child,
-                                            left,
-                                            delete_count,
-                                            ps.target.clone(),
-                                            right,
-                                        ) {
-                                            pending_echo += echo_len;
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    };
-                                    if applied {
-                                        funnel.corrections_applied += 1;
-                                        tally.add_accepted();
+                                            expected_len,
+                                            alternate_len,
+                                        },
+                                    ) {
+                                        accept_ledger.note_requested();
                                         accepted_ok = true;
-                                        if is_drift {
-                                            bubbles.drift.note_taken();
-                                        } else {
-                                            record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Accepted, &ended_slot.1, &ended_slot.2, now_ms());
-                                        }
-                                        bubbles.diary.record(DiaryOutcome::Taken, &ended_slot.1, &ended_slot.2, None, now_ms());
-                                        tracing::info!(
-                                            "CORRECTION_APPLIED typed={:?} target={:?} delete_count={} boundary={:?} after_len={}",
-                                            ps.typed,
-                                            ps.target,
-                                            delete_count_emitted,
-                                            ps.boundary,
-                                            after_len
-                                        );
-                                        let _ = app_handle.emit(
-                                            EVT_CORRECTION_APPLIED,
-                                            CorrectionAppliedEvent {
-                                                typed: ps.typed.clone(),
-                                                target: ps.target.clone(),
-                                                undo: false,
-                                            },
-                                        );
-                                        // Arm the 6s Esc-undo (revert only). Carry the
-                                        // punct (QA-17) + immediate flag so the revert
-                                        // mirrors the accept and restores the quotes.
-                                        last_correction = Some(LastCorrection {
-                                            typed: ps.typed,
-                                            target: ps.target,
-                                            boundary: ps.boundary,
-                                            lead: ps.lead,
-                                            trail: ps.trail,
-                                            immediate,
-                                            after_len,
-                                            fired_at_ms: now_ms(),
-                                            span_edit: ps.span_edit,
+                                        in_flight = Some(InFlight {
+                                            id: next_inject_id,
+                                            replacement_len,
+                                            sent_at_ms: now_ms(),
+                                            request: InjectRequest::Accept(ps),
                                         });
-                                        // The tap suppresses the injection echo, so the
-                                        // engine never sees the text change — reset the
-                                        // line to mirror the corrected state. The reset
-                                        // re-bases the coordinate system; the anchored
-                                        // accept uses RELATIVE distances (after_len), so
-                                        // future accepts stay correct from the new base.
-                                        tokenizer.reset_line();
-                                        line_buf.clear();
-                                        line_dwells.clear();
-                                        caret = 0;
-                                        anchors.clear();
-                                        let _ = app_handle.emit(EVT_LINE_RESET, ());
-                                        let snap = anchors.snapshot();
-                                        let _ = app_handle.emit(
-                                            EVT_ANCHOR_SNAPSHOT,
-                                            anchor_emit_payload(&snap, &line_buf),
-                                        );
                                     }
                                 }
                                 // ACCEPTED counts only a successful injection. An
@@ -4874,6 +4955,7 @@ pub fn spawn<R: Runtime>(
                                     funnel.dump();
                                     bubbles.diary.dump();
                                     bubbles.drift.dump(pending_suggestion.is_some());
+                                    accept_ledger.dump(in_flight.is_some());
                                     dump_classifications(&word_patterns, &motor_map);
                                     funnel.reset(now_ms());
                                     continue;
@@ -4900,94 +4982,29 @@ pub fn spawn<R: Runtime>(
                                     && !modifiers.command
                                     && !modifiers.control;
                                 if !expired && is_escape {
-                                    // Revert, mirroring the accept. `last_correction`
-                                    // disarms on any non-Esc key, so the caret is
-                                    // exactly where the accept left it.
-                                    let reverted = if lc.immediate {
-                                        // Immediate accept → caret at rest: delete the
-                                        // injected target (+ re-wrapped punct + boundary),
-                                        // retype the original word with its punctuation
-                                        // (QA-17). Exact inverse of the accept geometry.
-                                        let (delete_count, replacement) =
-                                            immediate_revert_injection(&lc);
-                                        let echo_len =
-                                            delete_count + replacement.chars().count() as u32;
-                                        if send_inject_correction(
-                                            &mut sidecar_child,
+                                    // Revert, mirroring the accept — checked too: if the
+                                    // caret is no longer where our fix left it, nothing is
+                                    // deleted. Outcomes are recorded when it answers.
+                                    let (delete_count, replacement) =
+                                        immediate_revert_injection(&lc);
+                                    let replacement_len = replacement.chars().count() as u32;
+                                    next_inject_id = next_inject_id.wrapping_add(1);
+                                    if send_command(
+                                        &mut sidecar_child,
+                                        &OutboundCommand::InjectRevert {
+                                            id: next_inject_id,
                                             delete_count,
                                             replacement,
-                                        ) {
-                                            pending_echo += echo_len;
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        // Anchored accept → caret moved on: anchored
-                                        // revert. Left × after_len, Backspace ×
-                                        // target_len, type typed (no boundary), Right
-                                        // × after_len. (Gated off; QA-17 punct re-wrap
-                                        // not threaded here — see ANCHORED_ACCEPT_ENABLED.)
-                                        let target_len = lc.target.chars().count() as u32;
-                                        let left = lc.after_len as u32;
-                                        let right = lc.after_len as u32;
-                                        let echo_len = left
-                                            + target_len
-                                            + lc.typed.chars().count() as u32
-                                            + right;
-                                        if send_inject_anchored(
-                                            &mut sidecar_child,
-                                            left,
-                                            target_len,
-                                            lc.typed.clone(),
-                                            right,
-                                        ) {
-                                            pending_echo += echo_len;
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    };
-                                    if reverted {
-                                        funnel.corrections_undone += 1;
-                                        if lc.span_edit.is_some() {
-                                            bubbles.drift.note_undone();
-                                        } else {
-                                            record_pattern_outcome(&mut word_patterns, &mut funnel, OutcomeEvent::Undone, &lc.typed, &lc.target, now_ms());
-                                        }
-                                        tracing::info!(
-                                            "CORRECTION_UNDONE typed={:?} target={:?} after_len={}",
-                                            lc.typed,
-                                            lc.target,
-                                            lc.after_len
-                                        );
-                                        // The bubble shows the revert direction.
-                                        let _ = app_handle.emit(
-                                            EVT_CORRECTION_APPLIED,
-                                            CorrectionAppliedEvent {
-                                                typed: lc.target.clone(),
-                                                target: lc.typed.clone(),
-                                                undo: true,
-                                            },
-                                        );
+                                        },
+                                    ) {
+                                        accept_ledger.note_requested();
+                                        in_flight = Some(InFlight {
+                                            id: next_inject_id,
+                                            replacement_len,
+                                            sent_at_ms: now_ms(),
+                                            request: InjectRequest::Revert(lc),
+                                        });
                                     }
-                                    // Esc does ONE predictable thing: revert. It no
-                                    // longer teach-stops the pattern — backing off a
-                                    // pattern comes from the user IGNORING the
-                                    // suggestion (not accepting), not from undo.
-                                    // The revert's echo is suppressed too; reset
-                                    // the line to mirror the restored text.
-                                    tokenizer.reset_line();
-                                    line_buf.clear();
-                                    line_dwells.clear();
-                                    caret = 0;
-                                    anchors.clear();
-                                    let _ = app_handle.emit(EVT_LINE_RESET, ());
-                                    let snap = anchors.snapshot();
-                                    let _ = app_handle.emit(
-                                        EVT_ANCHOR_SNAPSHOT,
-                                        anchor_emit_payload(&snap, &line_buf),
-                                    );
                                     continue;
                                 }
                                 // Not an undo — implicit accept. `lc` is dropped
@@ -5303,6 +5320,32 @@ pub fn spawn<R: Runtime>(
                                                             && suggestion.as_ref().is_some_and(|(t, g)| {
                                                                 correction_engine::is_host_redundant(t, g, lexicon)
                                                             });
+                                                        // TF-08b weld-risk: a LENGTH-CHANGING correction
+                                                        // (len(typed) != len(target)) — doubling/omission,
+                                                        // the exact set that welds when a web autocorrect
+                                                        // shrinks the word before accept. Same-length slips
+                                                        // (coordination + adjacent-key precision) are never
+                                                        // at risk. Content-free (a char-count delta).
+                                                        let weld_risk = suggestion
+                                                            .as_ref()
+                                                            .is_some_and(|(t, g)| {
+                                                                t.chars().count() != g.chars().count()
+                                                            });
+                                                        // TF-08b: withhold iff web host AND length-changing
+                                                        // AND the toggle is on. `&&` short-circuits, so the
+                                                        // config file is read ONLY on a would-weld (rare) —
+                                                        // never per keystroke. The toggle lives engine-side
+                                                        // (authoritative data dir); the sidecar reports only
+                                                        // the raw web-host fact.
+                                                        let weld_suppress =
+                                                            web_host == Some(true) && weld_risk && weld_suppress_enabled();
+                                                        // TF-08: withhold ALL fixes in the Intel+Safari dead
+                                                        // zone (not gated on weld_risk — the whole surface
+                                                        // can't take an injection). Toggle read engine-side,
+                                                        // short-circuited so the file is touched only in the
+                                                        // dead zone (rare), never per keystroke.
+                                                        let dead_zone_suppress =
+                                                            injection_dead_zone && dead_zone_suppress_enabled();
                                                         // FIRE_TIMING t1 — the fire decision is resolved (Some/None).
                                                         t1 = now_ms();
                                                         // The master gate turns a suggestion into a live bubble. Log the
@@ -5310,17 +5353,44 @@ pub fn spawn<R: Runtime>(
                                                         // `competitor_deferred` is a content-free verdict bool
                                                         // (Principle #8): it never names the app or the reason's source.
                                                         tracing::info!(
-                                                            "FIRE_DECISION word={:?} gate_on={} suggestion={:?} apostrophe_suppressed={} competitor_deferred={} t1={} t1_minus_t0_ms={}",
+                                                            "FIRE_DECISION word={:?} gate_on={} suggestion={:?} apostrophe_suppressed={} competitor_deferred={} dead_zone={} dead_zone_suppress={} web_host={} weld_risk={} weld_suppress={} t1={} t1_minus_t0_ms={}",
                                                             tok.core,
                                                             allow_list.correction_enabled,
                                                             suggestion.as_ref().map(|(t, g)| format!("{t}->{g}")),
                                                             apostrophe_suppressed,
                                                             competitor_deferred,
+                                                            injection_dead_zone,
+                                                            dead_zone_suppress,
+                                                            web_host == Some(true),
+                                                            weld_risk,
+                                                            weld_suppress,
                                                             t1,
                                                             t1.saturating_sub(t_recv),
                                                         );
                                                         if allow_list.correction_enabled {
-                                                            if competitor_deferred {
+                                                            if dead_zone_suppress {
+                                                                // TF-08 dead zone (Safari-web/Intel
+                                                                // phantom caret): a synthetic fix can't
+                                                                // land, so WATCH-ONLY — withhold the bubble
+                                                                // entirely (silent, no cue) while the
+                                                                // observation/learning below runs as normal.
+                                                                // Supersedes the competitor deferral (we
+                                                                // inject nothing, so nothing double-corrects).
+                                                                // A deliberate, counted drop (Principle #7);
+                                                                // `fire` stays None.
+                                                                funnel.dead_zone_suppressed += 1;
+                                                            } else if weld_suppress {
+                                                                // TF-08b: a length-changing correction in a
+                                                                // web host would weld (the host shrinks the
+                                                                // word before accept; Jordan's dead-reckoned
+                                                                // delete over-runs). WITHHOLD — cede this one
+                                                                // word to the host. Silent, no bubble. A
+                                                                // deliberate, counted drop (Principle #7);
+                                                                // `fire` stays None. Only length-changing
+                                                                // slips in web hosts land here — same-length
+                                                                // and native fire below unchanged.
+                                                                funnel.weld_suppressed += 1;
+                                                            } else if competitor_deferred {
                                                                 // A live bubble withheld to avoid
                                                                 // double-correcting the host — a deliberate,
                                                                 // counted drop (Principle #7). `fire` stays
@@ -5599,6 +5669,8 @@ pub fn spawn<R: Runtime>(
                         &mut sidecar_child,
                         &mut respawn_attempts,
                     ) {
+                        // A new sidecar has not reported its surface yet.
+                        web_host = None;
                         // Reset heartbeat clock so the watchdog
                         // doesn't immediately fire on staleness while
                         // the new sidecar is booting.
@@ -5698,6 +5770,8 @@ pub fn spawn<R: Runtime>(
                                         &mut sidecar_child,
                                         &mut respawn_attempts,
                                     ) {
+                                        // A new sidecar has not reported its surface yet.
+                                        web_host = None;
                                         last_heartbeat_at = Some(Instant::now());
                                     }
                                 }
@@ -6056,6 +6130,25 @@ pub fn spawn<R: Runtime>(
                     // deferral at the window edge; this keeps the counter honest.
                     competitor_sense.decay(now_ms());
 
+                    // An injection the sidecar never answered: count it, never
+                    // assume it landed.
+                    if let Some(f) = in_flight.take_if(|f| {
+                        now_ms().saturating_sub(f.sent_at_ms) > INJECT_RESULT_TIMEOUT_MS
+                    }) {
+                        accept_ledger.note_result(InjectStatus::Aborted, Some("no_result"));
+                        tracing::warn!("INJECT_NO_RESULT id={}", f.id);
+                        if let InjectRequest::Accept(ps) = f.request {
+                            let _ = app_handle.emit(EVT_CORRECTION_DISMISSED, ());
+                            bubbles.end_unaccepted_bubble(
+                                ps.word_end.saturating_sub(ps.word_len),
+                                &bubble_key(&ps.typed),
+                                &bubble_key(&ps.target),
+                                ps.span_edit.is_some(),
+                                now_ms(),
+                            );
+                        }
+                    }
+
                     // Idle line-buffer reset (desync recovery). tick_resolver
                     // above already fired any due Kept/Abandoned verdicts on
                     // this line, so clearing now drops only a stale, fully-
@@ -6164,6 +6257,7 @@ pub fn spawn<R: Runtime>(
                         funnel.dump();
                         bubbles.diary.dump();
                                     bubbles.drift.dump(pending_suggestion.is_some());
+                                    accept_ledger.dump(in_flight.is_some());
                         // Read-only kill-switch observability (no injection).
                         dump_classifications(&word_patterns, &motor_map);
                         // Observe-only guesser accuracy readout (no injection).
@@ -6222,6 +6316,8 @@ pub fn spawn<R: Runtime>(
                             &mut sidecar_child,
                             &mut respawn_attempts,
                         ) {
+                            // A new sidecar has not reported its surface yet.
+                            web_host = None;
                             last_heartbeat_at = Some(Instant::now());
                         }
                     }
@@ -6535,7 +6631,6 @@ mod tests {
             boundary: ps.boundary,
             lead: ps.lead.clone(),
             trail: ps.trail.clone(),
-            immediate: true,
             after_len: ps.outer_trail_len + 1,
             fired_at_ms: 0,
             span_edit: ps.span_edit.clone(),
@@ -6740,6 +6835,25 @@ mod tests {
     }
 
     #[test]
+    fn no_delete_leaves_the_engine_unchecked() {
+        // Source-level lock: accept and revert go through the checked commands, and
+        // outcomes are recorded only in the sidecar's answer.
+        let src = include_str!("engine.rs");
+        let live = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(live.contains("&OutboundCommand::InjectChecked {"));
+        assert!(live.contains("&OutboundCommand::InjectRevert {"));
+        assert!(!live.contains("OutboundCommand::InjectCorrection"));
+        assert!(!live.contains("OutboundCommand::InjectAnchored"));
+        let answer = live.find("InputEvent::InjectResult {").expect("answer handled");
+        let ask = live.find("InputEvent::ShiftTap { .. } => {").unwrap();
+        for record in ["bubbles.drift.note_taken()", "DiaryOutcome::Taken", "bubbles.drift.note_undone()"] {
+            let at = live.find(record).unwrap();
+            assert!(answer < at && at < ask, "{record} must wait for the sidecar's answer");
+        }
+        assert!(live.contains("web_host = surface_after(web_host, &parsed);"));
+    }
+
+    #[test]
     fn early_drift_outcomes_are_wired_at_every_join_and_skip_the_pattern_store() {
         // Source-level join lock (like `consent_lock.rs`): the live loop is not
         // unit-drivable, so assert each outcome site is wired to the drift ledger and
@@ -6774,8 +6888,8 @@ mod tests {
         // No pattern-store write for the pair on the shown/accepted/undone paths.
         for (guard, store_call) in [
             ("if ps.span_edit.is_some() {\n                                                            bubbles.drift.note_offered();\n                                                        } else {", "OutcomeEvent::Shown"),
-            ("if is_drift {\n                                            bubbles.drift.note_taken();\n                                        } else {", "OutcomeEvent::Accepted"),
-            ("if lc.span_edit.is_some() {\n                                            bubbles.drift.note_undone();\n                                        } else {", "OutcomeEvent::Undone"),
+            ("if is_drift {\n                                        bubbles.drift.note_taken();\n                                    } else {", "OutcomeEvent::Accepted"),
+            ("if lc.span_edit.is_some() {\n                                        bubbles.drift.note_undone();\n                                    } else {", "OutcomeEvent::Undone"),
         ] {
             let at = live.find(guard).unwrap_or_else(|| panic!("guard for {store_call} missing"));
             assert!(live[at..at + 600].contains(store_call), "{store_call} must sit on the else branch");

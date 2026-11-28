@@ -1,3 +1,4 @@
+import AppKit
 import Carbon
 import CoreGraphics
 import Foundation
@@ -38,6 +39,47 @@ final class EventTap {
     private let logGateReads =
         ProcessInfo.processInfo.environment["TYPEASSIST_LOG_GATE"] == "1"
 
+    /// Verifies the word's on-screen length before any delete (see AcceptGuard).
+    private let acceptGuard = AcceptGuard(
+        readCaret: {
+            Accessibility.primeAXConnection()
+            guard let front = NSWorkspace.shared.frontmostApplication else { return nil }
+            return AcceptGuard.caret(ofApp: front.processIdentifier)
+        },
+        secondsSinceKeyDown: {
+            CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
+        })
+
+    /// Space / Return / keypad Enter / Tab — a new word starts after these.
+    private static let whitespaceKeycodes: Set<Int64> = [49, 36, 76, 48]
+    /// Home / PageUp / End / PageDown / arrows — the caret moves.
+    private static let caretKeycodes: Set<Int64> = [115, 116, 119, 121, 123, 124, 125, 126]
+
+    /// App switch / focus change (reported by SecureFieldMonitor).
+    func caretRelocated() { acceptGuard.caretRelocated() }
+
+    /// Run one checked injection and report what happened. The result is emitted
+    /// BEFORE the keys are posted, so the engine is ready for their echo.
+    private func perform(
+        id: UInt32, replacement: String, requested: Int,
+        check: () -> AcceptGuard.Decision
+    ) {
+        // Web fields vend unreliable caret positions and the check is only proven
+        // on native ones: they keep the unchecked behaviour, reported as such.
+        let decision: AcceptGuard.Decision
+        let isWeb = Accessibility.webHostDetail().isWeb
+        decision = isWeb ? .inject(delete: requested, adjusted: false) : check()
+        switch decision {
+        case .abort(let reason):
+            bridge.emit(.injectResult(id: id, status: "aborted", deleted: 0, reason: reason))
+        case .inject(let delete, let adjusted):
+            let status = isWeb ? "unverified" : (adjusted ? "adjusted" : "applied")
+            bridge.emit(.injectResult(id: id, status: status, deleted: delete, reason: nil))
+            acceptGuard.willInject(delete: delete, replacement: replacement)
+            Accessibility.injectCorrection(deleteCount: delete, replacement: replacement)
+        }
+    }
+
     init(bridge: Bridge, secureMonitor: SecureFieldMonitor) {
         self.bridge = bridge
         self.secureMonitor = secureMonitor
@@ -77,8 +119,14 @@ final class EventTap {
 
     func handleCommand(_ command: OutboundCommand) {
         switch command {
-        case .injectCorrection(let deleteCount, let replacement):
-            Accessibility.injectCorrection(deleteCount: deleteCount, replacement: replacement)
+        case .injectChecked(let id, let delete, let replacement, let expected, let alternate):
+            perform(id: id, replacement: replacement, requested: delete) {
+                acceptGuard.checkAccept(delete: delete, expected: expected, alternate: alternate)
+            }
+        case .injectRevert(let id, let delete, let replacement):
+            perform(id: id, replacement: replacement, requested: delete) {
+                acceptGuard.checkRevert(delete: delete)
+            }
         case .injectAnchored(let left, let deleteCount, let replacement, let right):
             Accessibility.injectAnchored(
                 left: left, deleteCount: deleteCount, replacement: replacement, right: right)
@@ -159,6 +207,7 @@ final class EventTap {
         switch type {
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             shiftArmed = false // a click cancels an in-progress isolated-Shift tap
+            acceptGuard.caretRelocated()
             bridge.emit(.caretMoved(reason: "mouse"))
             return
         case .flagsChanged:
@@ -175,6 +224,14 @@ final class EventTap {
         // keystroke cancels it too (and no .shiftTap fires mid-password).
         if type == .keyDown {
             shiftArmed = false
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            let shortcut = !event.flags.intersection([.maskCommand, .maskControl]).isEmpty
+            if shortcut || Self.caretKeycodes.contains(code) {
+                acceptGuard.caretRelocated()
+            } else if code != 53 { // Escape moves nothing
+                // Keycode only: no character is read ahead of the secure gate.
+                acceptGuard.keyDown(isSpace: Self.whitespaceKeycodes.contains(code))
+            }
         }
 
         // NOTE: our own injection echo is dropped on the ENGINE side by an exact

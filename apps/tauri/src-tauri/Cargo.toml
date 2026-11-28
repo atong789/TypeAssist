@@ -54,7 +54,7 @@ correction-engine = { path = "../../../crates/correction-engine" }
 libc = "0.2"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSNotification", "NSString", "NSArray", "NSOperation", "NSGeometry", "NSRange"] }
-objc2-app-kit = { version = "0.3", features = ["NSMenu", "NSMenuItem", "NSEvent", "NSApplication", "NSResponder", "NSGraphicsContext", "NSSpellChecker"] }
+objc2-app-kit = { version = "0.3", features = ["NSMenu", "NSMenuItem", "NSEvent", "NSApplication", "NSResponder", "NSGraphicsContext", "NSSpellChecker", "NSScreen", "NSWindow"] }
 block2 = "0.6"
 # Open at Login: `SMAppService.mainApp` (macOS 13+ login-items API) — registers the
 # signed .app itself, shows up in System Settings ▸ General ▸ Login Items, and is

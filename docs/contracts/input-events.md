@@ -55,12 +55,28 @@ Emitted on every **deliberate (non-auto-repeat) space keyDown**, carrying the ad
 { "type": "space_observed", "total": 42 }
 ```
 
+### `injection_zone`
+
+**TF-08 host-scoped suppression.** Reports whether the focused field is a place a synthetic delete+retype correction **cannot** land. The confirmed case is a Safari web/contenteditable surface on **Intel (x86_64)**, whose AX caret is a pinned phantom (`loc=1`, no tracking — TF-08 probe), so blind dead-reckoned injection garbles or no-ops. In the dead zone the core goes **watch-only**: it keeps observing/learning slips but withholds the bubble entirely (no cue), rather than fire a "worse autocorrect" (Principle #9). Derived in the adapter from arch + frontmost bundle (Safari) + focused role (`AXTextArea`) — a structural gate that cannot fire on Chrome (different bundle), native apps (different app/field), or Apple Silicon (different arch). `dead` is the **raw** structural fact; the core applies the `suppress` toggle (read core-side from `~/.typeassist/inject_config`, default on). A **level** signal, re-evaluated on the adapter heartbeat and emitted only when it flips. Content-free (Principle #8): a single bool, never the app id, field role, or arch.
+
+```json
+{ "type": "injection_zone", "dead": true }
+```
+
 ### `web_host`
 
-**TF-08b weld suppression.** Reports whether the focused field lives inside a web/contenteditable host — an `AXWebArea` ancestor **or** (fallback) the frontmost app is a browser. The AXWebArea walk covers normal contenteditable (Gmail) and Electron; the browser-bundle fallback rescues **Google Docs**, whose canvas editor keeps an offscreen input target with a degraded AX subtree that the walk can't reach. In such a host a competing **web** autocorrect can shrink a word a beat before the user's accept, so the core's dead-reckoned delete over-deletes into the previous word (the weld). The core pairs this with a length-delta test (`len(typed) != len(target)`) and **withholds only length-changing corrections in web hosts**, ceding that word to the host. `web` is the **raw** fact; the core applies the `weld_suppress` toggle (read engine-side from `~/.typeassist/inject_config`, default off). A **level** signal, re-evaluated on the adapter heartbeat and emitted only when it flips. Content-free (Principle #8): a single bool, never the app id or field role.
+**TF-08b weld suppression.** Reports whether the focused field lives inside a web/contenteditable host — an `AXWebArea` ancestor **or** (fallback) the frontmost app is a browser. The AXWebArea walk covers normal contenteditable (Gmail) and Electron; the browser-bundle fallback rescues **Google Docs**, whose canvas editor keeps an offscreen input target with a degraded AX subtree that the walk can't reach. In such a host a competing **web** autocorrect can shrink a word a beat before the user's accept, so the core's dead-reckoned delete over-deletes into the previous word (the weld). The core pairs this with a length-delta test (`len(typed) != len(target)`) and **withholds only length-changing corrections in web hosts**, ceding that word to the host. `web` is the **raw** fact; the core applies the `weld_suppress` toggle (read engine-side from `~/.typeassist/inject_config`, default on). A **level** signal, re-evaluated on the adapter heartbeat and emitted only when it flips. Content-free (Principle #8): a single bool, never the app id or field role.
 
 ```json
 { "type": "web_host", "web": true }
+```
+
+### `inject_result`
+
+The answer to `inject_checked` / `inject_revert`, sent **before** any key is posted. `status` is `applied`, `adjusted` (delete count moved to match a host rewrite), `unverified` (web field) or `aborted` (`reason` says why: `no_baseline`, `caret_unreadable`, `field_changed`, `selection`, `length_changed`). Content-free. The core counts nothing as accepted until this arrives.
+
+```json
+{ "type": "inject_result", "id": 1, "status": "adjusted", "deleted": 6 }
 ```
 
 ### `shift_tap`
@@ -105,13 +121,23 @@ Emitted just before the sidecar exits cleanly.
 
 ## Core → sidecar (commands)
 
-### `inject_correction`
+### `inject_checked`
 
-Replace the just-typed word: delete `delete_count` characters from the focused field, then type `replacement`. `replacement` includes the trailing word-boundary character (e.g. the space), so the adapter does no word logic of its own — the core decides exactly what to remove and what to type. Implementation is sidecar-specific (on macOS: synthesized backspaces + layout-independent Unicode keystrokes).
+Replace the just-typed word **only if its on-screen length checks out**. The sidecar measures the characters from the word's start (after the last whitespace) to the caret. `expected_len` = the field still holds what was typed: delete `delete_count`. `alternate_len` = the host already rewrote it to the target: delete `delete_count + alternate_len - expected_len`. Anything else, an unreadable caret, a changed field, a selection or no baseline: inject nothing. `replacement` includes the trailing boundary character. Web fields are injected unchecked and reported `unverified`.
 
 ```json
-{ "type": "inject_correction", "delete_count": 4, "replacement": "the " }
+{ "type": "inject_checked", "id": 1, "delete_count": 7, "replacement": "think ", "expected_len": 7, "alternate_len": 6 }
 ```
+
+### `inject_revert`
+
+Revert the last injection, only if the caret is still where it left it.
+
+```json
+{ "type": "inject_revert", "id": 2, "delete_count": 6, "replacement": "tthink " }
+```
+
+Both are answered with an [`inject_result`](#inject_result) event.
 
 ### `shutdown`
 

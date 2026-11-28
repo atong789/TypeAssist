@@ -115,6 +115,50 @@ enum Accessibility {
         up.post(tap: .cgSessionEventTap)
     }
 
+    // MARK: - TF-08 host-scoped suppression (injection dead-zone gate)
+    //
+    // TF-08 established that a synthetic delete+retype correction cannot land in a
+    // Safari web/contenteditable surface on Intel: its AX caret is a pinned phantom
+    // (`loc=1`, writes hit a ghost AXTextArea — probe TF-08), so injection garbles
+    // or no-ops. Neither HID-tap nor pacing fixed placement (both tried and
+    // rejected). The fix is host-scoped suppression: in that confirmed dead zone
+    // the engine goes WATCH-ONLY (keeps learning, withholds the bubble).
+    //
+    // The condition is derived, NOT hardcoded-behaviour-in-the-engine: the sidecar
+    // (the only place OS/AX calls live) reads arch + frontmost bundle + focused
+    // role and reports a single content-free bool. It is deliberately a STRUCTURAL
+    // gate, not a runtime caret-trust signal, because caret-untrustworthiness does
+    // NOT predict injection failure — Chrome-web likely vends an equally poor AX
+    // caret yet its keystroke injection WORKS, so a pure caret signal would
+    // wrongly suppress Chrome. Gating on arch+app+field is the only signal that
+    // structurally cannot fire outside the confirmed dead zone (Chrome = different
+    // bundle; native = different app/field; Apple Silicon = different arch).
+
+    /// True when the focused field is the confirmed injection dead zone:
+    /// **Intel (x86_64) + Safari frontmost + focused role `AXTextArea`** (the
+    /// web/contenteditable surface that vends the phantom caret — Docs / Gmail /
+    /// WhatsApp Web all match). Raw structural fact — the `suppress` toggle is
+    /// applied ENGINE-side (a faceless L1 adapter must not depend on reading the
+    /// user's config dir; that mismatch was the TF-08b `emit=false` bug). Content-
+    /// blind: reads the frontmost bundle id (ephemeral, never persisted — Principle
+    /// #8) and the focused element's ROLE only, never its text. On Apple Silicon the
+    /// `#if` compiles this to `false`, so the arm64 slice can never suppress.
+    static func isInjectionDeadZone() -> Bool {
+        #if arch(x86_64)
+        primeAXConnection()
+        guard let front = NSWorkspace.shared.frontmostApplication,
+              front.bundleIdentifier == "com.apple.Safari" else { return false }
+        let appEl = AXUIElementCreateApplication(front.processIdentifier)
+        guard let f = copyAttr(appEl, kAXFocusedUIElementAttribute as String),
+              CFGetTypeID(f) == AXUIElementGetTypeID() else { return false }
+        let focused = f as! AXUIElement
+        let role = (copyAttr(focused, kAXRoleAttribute as String) as? String) ?? ""
+        return role == "AXTextArea"
+        #else
+        return false
+        #endif
+    }
+
     // MARK: - TF-08b web-host detection (weld suppression gate)
     //
     // In a web/contenteditable host (Google Docs/Gmail in any browser, on any

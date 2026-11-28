@@ -83,24 +83,69 @@ pub enum InputEvent {
     /// Content-free (Principle #8/#9): a count, never the character, its timing,
     /// or the focused app.
     SpaceObserved { total: u64 },
+    /// **Injection dead-zone signal (TF-08, host-scoped suppression).** The L1
+    /// adapter reports whether the currently focused field is a place a synthetic
+    /// delete+retype correction CANNOT land. The confirmed case is a Safari
+    /// web/contenteditable surface on Intel (x86_64), whose AX caret is a pinned
+    /// phantom (`loc=1`, no tracking — TF-08 probe), so blind dead-reckoned
+    /// injection garbles or no-ops. In the dead zone the engine goes WATCH-ONLY:
+    /// it keeps observing/learning slips but withholds the bubble entirely (no
+    /// cue) — never a "worse autocorrect" (Principle #9). This supersedes the Watch
+    /// Dog competition there (nothing is injected, so nothing double-corrects).
+    ///
+    /// A **level** signal, re-evaluated on the adapter heartbeat and emitted only
+    /// when it flips. `dead` is the **raw** structural fact (arch + Safari +
+    /// AXTextArea) — the `suppress` toggle is applied engine-side, not by the
+    /// adapter. The pre-signal default is `false`, so nothing changes for native
+    /// fields, Chrome, or Apple Silicon. Content-free (Principle #8): a single
+    /// bool — never the app id, field role, or arch that derived it.
+    InjectionZone { dead: bool },
     /// **Web/contenteditable host signal (TF-08b, weld suppression).** The L1
     /// adapter reports whether the focused field lives inside a web content area
-    /// (an `AXWebArea` ancestor — browser tabs and Electron web views, never a
-    /// native text field). In such a host a competing **web** autocorrect (Google
-    /// Docs/Gmail) can shrink a word a beat before Jordan's accept, so Jordan's
-    /// dead-reckoned delete count over-deletes into the previous word (the weld).
-    /// The engine pairs this with a length-delta test (`len(typed) != len(target)`,
-    /// the exact weld-risk set) to WITHHOLD only length-changing corrections in web
-    /// hosts — ceding that one word to the host. Same-length slips, and every slip
-    /// in native apps, are untouched.
+    /// (an `AXWebArea` ancestor, OR — fallback — the frontmost app is a browser,
+    /// which rescues Google Docs' canvas editor whose degraded AX subtree defeats
+    /// the walk). In such a host a competing **web** autocorrect (Google Docs/Gmail)
+    /// can shrink a word a beat before Jordan's accept, so Jordan's dead-reckoned
+    /// delete count over-deletes into the previous word (the weld). The engine pairs
+    /// this with a length-delta test (`len(typed) != len(target)`, the exact
+    /// weld-risk set) to WITHHOLD only length-changing corrections in web hosts —
+    /// ceding that one word to the host. Same-length slips, and every slip in native
+    /// apps, are untouched.
     ///
-    /// A **level** signal, re-emitted (on the adapter's heartbeat re-eval) only
+    /// A **level** signal, re-evaluated on the adapter heartbeat and emitted only
     /// when it flips. `web` is the **raw** web-host fact — the `weld_suppress`
-    /// toggle is applied engine-side, not by the adapter (a faceless L1 adapter
-    /// must not depend on reading the user's config dir). The pre-signal default is
-    /// `false` (fire as today). Content-free (Principle #8): a single bool, never
-    /// the app id or field role that derived it.
+    /// toggle is applied engine-side, not by the adapter (a faceless L1 adapter must
+    /// not depend on reading the user's config dir). The pre-signal default is
+    /// `false`. Content-free (Principle #8): a single bool, never the app id or
+    /// field role that derived it.
     WebHost { web: bool },
+    /// **Outcome of an injection request** ([`OutboundCommand::InjectChecked`] /
+    /// [`OutboundCommand::InjectRevert`]). Emitted before the adapter posts any
+    /// key. `deleted` is the number of backspaces it is about to post (0 when
+    /// aborted); `reason` is a content-free tag. Nothing counts as accepted
+    /// until this says so.
+    InjectResult {
+        id: u32,
+        status: InjectStatus,
+        deleted: u32,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+}
+
+/// What the adapter did with an injection request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InjectStatus {
+    /// The on-screen length matched; injected as asked.
+    Applied,
+    /// The host had already rewritten the word to the target's length; the
+    /// delete count was moved to match.
+    Adjusted,
+    /// A web field: injected as asked, without the length check.
+    Unverified,
+    /// Nothing was injected.
+    Aborted,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,11 +162,26 @@ pub struct Modifiers {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutboundCommand {
-    /// Replace the just-typed word: delete `delete_count` characters from the
-    /// focused field, then type `replacement`. `replacement` includes the
-    /// trailing word-boundary character (e.g. the space) so the adapter stays
-    /// dumb — it does no word logic of its own.
-    InjectCorrection { delete_count: u32, replacement: String },
+    /// Replace the just-typed word — **only if its on-screen length checks
+    /// out**. `expected_len` is the character count from the word's start (after
+    /// the last whitespace) to the caret if the field still holds what was typed;
+    /// `alternate_len` is the same if the host already rewrote it to the target.
+    /// On `expected_len` the adapter deletes `delete_count`; on `alternate_len`
+    /// it deletes `delete_count + alternate_len - expected_len`; otherwise it
+    /// injects nothing. `replacement` includes the trailing boundary character.
+    InjectChecked {
+        id: u32,
+        delete_count: u32,
+        replacement: String,
+        expected_len: u32,
+        alternate_len: u32,
+    },
+    /// Revert the last injection, only if the caret is still where it left it.
+    InjectRevert {
+        id: u32,
+        delete_count: u32,
+        replacement: String,
+    },
     /// **Anchored replace (M3 bubble, accept-after-typing-on).** Replace a word
     /// the caret has already moved PAST: move the caret left `left` chars (to just
     /// after the word), delete `delete_count` (the word), type `replacement` (the
@@ -268,6 +328,18 @@ mod tests {
         let e = InputEvent::SpaceObserved { total: 42 };
         let json = serde_json::to_string(&e).unwrap();
         assert_eq!(json, r#"{"type":"space_observed","total":42}"#);
+        let back: InputEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn injection_zone_event_round_trips() {
+        // TF-08: L1 reports whether the focused field is an injection dead zone
+        // (host-scoped suppression). snake_case tag + `dead` field must match the
+        // Swift bridge's `injection_zone` encoding.
+        let e = InputEvent::InjectionZone { dead: true };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(json, r#"{"type":"injection_zone","dead":true}"#);
         let back: InputEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
     }

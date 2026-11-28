@@ -76,6 +76,9 @@ final class SecureFieldMonitor {
     /// constant in ApplicationServices on every SDK).
     private static let secureSubrole = "AXSecureTextField"
 
+    /// Told about every app / focus change, for the accept check's baseline.
+    var onCaretRelocated: (() -> Void)?
+
     /// Begin tracking. Must be called on the main thread (the AX observer's
     /// run-loop source and the `NSWorkspace` notification are serviced by the
     /// main run loop, the same loop the `CGEventTap` callback runs on — so the
@@ -110,6 +113,7 @@ final class SecureFieldMonitor {
         // (Fix-B's bias-toward-resetting), but only an `"app"` switch is a true
         // change of corrector regime. Content-free tag — no app identity (#8).
         bridge.emit(.caretMoved(reason: "app"))
+        onCaretRelocated?()
         rebindToFrontmostApp()
     }
 
@@ -197,6 +201,7 @@ final class SecureFieldMonitor {
             // can choose NOT to reset on this churn while Fix-B still resets on
             // both. Content-free tag — no element/app identity (#8).
             bridge.emit(.caretMoved(reason: "focus-element"))
+            onCaretRelocated?()
         }
         reevaluateNow()
         scheduleConfirmation()
@@ -247,9 +252,32 @@ final class SecureFieldMonitor {
             FileHandle.standardError.write(
                 Data("SECURE_FIELD_FOCUS \(secure ? "ENTER" : "LEAVE") tid=\(threadID())\n".utf8))
         }
-        // TF-08b: re-evaluate the web-host signal on the same focus-eval cadence
-        // (focus / app change — never per keystroke). Emitted OUTSIDE the lock.
+        // TF-08 / TF-08b: re-evaluate the injection dead-zone AND web-host signals
+        // on the same focus-eval cadence (focus / app change — never per keystroke),
+        // OUTSIDE the lock. Both are ALSO driven off the heartbeat (main.swift):
+        // Google Docs' canvas editor never fires a focus-element change while typing,
+        // so the notification hook alone leaves either signal stale at its startup
+        // value.
+        updateInjectionZone()
         updateWebHost()
+    }
+
+    /// Last dead-zone value emitted to the engine, so we only send on a FLIP.
+    private var lastInjectionDead: Bool?
+
+    /// TF-08 host-scoped suppression: compute the RAW injection dead-zone fact
+    /// (arch + Safari + AXTextArea; the `suppress` toggle is applied engine-side)
+    /// and emit it to the engine only when it flips. Called on the focus-eval hook
+    /// AND the heartbeat (main.swift) — Docs' static canvas focus means the
+    /// notification hook alone can leave it stale. Content-free — a single bool
+    /// crosses the wire, never the app/field that derived it (Principle #8).
+    func updateInjectionZone() {
+        let dead = Accessibility.isInjectionDeadZone()
+        guard lastInjectionDead != dead else { return }
+        lastInjectionDead = dead
+        FileHandle.standardError.write(
+            Data("INJECTION_ZONE_EMIT dead=\(dead) tid=\(threadID())\n".utf8))
+        bridge.emit(.injectionZone(dead: dead))
     }
 
     /// Last DETAIL string and last EMITTED bit, tracked separately so the
