@@ -71,6 +71,14 @@ Emitted on every **deliberate (non-auto-repeat) space keyDown**, carrying the ad
 { "type": "web_host", "web": true }
 ```
 
+### `inject_result`
+
+The answer to `inject_checked` / `inject_revert`, sent **before** any key is posted. `status` is `applied`, `adjusted` (delete count moved to match a host rewrite), `unverified` (web field) or `aborted` (`reason` says why: `no_baseline`, `caret_unreadable`, `field_changed`, `selection`, `length_changed`). Content-free. The core counts nothing as accepted until this arrives.
+
+```json
+{ "type": "inject_result", "id": 1, "status": "adjusted", "deleted": 6 }
+```
+
 ### `shift_tap`
 
 An **isolated Shift tap** — Shift pressed and released with no other key in between (either Shift, reachable one-handed). The accept gesture for a pending correction suggestion (the M3 bubble). The adapter derives it from `.flagsChanged` transitions and cancels the in-progress tap on any real key / mouse-down, so a `Shift+key` chord never produces it. Content-free.
@@ -113,13 +121,23 @@ Emitted just before the sidecar exits cleanly.
 
 ## Core → sidecar (commands)
 
-### `inject_correction`
+### `inject_checked`
 
-Replace the just-typed word: delete `delete_count` characters from the focused field, then type `replacement`. `replacement` includes the trailing word-boundary character (e.g. the space), so the adapter does no word logic of its own — the core decides exactly what to remove and what to type. Implementation is sidecar-specific (on macOS: synthesized backspaces + layout-independent Unicode keystrokes).
+Replace the just-typed word **only if its on-screen length checks out**. The sidecar measures the characters from the word's start (after the last whitespace) to the caret. `expected_len` = the field still holds what was typed: delete `delete_count`. `alternate_len` = the host already rewrote it to the target: delete `delete_count + alternate_len - expected_len`. Anything else, an unreadable caret, a changed field, a selection or no baseline: inject nothing. `replacement` includes the trailing boundary character. Web fields are injected unchecked and reported `unverified`.
 
 ```json
-{ "type": "inject_correction", "delete_count": 4, "replacement": "the " }
+{ "type": "inject_checked", "id": 1, "delete_count": 7, "replacement": "think ", "expected_len": 7, "alternate_len": 6 }
 ```
+
+### `inject_revert`
+
+Revert the last injection, only if the caret is still where it left it.
+
+```json
+{ "type": "inject_revert", "id": 2, "delete_count": 6, "replacement": "tthink " }
+```
+
+Both are answered with an [`inject_result`](#inject_result) event.
 
 ### `shutdown`
 

@@ -3,6 +3,7 @@
 //! Hosts the Svelte webview and the engine (Swift sidecar + walking-skeleton
 //! loop). See `engine.rs`.
 
+mod accept_check;
 mod allow_list;
 mod backup;
 mod drift_ledger;

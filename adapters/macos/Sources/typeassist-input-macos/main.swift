@@ -95,6 +95,8 @@ guard tap.start() else {
     exitNeedingPermission()
 }
 
+secureMonitor.onCaretRelocated = { [weak tap] in tap?.caretRelocated() }
+tap.caretRelocated()
 bridge.emit(.ready)
 bridge.runInputLoop(commandHandler: tap.handleCommand(_:))
 

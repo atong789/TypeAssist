@@ -71,10 +71,16 @@ enum InputEvent {
     /// and the length-delta test. Level signal, emitted when it flips (re-evaluated
     /// on the heartbeat). Content-free. See `InputEvent::WebHost`.
     case webHost(web: Bool)
+    /// What happened to an injection request: "applied" | "adjusted" |
+    /// "unverified" | "aborted". Counts and a reason tag only.
+    case injectResult(id: UInt32, status: String, deleted: Int, reason: String?)
 }
 
 enum OutboundCommand {
-    case injectCorrection(deleteCount: Int, replacement: String)
+    /// Replace the word only if its on-screen length checks out (AcceptGuard).
+    case injectChecked(id: UInt32, deleteCount: Int, replacement: String, expected: Int, alternate: Int)
+    /// Revert our last fix only if the caret is still where it left it.
+    case injectRevert(id: UInt32, deleteCount: Int, replacement: String)
     /// Anchored replace — see `InputEvent::InjectAnchored` in `events.rs`.
     case injectAnchored(left: Int, deleteCount: Int, replacement: String, right: Int)
     case shutdown
@@ -175,6 +181,12 @@ final class Bridge {
             payload = ["type": "injection_zone", "dead": dead]
         case let .webHost(web):
             payload = ["type": "web_host", "web": web]
+        case let .injectResult(id, status, deleted, reason):
+            var p: [String: Any] = [
+                "type": "inject_result", "id": id, "status": status, "deleted": deleted,
+            ]
+            if let reason = reason { p["reason"] = reason }
+            payload = p
         }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
               let s = String(data: data, encoding: .utf8) else {
@@ -187,10 +199,20 @@ final class Bridge {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = obj["type"] as? String else { return nil }
         switch type {
-        case "inject_correction":
-            guard let deleteCount = obj["delete_count"] as? Int,
+        case "inject_checked":
+            guard let id = obj["id"] as? Int,
+                  let deleteCount = obj["delete_count"] as? Int,
+                  let replacement = obj["replacement"] as? String,
+                  let expected = obj["expected_len"] as? Int,
+                  let alternate = obj["alternate_len"] as? Int else { return nil }
+            return .injectChecked(
+                id: UInt32(id), deleteCount: deleteCount, replacement: replacement,
+                expected: expected, alternate: alternate)
+        case "inject_revert":
+            guard let id = obj["id"] as? Int,
+                  let deleteCount = obj["delete_count"] as? Int,
                   let replacement = obj["replacement"] as? String else { return nil }
-            return .injectCorrection(deleteCount: deleteCount, replacement: replacement)
+            return .injectRevert(id: UInt32(id), deleteCount: deleteCount, replacement: replacement)
         case "inject_anchored":
             guard let left = obj["left"] as? Int,
                   let deleteCount = obj["delete_count"] as? Int,

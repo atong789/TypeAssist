@@ -76,6 +76,9 @@ final class SecureFieldMonitor {
     /// constant in ApplicationServices on every SDK).
     private static let secureSubrole = "AXSecureTextField"
 
+    /// Told about every app / focus change, for the accept check's baseline.
+    var onCaretRelocated: (() -> Void)?
+
     /// Begin tracking. Must be called on the main thread (the AX observer's
     /// run-loop source and the `NSWorkspace` notification are serviced by the
     /// main run loop, the same loop the `CGEventTap` callback runs on — so the
@@ -110,6 +113,7 @@ final class SecureFieldMonitor {
         // (Fix-B's bias-toward-resetting), but only an `"app"` switch is a true
         // change of corrector regime. Content-free tag — no app identity (#8).
         bridge.emit(.caretMoved(reason: "app"))
+        onCaretRelocated?()
         rebindToFrontmostApp()
     }
 
@@ -197,6 +201,7 @@ final class SecureFieldMonitor {
             // can choose NOT to reset on this churn while Fix-B still resets on
             // both. Content-free tag — no element/app identity (#8).
             bridge.emit(.caretMoved(reason: "focus-element"))
+            onCaretRelocated?()
         }
         reevaluateNow()
         scheduleConfirmation()

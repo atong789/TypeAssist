@@ -119,6 +119,33 @@ pub enum InputEvent {
     /// `false`. Content-free (Principle #8): a single bool, never the app id or
     /// field role that derived it.
     WebHost { web: bool },
+    /// **Outcome of an injection request** ([`OutboundCommand::InjectChecked`] /
+    /// [`OutboundCommand::InjectRevert`]). Emitted before the adapter posts any
+    /// key. `deleted` is the number of backspaces it is about to post (0 when
+    /// aborted); `reason` is a content-free tag. Nothing counts as accepted
+    /// until this says so.
+    InjectResult {
+        id: u32,
+        status: InjectStatus,
+        deleted: u32,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+}
+
+/// What the adapter did with an injection request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InjectStatus {
+    /// The on-screen length matched; injected as asked.
+    Applied,
+    /// The host had already rewritten the word to the target's length; the
+    /// delete count was moved to match.
+    Adjusted,
+    /// A web field: injected as asked, without the length check.
+    Unverified,
+    /// Nothing was injected.
+    Aborted,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,11 +162,26 @@ pub struct Modifiers {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutboundCommand {
-    /// Replace the just-typed word: delete `delete_count` characters from the
-    /// focused field, then type `replacement`. `replacement` includes the
-    /// trailing word-boundary character (e.g. the space) so the adapter stays
-    /// dumb — it does no word logic of its own.
-    InjectCorrection { delete_count: u32, replacement: String },
+    /// Replace the just-typed word — **only if its on-screen length checks
+    /// out**. `expected_len` is the character count from the word's start (after
+    /// the last whitespace) to the caret if the field still holds what was typed;
+    /// `alternate_len` is the same if the host already rewrote it to the target.
+    /// On `expected_len` the adapter deletes `delete_count`; on `alternate_len`
+    /// it deletes `delete_count + alternate_len - expected_len`; otherwise it
+    /// injects nothing. `replacement` includes the trailing boundary character.
+    InjectChecked {
+        id: u32,
+        delete_count: u32,
+        replacement: String,
+        expected_len: u32,
+        alternate_len: u32,
+    },
+    /// Revert the last injection, only if the caret is still where it left it.
+    InjectRevert {
+        id: u32,
+        delete_count: u32,
+        replacement: String,
+    },
     /// **Anchored replace (M3 bubble, accept-after-typing-on).** Replace a word
     /// the caret has already moved PAST: move the caret left `left` chars (to just
     /// after the word), delete `delete_count` (the word), type `replacement` (the
